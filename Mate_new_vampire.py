@@ -2,12 +2,20 @@ import re
 import logging
 import sys
 import json
+import itertools
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from logger_config import setup_colored_logger
 from env_config import setup_environment, setup_model
-from vampire_runner import run_vampire_with_timeout
+from vampire_runner import (
+    run_vampire_with_timeout,
+    run_vampire,
+    run_vampire_diagnostic,
+    compute_progress_score,
+    derive_repair_hints,
+    VampireResult,
+)
 
 # 配置彩色日志
 logger = setup_colored_logger()
@@ -15,6 +23,13 @@ config = setup_environment()
 
 # 初始化模型
 llm = setup_model(config)
+
+# Cap how much solver feedback we inject into prompts.
+_MAX_REPAIR_HINTS = 4
+_MAX_PROGRESS_LEMMAS = 6
+_PROGRESS_SCORE_THRESHOLD = 0.5
+_DIAGNOSTIC_TIMEOUT = 3
+_MAX_SUBSET_LEMMAS = 4  # exhaustive pairs only if len(lemmas) <= this
 
 # 在文件开头添加失败引理管理函数
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
@@ -29,16 +44,30 @@ def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
     
     return Path(base_path) / filename
 
+def _empty_failed_data() -> dict:
+    return {
+        "invalid_lemmas": [],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "repair_hints": [],
+    }
+
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
-    """加载失败引理记录"""
+    """加载失败引理记录（含 solver-guided repair hints）"""
     failed_file = get_failed_lemmas_file(base_path, goal_name)
     if failed_file.exists():
         try:
             with open(failed_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+            # Backward compatible defaults
+            data.setdefault("invalid_lemmas", [])
+            data.setdefault("useless_lemma_groups", [])
+            data.setdefault("progress_lemmas", [])
+            data.setdefault("repair_hints", [])
+            return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
-    return {"invalid_lemmas": [], "useless_lemma_groups": []}
+    return _empty_failed_data()
 
 def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
     """保存失败引理记录"""
@@ -59,13 +88,108 @@ def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
         save_failed_lemmas(base_path, goal_name, failed_data)
         logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
 
-def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str]):
-    """添加无用引理组合记录"""
+def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
+                            meta: Optional[dict] = None):
+    """添加无用引理组合记录（可附带 Vampire 失败元信息）"""
     failed_data = load_failed_lemmas(base_path, goal_name)
-    if lemma_group not in failed_data["useless_lemma_groups"]:
-        failed_data["useless_lemma_groups"].append(lemma_group)
-        save_failed_lemmas(base_path, goal_name, failed_data)
-        logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+    record: Any = lemma_group
+    if meta:
+        record = {"lemmas": lemma_group, **meta}
+    # Avoid exact duplicates (compare lemma lists)
+    existing = failed_data["useless_lemma_groups"]
+    for item in existing:
+        lemmas = item if isinstance(item, list) else item.get("lemmas", [])
+        if lemmas == lemma_group:
+            return
+    existing.append(record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+
+def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
+                       score: float, signals: List[str]):
+    """记录对卡住目标有“进展”但尚未证出的引理（供下一轮优先复用/强化）"""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    record = {"lemma": lemma, "score": score, "signals": signals}
+    # Replace existing entry for same lemma
+    failed_data["progress_lemmas"] = [
+        r for r in failed_data["progress_lemmas"] if r.get("lemma") != lemma
+    ]
+    failed_data["progress_lemmas"].append(record)
+    # Keep top-N by score
+    failed_data["progress_lemmas"].sort(key=lambda r: r.get("score", 0), reverse=True)
+    failed_data["progress_lemmas"] = failed_data["progress_lemmas"][:_MAX_PROGRESS_LEMMAS]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录进展引理到{goal_name}: score={score:.2f} signals={signals}")
+
+def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
+    """追加 solver-guided repair hints（去重、截断）"""
+    if not hints:
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    existing = failed_data["repair_hints"]
+    existing_keys = {(h.get("kind"), h.get("detail", "")[:80]) for h in existing}
+    for hint in hints:
+        key = (hint.get("kind"), hint.get("detail", "")[:80])
+        if key not in existing_keys:
+            existing.append(hint)
+            existing_keys.add(key)
+    failed_data["repair_hints"] = existing[-_MAX_REPAIR_HINTS:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def format_solver_feedback_for_prompt(failed_data: dict) -> str:
+    """把 Vampire 失败/进展信号格式化进下一轮 LLM prompt。"""
+    parts: List[str] = []
+
+    if failed_data.get("invalid_lemmas"):
+        parts.append(
+            "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. "
+            "DO NOT generate these lemmas:"
+        )
+        for i, record in enumerate(failed_data["invalid_lemmas"], 1):
+            parts.append(f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}")
+
+    if failed_data.get("useless_lemma_groups"):
+        parts.append(
+            "\n; IMPORTANT: The following lemma groups are USELESS for proving the "
+            "original goal. DO NOT generate the exact same group:"
+        )
+        for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
+            lemmas = group if isinstance(group, list) else group.get("lemmas", [])
+            meta = "" if isinstance(group, list) else (
+                f" [vampire_status={group.get('status', '?')}; "
+                f"hint={group.get('hint_kind', '')}]"
+            )
+            parts.append(f"; Useless group {i}{meta}:")
+            for j, lemma in enumerate(lemmas, 1):
+                parts.append(f";   {j}. {lemma}")
+
+    if failed_data.get("progress_lemmas"):
+        parts.append(
+            "\n; SOLVER PROGRESS SIGNALS: The following lemmas did NOT finish the proof, "
+            "but Vampire statistics suggest they made rewrite/induction progress. "
+            "Prefer refining/extending these rather than unrelated lemmas:"
+        )
+        for i, record in enumerate(failed_data["progress_lemmas"], 1):
+            signals = ", ".join(record.get("signals", []))
+            parts.append(
+                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}): "
+                f"{record['lemma']}"
+            )
+
+    if failed_data.get("repair_hints"):
+        parts.append(
+            "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
+            "Use these hints to choose the NEXT lemmas:"
+        )
+        for i, hint in enumerate(failed_data["repair_hints"], 1):
+            parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
+            focus = hint.get("induction_focus") or []
+            if focus:
+                parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+            for action in hint.get("suggested_actions", [])[:3]:
+                parts.append(f";   -> {action}")
+
+    return "\n".join(parts)
 
 def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None) -> list:
     """创建用于 LLM 的结构化消息列表"""
@@ -76,22 +200,11 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
         system_prompt_content = file.read()
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
-    # 添加失败引理信息
+    # 添加失败引理 + Vampire solver-guided 反馈
     failed_info = ""
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
-        
-        if failed_data["invalid_lemmas"]:
-            failed_info += "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. DO NOT generate these lemmas:\n"
-            for i, record in enumerate(failed_data["invalid_lemmas"], 1):
-                failed_info += f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}\n"
-        
-        if failed_data["useless_lemma_groups"]:
-            failed_info += "\n; IMPORTANT: The following lemma groups are USELESS for proving the original goal. DO NOT generate the exact same group:\n"
-            for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
-                failed_info += f"; Useless group {i}:\n"
-                for j, lemma in enumerate(group, 1):
-                    failed_info += f";   {j}. {lemma}\n"
+        failed_info = format_solver_feedback_for_prompt(failed_data)
     
     # 构建结构化消息列表
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
@@ -147,37 +260,282 @@ def parse_llm_response(response: str) -> List[str]:
     
     return result
 
-def verify_combined_lemmas(original_assert: re.Match, asserts: List[str], original_content: str, output_path: Path) -> bool:
-    
-    """验证引理组合有效性"""
-    combined_asserts = "\n".join([f"(assert {a})" for a in asserts])
+def _write_combined_smt(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+    *,
+    named: bool = False,
+) -> None:
+    """Write SMT file with lemmas inserted into the proof-goal block."""
+    if named:
+        combined_asserts = "\n".join(
+            f"(assert (! {a} :named lemma_{i}))" for i, a in enumerate(asserts, 1)
+        )
+    else:
+        combined_asserts = "\n".join(f"(assert {a})" for a in asserts)
 
-    # 构造新的 assert 块（新的 assert + 原有的 assert）
     new_asserts_block = combined_asserts + "\n" + original_assert.group(1)
-
-    # 替换模板中的目标部分
     new_content = re.sub(
         r'; proof goal\s*\(assert.*?\)\s*; proof goal end',
         f'; proof goal\n{new_asserts_block}\n; proof goal end',
         original_content,
-        flags=re.DOTALL
+        flags=re.DOTALL,
+    )
+    output_path.write_text(new_content)
+
+
+def _lemma_subsets(asserts: List[str]) -> List[List[str]]:
+    """Generate singleton (and small pairwise) subsets for usefulness search."""
+    subsets: List[List[str]] = [[a] for a in asserts]
+    if 2 <= len(asserts) <= _MAX_SUBSET_LEMMAS:
+        for a, b in itertools.combinations(asserts, 2):
+            subsets.append([a, b])
+    return subsets
+
+
+def _first_datatype_name(smt_content: str) -> Optional[str]:
+    m = re.search(r'\(declare-datatypes\s*\(\s*\(\s*(\w+)', smt_content)
+    return m.group(1) if m else None
+
+
+def _is_trivial_equational_lemma(lemma: str) -> bool:
+    """Heuristic: forall ... (= t t) style tautologies are never useful progress."""
+    compact = re.sub(r'\s+', ' ', lemma.strip())
+    # Find top-level equality body after forall vars
+    eq = re.search(r'\(\s*=\s*', compact)
+    if not eq:
+        return False
+    # crude balance extract of (= ...)
+    start = eq.start()
+    bal = 0
+    end = None
+    for i, ch in enumerate(compact[start:], start):
+        if ch == '(':
+            bal += 1
+        elif ch == ')':
+            bal -= 1
+            if bal == 0:
+                end = i + 1
+                break
+    if end is None:
+        return False
+    body = compact[start + 2:end - 1].strip()  # inside (= ...)
+    # split into two args at top-level space
+    bal = 0
+    parts = []
+    cur = []
+    for ch in body:
+        if ch == '(':
+            bal += 1
+            cur.append(ch)
+        elif ch == ')':
+            bal -= 1
+            cur.append(ch)
+        elif ch == ' ' and bal == 0:
+            if cur:
+                parts.append(''.join(cur).strip())
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append(''.join(cur).strip())
+    return len(parts) >= 2 and parts[0] == parts[1]
+
+
+def analyze_lemma_progress(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    work_dir: Path,
+    goal_name: str,
+    base_path: str,
+) -> Tuple[List[str], VampireResult]:
+    """
+    Diagnostic pass: compare baseline vs each lemma subset.
+    Records progress lemmas + repair hints. Returns progressive lemmas and baseline result.
+    """
+    baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
+    baseline_path.write_text(original_content)
+    baseline = run_vampire_diagnostic(
+        baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True
+    )
+    add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+
+    # Control: quantified reflexivity on first datatype (closer to a useless forall lemma).
+    dt = _first_datatype_name(original_content) or "Nat"
+    control_lemma = f"(forall ((x {dt})) (= x x))"
+    control_path = work_dir / f"{goal_name}_diag_control.smt2"
+    _write_combined_smt(
+        original_assert, [control_lemma], original_content, control_path, named=False
+    )
+    control = run_vampire_diagnostic(
+        control_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=False
     )
 
-    output_path.write_text(new_content)
-    combined_cvc_timeout = config['COMBINED_CVC_TIMEOUT']
-    return run_vampire_with_timeout(output_path, combined_cvc_timeout)
+    progressive: List[Tuple[float, str, List[str]]] = []
+    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
+        if all(_is_trivial_equational_lemma(a) for a in subset):
+            logging.info("诊断子集#%d 跳过：平凡重言式引理", idx)
+            continue
+        cand_path = work_dir / f"{goal_name}_diag_subset_{idx}.smt2"
+        _write_combined_smt(original_assert, subset, original_content, cand_path, named=False)
+        cand = run_vampire_diagnostic(
+            cand_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=False
+        )
+        score, signals = compute_progress_score(baseline, cand, control=control)
+        logging.info(
+            "诊断子集#%d score=%.2f signals=%s lemmas=%d",
+            idx, score, signals, len(subset),
+        )
+        if score >= _PROGRESS_SCORE_THRESHOLD:
+            for lemma in subset:
+                if _is_trivial_equational_lemma(lemma):
+                    continue
+                progressive.append((score, lemma, signals))
+                add_progress_lemma(base_path, goal_name, lemma, score, signals)
+
+    # Unique lemmas keeping best score order
+    seen = set()
+    ordered: List[str] = []
+    for score, lemma, _ in sorted(progressive, key=lambda x: -x[0]):
+        if lemma not in seen:
+            seen.add(lemma)
+            ordered.append(lemma)
+    return ordered, baseline
+
+
+def verify_combined_lemmas(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+    *,
+    base_path: str = None,
+    goal_name: str = None,
+) -> Tuple[bool, List[str], Optional[VampireResult]]:
+    """
+    验证引理组合有用性，并在失败时做子集搜索 / 进展评分 / repair hints。
+
+    Returns:
+        (useful, selected_lemmas, result)
+        selected_lemmas: on success, lemmas that appear in Vampire unsat core when available;
+                         otherwise the original asserts. On failure, progressive lemmas (may be empty).
+    """
+    combined_timeout = config['COMBINED_CVC_TIMEOUT']
+    work_dir = output_path.parent
+    gname = goal_name or output_path.stem
+
+    # 1) Full set with named lemmas → prove + optional ucore filtering
+    named_path = work_dir / f"{output_path.stem}_named.smt2"
+    _write_combined_smt(original_assert, asserts, original_content, named_path, named=True)
+    ucore_result = run_vampire(named_path, timeout=combined_timeout, collect_ucore=True)
+
+    if ucore_result.proved:
+        used = []
+        if ucore_result.used_lemma_names:
+            for name in ucore_result.used_lemma_names:
+                m = re.fullmatch(r"lemma_(\d+)", name)
+                if m:
+                    idx = int(m.group(1)) - 1
+                    if 0 <= idx < len(asserts):
+                        used.append(asserts[idx])
+        selected = used if used else list(asserts)
+        # Also write the non-named combined file for debugging compatibility
+        _write_combined_smt(original_assert, selected, original_content, output_path, named=False)
+        logging.info(
+            "组合引理证出目标；ucore 保留 %d/%d 条引理",
+            len(selected), len(asserts),
+        )
+        return True, selected, ucore_result
+
+    # 2) Fallback prove without ucore (same lemmas) in case ucore mode misfires
+    _write_combined_smt(original_assert, asserts, original_content, output_path, named=False)
+    plain_result = run_vampire(output_path, timeout=combined_timeout, collect_stats=True)
+    if plain_result.proved:
+        logging.info("组合引理证出目标（非 ucore 路径）")
+        return True, list(asserts), plain_result
+
+    # 3) Subset prove search: any singleton/pair that already proves the goal?
+    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
+        sub_path = work_dir / f"{output_path.stem}_subset_{idx}.smt2"
+        _write_combined_smt(original_assert, subset, original_content, sub_path, named=False)
+        sub_res = run_vampire(sub_path, timeout=max(10, combined_timeout // 2), collect_stats=False)
+        if sub_res.proved:
+            logging.info("子集引理证出目标: %d 条", len(subset))
+            _write_combined_smt(original_assert, subset, original_content, output_path, named=False)
+            return True, list(subset), sub_res
+
+    # 4) Not useful enough to prove: diagnostic progress + repair hints
+    progressive: List[str] = []
+    baseline = VampireResult(status="unknown")
+    if base_path and goal_name:
+        progressive, baseline = analyze_lemma_progress(
+            original_assert, asserts, original_content, work_dir, gname, base_path
+        )
+        hint_kind = "no_progress"
+        if progressive:
+            hint_kind = "partial_progress"
+        add_useless_lemma_group(
+            base_path,
+            goal_name,
+            asserts,
+            meta={
+                "status": plain_result.status,
+                "hint_kind": hint_kind,
+                "progressive_count": len(progressive),
+            },
+        )
+        # Extra repair hint summarizing this failed usefulness check
+        add_repair_hints(base_path, goal_name, [{
+            "kind": hint_kind,
+            "context": "usefulness_check",
+            "detail": (
+                "The full lemma group did not help Vampire prove the goal. "
+                + (
+                    f"{len(progressive)} lemma(s) showed partial rewrite/induction progress; "
+                    "refine them or add bridging lemmas."
+                    if progressive else
+                    "No lemma subset showed measurable progress; try a different lemma shape "
+                    "(generalization / rewrite bridge)."
+                )
+            ),
+            "induction_focus": baseline.induction_focus[:6],
+            "suggested_actions": [
+                "Build on progress lemmas if any are listed above",
+                "Target induction focus terms reported by Vampire",
+                "Do not repeat the same useless lemma group",
+            ],
+        }])
+
+    return False, progressive, plain_result
 
 
 def perform_initial_verification(goal_smt_file: Path) -> bool:
     """执行初始验证检查"""
     default_timeout = config['DEFAULT_CVC_TIMEOUT']
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
-    if run_vampire_with_timeout(goal_smt_file, default_timeout):
+    result = run_vampire(goal_smt_file, default_timeout, collect_stats=True)
+    if result.proved:
         logging.info("✅ 原目标直接验证成功!")
         return True
-    
-    logging.error("Vampire验证未通过，开始生成新引理...")
+
+    logging.error(
+        "Vampire验证未通过 (status=%s)，开始生成新引理...",
+        result.status,
+    )
     return False
+
+
+def seed_baseline_repair_hints(base_path: str, goal_name: str, goal_smt_file: Path) -> None:
+    """在首次求助于 LLM 前，用 Vampire 诊断跑一遍，写入 repair hints。"""
+    diag = run_vampire_diagnostic(
+        goal_smt_file, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True
+    )
+    add_repair_hints(base_path, goal_name, derive_repair_hints(diag, context="initial_goal"))
+    if diag.induction_focus:
+        logging.info("初始归纳焦点: %s", diag.induction_focus[:4])
 
 
 def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
@@ -398,11 +756,13 @@ def create_validation_files(extracted_asserts: List[str], smt_content: str,
     return valid_check_paths
 
 
-def verify_single_lemma(valid_path: Path) -> Tuple[Path, bool]:
-    """验证单个引理的有效性"""
+def verify_single_lemma(valid_path: Path) -> Tuple[Path, VampireResult]:
+    """验证单个引理的有效性（assert lemma 若 unsat ⇒ 与公理矛盾 ⇒ invalid）"""
     logging.info(f"开始检查有效性: {valid_path.name}")
-    result = run_vampire_with_timeout(valid_path, timeout=1)
-    logging.info(f"检查有效性: {valid_path.name} 结束，返回 {result}")
+    result = run_vampire(valid_path, timeout=1, collect_stats=False)
+    logging.info(
+        f"检查有效性: {valid_path.name} 结束，proved={result.proved} status={result.status}"
+    )
     return valid_path, result
 
 
@@ -418,20 +778,32 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
         for future in as_completed(future_to_path):
             try:
                 valid_path, result = future.result()
-                if result:
+                if result.proved:
                     logging.warning(f"发现无效引理: {valid_path.name}")
                     invalid_lemmas.append(valid_path)
-                    # 记录无效引理
                     lemma_content = extract_lemma_from_file(valid_path)
                     if lemma_content:
-                        add_invalid_lemma(base_path, goal_name, lemma_content, "verification failed")
+                        add_invalid_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"contradicts axioms (vampire={result.status})",
+                        )
+                elif result.status == "error":
+                    logging.error(f"引理检查出错: {valid_path.name}: {result.error}")
+                    invalid_lemmas.append(valid_path)
+                    lemma_content = extract_lemma_from_file(valid_path)
+                    if lemma_content:
+                        add_invalid_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"vampire error: {result.error}",
+                        )
                 else:
-                    logging.error(f"暂时无法过滤引理: {valid_path.name}")
+                    logging.error(
+                        f"暂时无法过滤引理: {valid_path.name} (status={result.status})"
+                    )
             except Exception as e:
                 path = future_to_path[future]
                 logging.error(f"验证引理 {path.name} 时发生异常: {e}")
                 invalid_lemmas.append(path)
-                # 记录异常引理
                 lemma_content = extract_lemma_from_file(path)
                 if lemma_content:
                     add_invalid_lemma(base_path, goal_name, lemma_content, f"验证异常: {e}")
@@ -482,15 +854,20 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
         # 在baseline模式下，使用task_timeout作为超时时间
         task_timeout = config['TASK_TIMEOUT']
         logging.info(f"🔍 Baseline模式: 执行初始验证检查，超时时间: {task_timeout}秒")
-        result = run_vampire_with_timeout(goal_smt_file, task_timeout)
-        if result:
+        result = run_vampire(goal_smt_file, task_timeout, collect_stats=True)
+        if result.proved:
             logging.info("✅ Baseline模式: 初始验证成功!")
         else:
-            logging.info("❌ Baseline模式: 初始验证失败")
-        return result, [], []
+            logging.info("❌ Baseline模式: 初始验证失败 (status=%s)", result.status)
+        return result.proved, [], []
     
     # 步骤2: 提取原始目标
     original_assert, original_forall = extract_original_goal(smt_content)
+
+    # 步骤2.5: 首次求助 LLM 前写入 Vampire 诊断反馈（若尚无 repair_hints）
+    failed_data = load_failed_lemmas(base_path, goal_smt_name)
+    if not failed_data.get("repair_hints"):
+        seed_baseline_repair_hints(base_path, goal_smt_name, goal_smt_file)
     
     # 步骤3: 使用LLM生成引理
     extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path)
@@ -499,7 +876,8 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
     if not extracted_asserts:
         logging.info("大模型未返回引理，尝试提高时间限制重新验证原目标")
         retry_timeout = config['RETRY_CVC_TIMEOUT']
-        if run_vampire_with_timeout(goal_smt_file, retry_timeout):
+        retry = run_vampire(goal_smt_file, retry_timeout, collect_stats=True)
+        if retry.proved:
             logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
             return True, [], []
         return False, [], []
@@ -516,20 +894,31 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
         return False, [], extracted_asserts
 
 
-    # 步骤6: 检查引理是否有助于证明原目标
+    # 步骤6: 检查引理是否有助于证明原目标（含子集搜索 / ucore / 进展评分）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
-    if not verify_combined_lemmas(original_assert, extracted_asserts, smt_content, combined_path):
-        logging.error("生成引理未能帮助证明原目标")
-        # 记录无用引理组合
-        add_useless_lemma_group(base_path, goal_smt_name, extracted_asserts)
+    useful, selected_lemmas, _vres = verify_combined_lemmas(
+        original_assert,
+        extracted_asserts,
+        smt_content,
+        combined_path,
+        base_path=base_path,
+        goal_name=goal_smt_name,
+    )
+    if not useful:
+        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
         return False, [], extracted_asserts
-    else:
-        logging.info("lemmas有用，生成lemmas验证文件，检查lemmas是否成立")
 
-    # 步骤7: 生成正式验证文件
-    generated_files = generate_formal_proof_files(extracted_asserts, smt_content, smt_file_path, goal_smt_name)
+    logging.info(
+        "lemmas有用，保留 %d/%d 条用于子目标生成",
+        len(selected_lemmas), len(extracted_asserts),
+    )
+
+    # 步骤7: 生成正式验证文件（仅对 ucore/子集保留的引理）
+    generated_files = generate_formal_proof_files(
+        selected_lemmas, smt_content, smt_file_path, goal_smt_name
+    )
     
-    return True, generated_files, extracted_asserts
+    return True, generated_files, selected_lemmas
 
 def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_lemmas: List[str] = None, parent_goal_name: str = None) -> bool:
     """并行执行多个子目标的验证，如果任何一个失败就立即终止所有进程"""
@@ -552,10 +941,36 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                     result = future.result()
                     if not result:
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
-                        # 记录导致子目标失败的引理到父目标的失败记录中
+                        # 记录导致子目标失败的引理 + Vampire 诊断到父目标
                         if parent_lemmas and parent_goal_name:
                             for lemma in parent_lemmas:
-                                add_invalid_lemma(base_path, parent_goal_name, lemma, f"导致子目标{subgoal}验证失败")
+                                add_invalid_lemma(
+                                    base_path, parent_goal_name, lemma,
+                                    f"导致子目标{subgoal}验证失败",
+                                )
+                            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
+                            if subgoal_file.exists():
+                                diag = run_vampire_diagnostic(
+                                    subgoal_file,
+                                    timeout=_DIAGNOSTIC_TIMEOUT,
+                                    show_induction=True,
+                                )
+                                hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
+                                hints.append({
+                                    "kind": "subgoal_failed",
+                                    "context": f"subgoal:{subgoal}",
+                                    "detail": (
+                                        f"Lemma was useful for the parent goal but its own proof "
+                                        f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
+                                        f"help prove this subgoal directly."
+                                    ),
+                                    "induction_focus": diag.induction_focus[:6],
+                                    "suggested_actions": [
+                                        "Propose a weaker/simpler variant of the failing lemma",
+                                        "Add bridging lemmas targeting the subgoal induction focus",
+                                    ],
+                                })
+                                add_repair_hints(base_path, parent_goal_name, hints)
                         # 取消所有未完成的任务
                         for f in future_to_subgoal:
                             if not f.done():

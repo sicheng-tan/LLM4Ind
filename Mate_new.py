@@ -2,12 +2,20 @@ import re
 import logging
 import sys
 import json
+import itertools
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from logger_config import setup_colored_logger
 from env_config import setup_environment, setup_model
-from cvc5_runner import run_cvc_solver_with_timeout
+from cvc5_runner import (
+    run_cvc_solver_with_timeout,
+    run_cvc,
+    run_cvc_diagnostic,
+    compute_progress_score,
+    derive_repair_hints,
+    CvcResult,
+)
 
 # 配置彩色日志
 logger = setup_colored_logger()
@@ -15,6 +23,12 @@ config = setup_environment()
 
 # 初始化模型
 llm = setup_model(config)
+
+_MAX_REPAIR_HINTS = 4
+_MAX_PROGRESS_LEMMAS = 6
+_PROGRESS_SCORE_THRESHOLD = 0.5
+_DIAGNOSTIC_TIMEOUT = 3
+_MAX_SUBSET_LEMMAS = 4
 
 # 在文件开头添加失败引理管理函数
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
@@ -29,16 +43,29 @@ def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
     
     return Path(base_path) / filename
 
+def _empty_failed_data() -> dict:
+    return {
+        "invalid_lemmas": [],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "repair_hints": [],
+    }
+
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
-    """加载失败引理记录"""
+    """加载失败引理记录（含 cvc5 solver-guided repair hints）"""
     failed_file = get_failed_lemmas_file(base_path, goal_name)
     if failed_file.exists():
         try:
             with open(failed_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+            data.setdefault("invalid_lemmas", [])
+            data.setdefault("useless_lemma_groups", [])
+            data.setdefault("progress_lemmas", [])
+            data.setdefault("repair_hints", [])
+            return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
-    return {"invalid_lemmas": [], "useless_lemma_groups": []}
+    return _empty_failed_data()
 
 def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
     """保存失败引理记录"""
@@ -46,7 +73,6 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
     try:
         with open(failed_file, 'w', encoding='utf-8') as f:
             json.dump(failed_data, f, ensure_ascii=False, indent=2)
-        # logging.info(f"保存失败引理到: {failed_file.name}")
     except Exception as e:
         logging.error(f"保存失败引理文件出错: {e}")
 
@@ -57,15 +83,108 @@ def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     if lemma_record not in failed_data["invalid_lemmas"]:
         failed_data["invalid_lemmas"].append(lemma_record)
         save_failed_lemmas(base_path, goal_name, failed_data)
-        # logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
 
-def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str]):
-    """添加无用引理组合记录"""
+def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
+                            meta: Optional[dict] = None):
+    """添加无用引理组合记录（可附带 cvc5 失败元信息）"""
     failed_data = load_failed_lemmas(base_path, goal_name)
-    if lemma_group not in failed_data["useless_lemma_groups"]:
-        failed_data["useless_lemma_groups"].append(lemma_group)
-        save_failed_lemmas(base_path, goal_name, failed_data)
-        logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+    record: Any = lemma_group
+    if meta:
+        record = {"lemmas": lemma_group, **meta}
+    for item in failed_data["useless_lemma_groups"]:
+        lemmas = item if isinstance(item, list) else item.get("lemmas", [])
+        if lemmas == lemma_group:
+            return
+    failed_data["useless_lemma_groups"].append(record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+
+def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
+                       score: float, signals: List[str]):
+    """记录对卡住目标有统计/难度进展但尚未证出的引理"""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    record = {"lemma": lemma, "score": score, "signals": signals}
+    failed_data["progress_lemmas"] = [
+        r for r in failed_data["progress_lemmas"] if r.get("lemma") != lemma
+    ]
+    failed_data["progress_lemmas"].append(record)
+    failed_data["progress_lemmas"].sort(key=lambda r: r.get("score", 0), reverse=True)
+    failed_data["progress_lemmas"] = failed_data["progress_lemmas"][:_MAX_PROGRESS_LEMMAS]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录进展引理到{goal_name}: score={score:.2f} signals={signals}")
+
+def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
+    """追加 cvc5 solver-guided repair hints"""
+    if not hints:
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    existing = failed_data["repair_hints"]
+    existing_keys = {(h.get("kind"), h.get("detail", "")[:80]) for h in existing}
+    for hint in hints:
+        key = (hint.get("kind"), hint.get("detail", "")[:80])
+        if key not in existing_keys:
+            existing.append(hint)
+            existing_keys.add(key)
+    failed_data["repair_hints"] = existing[-_MAX_REPAIR_HINTS:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def format_solver_feedback_for_prompt(failed_data: dict) -> str:
+    """把 cvc5 失败/进展/难度信号格式化进下一轮 LLM prompt。"""
+    parts: List[str] = []
+
+    if failed_data.get("invalid_lemmas"):
+        parts.append(
+            "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. "
+            "DO NOT generate these lemmas:"
+        )
+        for i, record in enumerate(failed_data["invalid_lemmas"], 1):
+            parts.append(f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}")
+
+    if failed_data.get("useless_lemma_groups"):
+        parts.append(
+            "\n; IMPORTANT: The following lemma groups are USELESS for proving the "
+            "original goal. DO NOT generate the exact same group:"
+        )
+        for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
+            lemmas = group if isinstance(group, list) else group.get("lemmas", [])
+            meta = "" if isinstance(group, list) else (
+                f" [cvc_status={group.get('status', '?')}; "
+                f"hint={group.get('hint_kind', '')}]"
+            )
+            parts.append(f"; Useless group {i}{meta}:")
+            for j, lemma in enumerate(lemmas, 1):
+                parts.append(f";   {j}. {lemma}")
+
+    if failed_data.get("progress_lemmas"):
+        parts.append(
+            "\n; SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty): The following lemmas "
+            "did NOT finish the proof, but made measurable progress. Prefer refining "
+            "or extending these:"
+        )
+        for i, record in enumerate(failed_data["progress_lemmas"], 1):
+            signals = ", ".join(record.get("signals", []))
+            parts.append(
+                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}): "
+                f"{record['lemma']}"
+            )
+
+    if failed_data.get("repair_hints"):
+        parts.append(
+            "\n; SOLVER-GUIDED REPAIR (from cvc5 failure analysis). "
+            "Use these hints to choose the NEXT lemmas:"
+        )
+        for i, hint in enumerate(failed_data["repair_hints"], 1):
+            parts.append(
+                f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
+            )
+            for ax in (hint.get("hard_axioms") or [])[:3]:
+                parts.append(f";   Hard axiom: {ax[:160]}")
+            for g in (hint.get("goal_fragments") or [])[:2]:
+                parts.append(f";   Goal fragment: {g[:160]}")
+            for action in hint.get("suggested_actions", [])[:3]:
+                parts.append(f";   -> {action}")
+
+    return "\n".join(parts)
 
 def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None) -> list:
     """创建用于 LLM 的结构化消息列表"""
@@ -76,24 +195,11 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
         system_prompt_content = file.read()
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
-    # 添加失败引理信息
     failed_info = ""
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
-        
-        if failed_data["invalid_lemmas"]:
-            failed_info += "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. DO NOT generate these lemmas:\n"
-            for i, record in enumerate(failed_data["invalid_lemmas"], 1):
-                failed_info += f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}\n"
-        
-        if failed_data["useless_lemma_groups"]:
-            failed_info += "\n; IMPORTANT: The following lemma groups are USELESS for proving the original goal. DO NOT generate the exact same group:\n"
-            for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
-                failed_info += f"; Useless group {i}:\n"
-                for j, lemma in enumerate(group, 1):
-                    failed_info += f";   {j}. {lemma}\n"
+        failed_info = format_solver_feedback_for_prompt(failed_data)
     
-    # 构建结构化消息列表
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
     
     messages = [
@@ -147,34 +253,229 @@ def parse_llm_response(response: str) -> List[str]:
     
     return result
 
-def verify_combined_lemmas(original_assert: re.Match, asserts: List[str], original_content: str, output_path: Path) -> bool:
-    
-    """验证引理组合有效性"""
-    combined_asserts = "\n".join([f"(assert {a})" for a in asserts])
-
-    # 将引理插入到 proof goal 之前，保持 proof goal 区块不变
+def _write_combined_smt(
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+) -> None:
+    """Insert lemmas before `; proof goal` (Mate_new historical style)."""
+    combined_asserts = "\n".join(f"(assert {a})" for a in asserts)
     new_content = re.sub(
         r'; proof goal',
         combined_asserts + "\n; proof goal",
         original_content,
-        count=1
+        count=1,
+    )
+    output_path.write_text(new_content)
+
+
+def _lemma_subsets(asserts: List[str]) -> List[List[str]]:
+    subsets: List[List[str]] = [[a] for a in asserts]
+    if 2 <= len(asserts) <= _MAX_SUBSET_LEMMAS:
+        for a, b in itertools.combinations(asserts, 2):
+            subsets.append([a, b])
+    return subsets
+
+
+def _first_datatype_name(smt_content: str) -> Optional[str]:
+    m = re.search(r'\(declare-datatypes\s*\(\s*\(\s*(\w+)', smt_content)
+    return m.group(1) if m else None
+
+
+def _is_trivial_equational_lemma(lemma: str) -> bool:
+    compact = re.sub(r'\s+', ' ', lemma.strip())
+    eq = re.search(r'\(\s*=\s*', compact)
+    if not eq:
+        return False
+    start = eq.start()
+    bal = 0
+    end = None
+    for i, ch in enumerate(compact[start:], start):
+        if ch == '(':
+            bal += 1
+        elif ch == ')':
+            bal -= 1
+            if bal == 0:
+                end = i + 1
+                break
+    if end is None:
+        return False
+    body = compact[start + 2:end - 1].strip()
+    bal = 0
+    parts = []
+    cur = []
+    for ch in body:
+        if ch == '(':
+            bal += 1
+            cur.append(ch)
+        elif ch == ')':
+            bal -= 1
+            cur.append(ch)
+        elif ch == ' ' and bal == 0:
+            if cur:
+                parts.append(''.join(cur).strip())
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append(''.join(cur).strip())
+    return len(parts) >= 2 and parts[0] == parts[1]
+
+
+def analyze_lemma_progress(
+    asserts: List[str],
+    original_content: str,
+    work_dir: Path,
+    goal_name: str,
+    base_path: str,
+) -> Tuple[List[str], CvcResult]:
+    """Diagnostic: baseline vs control vs lemma subsets using cvc5 stats/difficulty."""
+    baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
+    baseline_path.write_text(original_content)
+    baseline = run_cvc_diagnostic(
+        baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+    )
+    add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+
+    dt = _first_datatype_name(original_content) or "Nat"
+    control_lemma = f"(forall ((x {dt})) (= x x))"
+    control_path = work_dir / f"{goal_name}_diag_control.smt2"
+    _write_combined_smt([control_lemma], original_content, control_path)
+    control = run_cvc_diagnostic(
+        control_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=False
     )
 
-    output_path.write_text(new_content)
-    combined_cvc_timeout = config['COMBINED_CVC_TIMEOUT']
-    return run_cvc_solver_with_timeout(output_path, combined_cvc_timeout)
+    progressive: List[Tuple[float, str, List[str]]] = []
+    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
+        if all(_is_trivial_equational_lemma(a) for a in subset):
+            logging.info("诊断子集#%d 跳过：平凡重言式引理", idx)
+            continue
+        cand_path = work_dir / f"{goal_name}_diag_subset_{idx}.smt2"
+        _write_combined_smt(subset, original_content, cand_path)
+        cand = run_cvc_diagnostic(
+            cand_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+        )
+        score, signals = compute_progress_score(baseline, cand, control=control)
+        logging.info(
+            "cvc5诊断子集#%d score=%.2f signals=%s lemmas=%d",
+            idx, score, signals, len(subset),
+        )
+        if score >= _PROGRESS_SCORE_THRESHOLD:
+            for lemma in subset:
+                if _is_trivial_equational_lemma(lemma):
+                    continue
+                progressive.append((score, lemma, signals))
+                add_progress_lemma(base_path, goal_name, lemma, score, signals)
+
+    seen = set()
+    ordered: List[str] = []
+    for score, lemma, _ in sorted(progressive, key=lambda x: -x[0]):
+        if lemma not in seen:
+            seen.add(lemma)
+            ordered.append(lemma)
+    return ordered, baseline
+
+
+def verify_combined_lemmas(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+    *,
+    base_path: str = None,
+    goal_name: str = None,
+) -> Tuple[bool, List[str], Optional[CvcResult]]:
+    """
+    验证引理组合有用性。cvc5 路径：
+    1) 全组 portfolio 证明
+    2) 子集证明搜索（不依赖 unsat core）
+    3) 失败则 stats/difficulty 进展评分 + repair hints
+    """
+    combined_timeout = config['COMBINED_CVC_TIMEOUT']
+    work_dir = output_path.parent
+    gname = goal_name or output_path.stem
+
+    _write_combined_smt(asserts, original_content, output_path)
+    full = run_cvc(output_path, timeout=combined_timeout)
+    if full.proved:
+        logging.info("组合引理证出目标（cvc5 portfolio）")
+        return True, list(asserts), full
+
+    # Subset prove search
+    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
+        sub_path = work_dir / f"{output_path.stem}_subset_{idx}.smt2"
+        _write_combined_smt(subset, original_content, sub_path)
+        sub_res = run_cvc(sub_path, timeout=max(10, combined_timeout // 2))
+        if sub_res.proved:
+            logging.info("子集引理证出目标: %d 条", len(subset))
+            _write_combined_smt(subset, original_content, output_path)
+            return True, list(subset), sub_res
+
+    progressive: List[str] = []
+    baseline = CvcResult(status="unknown")
+    if base_path and goal_name:
+        progressive, baseline = analyze_lemma_progress(
+            asserts, original_content, work_dir, gname, base_path
+        )
+        hint_kind = "partial_progress" if progressive else "no_progress"
+        add_useless_lemma_group(
+            base_path,
+            goal_name,
+            asserts,
+            meta={
+                "status": full.status,
+                "hint_kind": hint_kind,
+                "progressive_count": len(progressive),
+            },
+        )
+        add_repair_hints(base_path, goal_name, [{
+            "kind": hint_kind,
+            "context": "usefulness_check",
+            "detail": (
+                "The full lemma group did not help cvc5 prove the goal. "
+                + (
+                    f"{len(progressive)} lemma(s) showed partial stats/difficulty progress; "
+                    "refine them or add bridging lemmas."
+                    if progressive else
+                    "No lemma subset showed measurable progress; try a different lemma shape "
+                    "(generalization / rewrite bridge) targeting high-difficulty axioms."
+                )
+            ),
+            "hard_axioms": [t for t, _ in baseline.difficulty[:4]],
+            "suggested_actions": [
+                "Build on progress lemmas if any are listed above",
+                "Target high-difficulty recursive definitions reported by cvc5",
+                "Do not repeat the same useless lemma group",
+            ],
+        }])
+
+    return False, progressive, full
 
 
 def perform_initial_verification(goal_smt_file: Path) -> bool:
     """执行初始验证检查"""
     default_timeout = config['DEFAULT_CVC_TIMEOUT']
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
-    if run_cvc_solver_with_timeout(goal_smt_file, default_timeout):
-        logging.info("✅ 原目标直接验证成功!")
+    result = run_cvc(goal_smt_file, default_timeout)
+    if result.proved:
+        logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
-    
-    logging.error("CVC5验证未通过，开始生成新引理...")
+
+    logging.error("CVC5验证未通过 (status=%s)，开始生成新引理...", result.status)
     return False
+
+
+def seed_baseline_repair_hints(base_path: str, goal_name: str, goal_smt_file: Path) -> None:
+    """首次求助于 LLM 前，用 cvc5 诊断写入 repair hints。"""
+    diag = run_cvc_diagnostic(
+        goal_smt_file, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+    )
+    add_repair_hints(base_path, goal_name, derive_repair_hints(diag, context="initial_goal"))
+    if diag.difficulty:
+        logging.info(
+            "初始 cvc5 高难度断言: %s",
+            [t[:80] for t, s in diag.difficulty[:3]],
+        )
 
 
 def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
@@ -394,11 +695,13 @@ def create_validation_files(extracted_asserts: List[str], smt_content: str,
     return valid_check_paths
 
 
-def verify_single_lemma(valid_path: Path) -> Tuple[Path, bool]:
-    """验证单个引理的有效性"""
+def verify_single_lemma(valid_path: Path) -> Tuple[Path, CvcResult]:
+    """验证单个引理的有效性（assert lemma 若 unsat ⇒ 与公理矛盾 ⇒ invalid）"""
     logging.info(f"开始检查有效性: {valid_path.name}")
-    result = run_cvc_solver_with_timeout(valid_path, timeout=1)
-    logging.info(f"检查有效性: {valid_path.name} 结束，返回 {result}")
+    result = run_cvc(valid_path, timeout=1)
+    logging.info(
+        f"检查有效性: {valid_path.name} 结束，proved={result.proved} status={result.status}"
+    )
     return valid_path, result
 
 
@@ -414,26 +717,34 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
         for future in as_completed(future_to_path):
             try:
                 valid_path, result = future.result()
-                if result:
-                    # logging.warning(f"发现无效引理: {valid_path.name}")
+                if result.proved:
                     invalid_lemmas.append(valid_path)
-                    # 记录无效引理
                     lemma_content = extract_lemma_from_file(valid_path)
                     if lemma_content:
-                        add_invalid_lemma(base_path, goal_name, lemma_content, "verification failed")
+                        add_invalid_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"contradicts axioms (cvc={result.status})",
+                        )
+                elif result.status == "error":
+                    invalid_lemmas.append(valid_path)
+                    lemma_content = extract_lemma_from_file(valid_path)
+                    if lemma_content:
+                        add_invalid_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"cvc error: {result.error}",
+                        )
                 else:
-                    logging.error(f"暂时无法过滤引理: {valid_path.name}")
+                    logging.error(
+                        f"暂时无法过滤引理: {valid_path.name} (status={result.status})"
+                    )
             except Exception as e:
                 path = future_to_path[future]
-                #logging.error(f"验证引理 {path.name} 时发生异常: {e}")
                 invalid_lemmas.append(path)
-                # 记录异常引理
                 lemma_content = extract_lemma_from_file(path)
                 if lemma_content:
                     add_invalid_lemma(base_path, goal_name, lemma_content, f"验证异常: {e}")
     
     if invalid_lemmas:
-        # logging.error("存在不合法引理，需要重新生成")
         return False
     return True
 
@@ -478,15 +789,20 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
         # 在baseline模式下，使用task_timeout作为超时时间
         task_timeout = config['TASK_TIMEOUT']
         logging.info(f"🔍 Baseline模式: 执行初始验证检查，超时时间: {task_timeout}秒")
-        result = run_cvc_solver_with_timeout(goal_smt_file, task_timeout)
-        if result:
+        result = run_cvc(goal_smt_file, task_timeout)
+        if result.proved:
             logging.info("✅ Baseline模式: 初始验证成功!")
         else:
-            logging.info("❌ Baseline模式: 初始验证失败")
-        return result, [], []
+            logging.info("❌ Baseline模式: 初始验证失败 (status=%s)", result.status)
+        return result.proved, [], []
 
     # 步骤2: 提取原始目标
     original_assert, original_forall = extract_original_goal(smt_content)
+
+    # 步骤2.5: 首次 LLM 前写入 cvc5 诊断反馈
+    failed_data = load_failed_lemmas(base_path, goal_smt_name)
+    if not failed_data.get("repair_hints"):
+        seed_baseline_repair_hints(base_path, goal_smt_name, goal_smt_file)
     
     # 步骤3: 使用LLM生成引理
     extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path)
@@ -495,7 +811,8 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
     if not extracted_asserts:
         logging.info("大模型未返回引理，尝试提高时间限制重新验证原目标")
         retry_timeout = config['RETRY_CVC_TIMEOUT']
-        if run_cvc_solver_with_timeout(goal_smt_file, retry_timeout):
+        retry = run_cvc(goal_smt_file, retry_timeout)
+        if retry.proved:
             logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
             return True, [], []
         return False, [], []
@@ -512,20 +829,31 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
         return False, [], extracted_asserts
 
 
-    # 步骤6: 检查引理是否有助于证明原目标
+    # 步骤6: 检查引理是否有助于证明原目标（子集搜索 / stats / difficulty）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
-    if not verify_combined_lemmas(original_assert, extracted_asserts, smt_content, combined_path):
-        logging.error("生成引理未能帮助证明原目标")
-        # 记录无用引理组合
-        add_useless_lemma_group(base_path, goal_smt_name, extracted_asserts)
+    useful, selected_lemmas, _cres = verify_combined_lemmas(
+        original_assert,
+        extracted_asserts,
+        smt_content,
+        combined_path,
+        base_path=base_path,
+        goal_name=goal_smt_name,
+    )
+    if not useful:
+        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
         return False, [], extracted_asserts
-    else:
-        logging.info("lemmas有用，生成lemmas验证文件，检查lemmas是否成立")
+
+    logging.info(
+        "lemmas有用，保留 %d/%d 条用于子目标生成",
+        len(selected_lemmas), len(extracted_asserts),
+    )
 
     # 步骤7: 生成正式验证文件
-    generated_files = generate_formal_proof_files(extracted_asserts, smt_content, smt_file_path, goal_smt_name)
+    generated_files = generate_formal_proof_files(
+        selected_lemmas, smt_content, smt_file_path, goal_smt_name
+    )
     
-    return True, generated_files, extracted_asserts
+    return True, generated_files, selected_lemmas
 
 def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_lemmas: List[str] = None, parent_goal_name: str = None) -> bool:
     """并行执行多个子目标的验证，如果任何一个失败就立即终止所有进程"""
@@ -548,11 +876,35 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                     result = future.result()
                     if not result:
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
-                        # 记录导致子目标失败的引理到父目标的失败记录中
                         if parent_lemmas and parent_goal_name:
                             for lemma in parent_lemmas:
-                                add_invalid_lemma(base_path, parent_goal_name, lemma, f"导致子目标{subgoal}验证失败")
-                        # 取消所有未完成的任务
+                                add_invalid_lemma(
+                                    base_path, parent_goal_name, lemma,
+                                    f"导致子目标{subgoal}验证失败",
+                                )
+                            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
+                            if subgoal_file.exists():
+                                diag = run_cvc_diagnostic(
+                                    subgoal_file,
+                                    timeout=_DIAGNOSTIC_TIMEOUT,
+                                    collect_difficulty=True,
+                                )
+                                hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
+                                hints.append({
+                                    "kind": "subgoal_failed",
+                                    "context": f"subgoal:{subgoal}",
+                                    "detail": (
+                                        f"Lemma was useful for the parent goal but its own proof "
+                                        f"({subgoal}) failed under cvc5. Generate easier lemmas, "
+                                        f"or lemmas that help prove this subgoal directly."
+                                    ),
+                                    "hard_axioms": [t for t, _ in diag.difficulty[:4]],
+                                    "suggested_actions": [
+                                        "Propose a weaker/simpler variant of the failing lemma",
+                                        "Add bridging lemmas targeting high-difficulty axioms",
+                                    ],
+                                })
+                                add_repair_hints(base_path, parent_goal_name, hints)
                         for f in future_to_subgoal:
                             if not f.done():
                                 f.cancel()
@@ -561,11 +913,9 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                         logging.info(f"✅ 子目标 {subgoal} 验证成功")
                 except Exception as e:
                     logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
-                    # 记录导致异常的引理到父目标的失败记录中
                     if parent_lemmas and parent_goal_name:
                         for lemma in parent_lemmas:
                             add_invalid_lemma(base_path, parent_goal_name, lemma, f"导致子目标{subgoal}执行异常: {e}")
-                    # 取消所有未完成的任务
                     for f in future_to_subgoal:
                         if not f.done():
                             f.cancel()
