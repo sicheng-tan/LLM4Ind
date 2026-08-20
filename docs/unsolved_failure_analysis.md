@@ -177,6 +177,8 @@ LLM4Ind / ProofMate 的核心流程：
 - **S1（主导）**：后端无法正确解释输入；LLM 生成再多引理也无法弥补。  
 - 部分题即便换成 cvc5，本身也难（排序正确性、正则语言、weird_nat 多元运算），但仍应优先视为 **求解器前端限制**，而非引理策略失败。
 
+**临时改写（已实现）：** Vampire 路径在送入求解器前把 `(is-C t)` 改写成 SMT-LIB2 索引形式 `((_ is C) t)`（`smt_adt_tester_rewrite.py`，由 `vampire_runner.prepare_vampire_smt_input` 写临时文件，不改 `benchmarks/`）。cvc5 上二者定义等价。测试见 `tests/test_adt_tester_rewrite.py`：119 个 `standard/` 模板共 880 处 tester 全部改写干净；改写后 Vampire 全部可解析（0 parse error）；`--schedule induction`、20s 墙钟下 **18/119** 直接 `unsat`（改写前全部因 `Unrecognized term identifier 'is-…'` 失败）。其余 101 题已不再是 S1 解析问题，仍受归纳难度约束。
+
 ### 4.2 `extend/` 中仍失败的 3 题（代表：`extend/count_tsort_flatten`）
 
 **同类：** `count_tsort_flatten`，`len_tsort_flatten`，`tsort_sort`（均超时 ~1200s）
@@ -254,7 +256,8 @@ LLM4Ind / ProofMate 的核心流程：
 ### A. 后端不支持（优先修求解器路径 / 预处理）
 
 - AutoProofBM `standard/*` 的 `is-*` / `ite(is-…)`（约 119 题）。  
-- **建议**：Vampire 路径上改写为显式 constructor 匹配；或此类题强制走 CVC5 后端。
+- **已做**：Vampire 输入临时改写为 `((_ is C) t)`（默认开启，`VAMPIRE_REWRITE_TESTERS=off` 可关）。20s induction 下 18/119 可证，119/119 可解析。  
+- **仍可选**：此类题分流到 CVC5；或对剩余难例加大超时 / 引理生成。
 
 ### B. ADT + LIA 混合（Vampire 弱项）
 
@@ -306,9 +309,9 @@ LLM4Ind / ProofMate 的核心流程：
 
 ## 8. 小结
 
-1. **253** 道未证中，约 **一半（~119）** 可归因于 Vampire 不支持 AutoProofBM `standard/` 的 SMT-LIB2 ADT tester（**S1**），换后端或改写输入即可大幅下降未证数。  
+1. **253** 道未证中，约 **一半（~119）** 原先可归因于 Vampire 不支持 AutoProofBM `standard/` 的 SMT-LIB2 ADT tester（**S1**）。临时改写 `is-*` → `((_ is C) …)` 后，解析障碍已消除（119/119 可解析；20s Vampire induction 直接证出 18 题）。其余 101 题转为普通归纳难度，不再是前端 S1。  
 2. **StandardDTLIA（88）** 主要暴露 Vampire 在 ADT+LIA 上的短板（**S4**），与方法的引理策略关系次之。  
-3. 真正考验当前 LLM 引理流程的，是 **堆/树不变量、旋转与 Nicomachus、IndBen 的 ∃/关系题、以及 extend 中少数树排序题**（**S2/S3/S5**）。  
-4. 后续改进应分三条线并行：**(i)** Vampire 输入规范化 / 分流到 CVC5；**(ii)** 扩展提示覆盖不变量与存在量词；**(iii)** 加强求解器引导的 repair（归纳焦点、progress、ucore）以降低长链超时。
+3. 真正考验当前 LLM 引理流程的，是 **堆/树不变量、旋转与 Nicomachus、IndBen 的 ∃/关系题、以及 extend 中少数树排序题**（**S2/S3/S5**），加上改写后仍未证的 AutoProofBM `standard/` 难例。  
+4. 后续改进应分三条线并行：**(i)** 已落地的 Vampire tester 规范化，必要时再分流到 CVC5；**(ii)** 扩展提示覆盖不变量与存在量词；**(iii)** 加强求解器引导的 repair（归纳焦点、progress、ucore）以降低长链超时。
 
 完整逐题列表见对话产物 canvas：`canvases/unsolved-proof-tasks.canvas.tsx`（若本地存在）。

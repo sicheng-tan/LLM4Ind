@@ -4,9 +4,12 @@ import time
 import os
 import re
 import signal
+import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
 
 try:
     from dotenv import load_dotenv
@@ -57,6 +60,43 @@ def run_vampire_with_timeout(smt2_path, timeout=60) -> bool:
     return run_vampire(smt2_path, timeout=timeout).proved
 
 
+def _vampire_rewrite_enabled() -> bool:
+    val = os.getenv("VAMPIRE_REWRITE_TESTERS", "on").strip().lower()
+    return val not in ("0", "off", "false", "no")
+
+
+def prepare_vampire_smt_input(smt2_path: Path) -> Tuple[Path, Optional[Path]]:
+    """Return (path_to_feed_vampire, temp_file_to_delete_or_None).
+
+    AutoProofBM `standard/` uses SMT-LIB2 shorthand testers `(is-Cons x)` that
+    Vampire 4.9 cannot parse. Rewrite them to `((_ is Cons) x)` in a temp file.
+    """
+    smt2_path = Path(smt2_path)
+    if not _vampire_rewrite_enabled():
+        return smt2_path, None
+    text = smt2_path.read_text(encoding="utf-8")
+    if not needs_tester_rewrite(text):
+        return smt2_path, None
+    rewritten, n = rewrite_smtlib_testers(text)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".smt2",
+        prefix="vamp_tester_rw_",
+        delete=False,
+        encoding="utf-8",
+    )
+    try:
+        tmp.write(rewritten)
+    finally:
+        tmp.close()
+    logging.debug(
+        "Rewrote %d SMT-LIB2 ADT testers for Vampire: %s -> %s",
+        n, smt2_path, tmp.name,
+    )
+    tmp_path = Path(tmp.name)
+    return tmp_path, tmp_path
+
+
 def run_vampire(
     smt2_path,
     timeout: int = 60,
@@ -74,6 +114,7 @@ def run_vampire(
         return VampireResult(status="error", error="VAMPIRE_BINARY not configured")
 
     smt2_path = Path(smt2_path)
+    run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
     command = [
         vampire_binary,
         "-t", f"{timeout}s",
@@ -103,8 +144,15 @@ def run_vampire(
                 "--print_proofs_to_file", str(proof_file),
             ])
 
-    command.append(str(smt2_path))
-    return _execute_vampire(command, timeout, collect_ucore=collect_ucore)
+    command.append(str(run_path))
+    try:
+        return _execute_vampire(command, timeout, collect_ucore=collect_ucore)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def run_vampire_diagnostic(
@@ -122,6 +170,7 @@ def run_vampire_diagnostic(
         return VampireResult(status="error", error="VAMPIRE_BINARY not configured")
 
     smt2_path = Path(smt2_path)
+    run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
     command = [
         vampire_binary,
         "-t", f"{timeout}s",
@@ -137,8 +186,15 @@ def run_vampire_diagnostic(
     ]
     if show_induction:
         command.extend(["--show_induction", "on"])
-    command.append(str(smt2_path))
-    return _execute_vampire(command, timeout, collect_ucore=False)
+    command.append(str(run_path))
+    try:
+        return _execute_vampire(command, timeout, collect_ucore=False)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def parse_vampire_stats(text: str) -> Dict[str, int]:
