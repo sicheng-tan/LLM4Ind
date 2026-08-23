@@ -20,6 +20,22 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from solver_relative_metrics import (
+    CONJ_SHARE_MIN,
+    EXPLOSION_LOG_GAIN,
+    INST_PER_SKOLEM_MAX,
+    SKOLEM_PER_CONJ_MAX,
+    SKOLEM_SHARE_MIN,
+    activity_rate,
+    gain_score,
+    in_problem_hard_cutoff,
+    is_relative_drop,
+    is_relative_gain,
+    log_gain,
+    pct_label,
+    relative_drop,
+)
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -351,6 +367,15 @@ def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
     return out[:12]
 
 
+def _cvc_stat_rate(stats: Dict[str, int], elapsed: float, key: str) -> float:
+    count = int(stats.get(key, 0))
+    time_s = elapsed
+    ms = stats.get("TOTAL_TIME_MS", 0)
+    if ms:
+        time_s = max(time_s, ms / 1000.0)
+    return activity_rate(count, time_s)
+
+
 def compute_progress_score(
     baseline: CvcResult,
     candidate: CvcResult,
@@ -358,49 +383,51 @@ def compute_progress_score(
     control: Optional[CvcResult] = None,
 ) -> Tuple[float, List[str]]:
     """
-    Score whether lemmas made cvc5 less stuck, using stats deltas.
-    If control is provided, only credit gains beyond the control run.
+    Score whether lemmas made cvc5 less stuck, using relative stats deltas.
+
+    Gains are log1p relative increases of per-second rates vs the control
+    (or baseline) run. Difficulty uses in-problem relative drops, not a
+    fixed point cutoff.
     """
     if candidate.proved:
         return 100.0, ["proved_goal"]
     if candidate.status == "error":
         return -10.0, ["solver_error"]
 
-    b, c = baseline.stats, candidate.stats
-    ctrl = control.stats if control is not None else {}
+    c = candidate.stats
+    ref_stats = control.stats if control is not None else baseline.stats
+    ref_elapsed = control.elapsed if control is not None else baseline.elapsed
+    cand_elapsed = candidate.elapsed
     signals: List[str] = []
     score = 0.0
 
-    def over_control(key: str) -> int:
-        if control is None:
-            return int(c.get(key, 0)) - int(b.get(key, 0))
-        return int(c.get(key, 0)) - int(ctrl.get(key, 0))
-
-    conj = over_control("CONJ_TOTAL")
-    inst = over_control("INST_TOTAL")
-    skol = over_control("QUANTIFIERS_SKOLEMIZE")
-    dt = over_control("DT_TOTAL")
+    conj_c = _cvc_stat_rate(c, cand_elapsed, "CONJ_TOTAL")
+    conj_r = _cvc_stat_rate(ref_stats, ref_elapsed, "CONJ_TOTAL")
+    inst_c = _cvc_stat_rate(c, cand_elapsed, "INST_TOTAL")
+    inst_r = _cvc_stat_rate(ref_stats, ref_elapsed, "INST_TOTAL")
+    skol_c = _cvc_stat_rate(c, cand_elapsed, "QUANTIFIERS_SKOLEMIZE")
+    skol_r = _cvc_stat_rate(ref_stats, ref_elapsed, "QUANTIFIERS_SKOLEMIZE")
+    dt_c = _cvc_stat_rate(c, cand_elapsed, "DT_TOTAL")
+    dt_r = _cvc_stat_rate(ref_stats, ref_elapsed, "DT_TOTAL")
     strong = 0
 
-    # More productive conjecture-gen beyond control ≈ theory exploration progress
-    if conj > 20:
-        score += min(conj / 80.0, 2.5)
-        signals.append(f"more_conjecture_gen(+{conj})")
+    if is_relative_gain(conj_c, conj_r):
+        score += gain_score(conj_c, conj_r, 2.5)
+        signals.append(f"more_conjecture_gen(+{pct_label(conj_c, conj_r)}%)")
         strong += 1
-    if skol > 0:
-        score += min(skol, 2.0)
-        signals.append(f"more_skolemize(+{skol})")
+    if is_relative_gain(skol_c, skol_r, rare=True):
+        score += min(2.0, 0.4 + gain_score(skol_c, skol_r, 1.6))
+        signals.append(f"more_skolemize(+{pct_label(skol_c, skol_r)}%)")
         strong += 1
-    if inst > 50:
-        score += min(inst / 200.0, 2.0)
-        signals.append(f"more_instantiations(+{inst})")
+    if is_relative_gain(inst_c, inst_r):
+        score += gain_score(inst_c, inst_r, 2.0)
+        signals.append(f"more_instantiations(+{pct_label(inst_c, inst_r)}%)")
         strong += 1
-    if dt > 10:
-        score += min(dt / 40.0, 1.5)
-        signals.append(f"more_datatype_inference(+{dt})")
+    if is_relative_gain(dt_c, dt_r, rare=True):
+        score += gain_score(dt_c, dt_r, 1.5)
+        signals.append(f"more_datatype_inference(+{pct_label(dt_c, dt_r)}%)")
         strong += 1
 
-    # Difficulty: if goal assertion difficulty drops, that is progress
     def goal_diff(res: CvcResult) -> Optional[int]:
         for term, s in res.difficulty:
             if "(not" in term and "forall" in term:
@@ -408,22 +435,36 @@ def compute_progress_score(
         return None
 
     gb, gc = goal_diff(baseline), goal_diff(candidate)
-    if gb is not None and gc is not None and gc < gb:
-        score += 1.5
-        signals.append(f"goal_difficulty_drop({gb}->{gc})")
+    if gb is not None and gc is not None and is_relative_drop(gb, gc):
+        drop = relative_drop(gb, gc)
+        score += 1.5 * min(drop / 0.5, 1.0)
+        signals.append(f"goal_difficulty_drop({gb}->{gc},{int(round(100 * drop))}%)")
         strong += 1
 
-    # High-difficulty recursive axioms that drop after adding lemmas
     if baseline.difficulty and candidate.difficulty:
         b_map = {t: s for t, s in baseline.difficulty}
         dropped = 0
         for t, s in candidate.difficulty:
-            if t in b_map and s + 2 < b_map[t]:
+            if t in b_map and is_relative_drop(b_map[t], s):
                 dropped += 1
         if dropped >= 1:
             score += min(dropped * 0.75, 2.0)
             signals.append(f"axiom_difficulty_drop(x{dropped})")
             strong += 1
+
+    productive = any(
+        s.startswith("more_skolemize")
+        or s.startswith("goal_difficulty")
+        or s.startswith("axiom_difficulty")
+        or s.startswith("more_datatype")
+        or s.startswith("more_instantiations")
+        for s in signals
+    )
+    # Conjecture-gen is the enumeration-volume proxy; do not treat INST_TOTAL
+    # growth itself as explosion (that is also the matching-progress signal).
+    if log_gain(conj_c, conj_r) >= EXPLOSION_LOG_GAIN and not productive:
+        score -= min(gain_score(conj_c, conj_r, 1.5), 1.5)
+        signals.append(f"search_explosion(+{pct_label(conj_c, conj_r)}%)")
 
     if strong < 2 and "more_skolemize" not in "".join(signals) and "goal_difficulty" not in "".join(signals):
         if score > 0:
@@ -443,10 +484,12 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     hints: List[dict] = []
     stats = result.stats
 
-    hard_axioms = [
-        t for t, s in result.difficulty
-        if s >= 3 and "forall" in t and "(not" not in t
-    ][:4]
+    axiom_items = [
+        (t, s) for t, s in result.difficulty
+        if "forall" in t and "(not" not in t and s > 0
+    ]
+    cutoff = in_problem_hard_cutoff([s for _, s in axiom_items])
+    hard_axioms = [t for t, s in axiom_items if s >= cutoff][:4]
     goal_bits = [t for t, s in result.difficulty if "(not" in t][:2]
 
     if hard_axioms or goal_bits:
@@ -471,34 +514,43 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     conj = stats.get("CONJ_TOTAL", 0)
     skol = stats.get("QUANTIFIERS_SKOLEMIZE", 0)
     inst = stats.get("INST_TOTAL", 0)
+    q_activity = conj + skol + inst
 
-    if conj >= 50 and skol <= 2:
-        hints.append({
-            "kind": "need_stronger_lemma",
-            "context": context,
-            "detail": (
-                "cvc5 conjecture-gen was active but skolem/induction strengthening "
-                "stayed low. Likely missing a stronger inductive lemma (generalization)."
-            ),
-            "suggested_actions": [
-                "Strengthen or generalize the goal into an inductive lemma",
-                "Try associativity/commutativity/distributivity style facts",
-            ],
-        })
-    elif skol >= 3 and inst < 30:
-        hints.append({
-            "kind": "need_rewrite",
-            "context": context,
-            "detail": (
-                "cvc5 skolemized (induction-like) but instantiations stayed sparse. "
-                "Missing rewrite-oriented lemmas may be blocking matching."
-            ),
-            "suggested_actions": [
-                "Propose rewrite lemmas whose LHS matches a subterm of the goal",
-                "Unfold recursive definitions one step in a lemma",
-            ],
-        })
-    elif result.status in ("timeout", "unknown") and not hints:
+    if q_activity > 0:
+        conj_share = conj / q_activity
+        skol_share = skol / q_activity
+        skol_per_conj = skol / max(conj, 1)
+        inst_per_skol = inst / max(skol, 1)
+        if conj_share >= CONJ_SHARE_MIN and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
+            hints.append({
+                "kind": "need_stronger_lemma",
+                "context": context,
+                "detail": (
+                    "cvc5 conjecture-gen is a large share of quantifier activity "
+                    "but skolem/induction strengthening stays relatively low. "
+                    "Likely missing a stronger inductive lemma (generalization)."
+                ),
+                "suggested_actions": [
+                    "Strengthen or generalize the goal into an inductive lemma",
+                    "Try associativity/commutativity/distributivity style facts",
+                ],
+            })
+        elif skol_share >= SKOLEM_SHARE_MIN and inst_per_skol < INST_PER_SKOLEM_MAX:
+            hints.append({
+                "kind": "need_rewrite",
+                "context": context,
+                "detail": (
+                    "cvc5 skolemized (induction-like) but instantiations are sparse "
+                    "relative to that skolemization. Missing rewrite-oriented lemmas "
+                    "may be blocking matching."
+                ),
+                "suggested_actions": [
+                    "Propose rewrite lemmas whose LHS matches a subterm of the goal",
+                    "Unfold recursive definitions one step in a lemma",
+                ],
+            })
+
+    if result.status in ("timeout", "unknown") and not hints:
         hints.append({
             "kind": "timeout",
             "context": context,

@@ -10,6 +10,19 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
+from solver_relative_metrics import (
+    EXPLOSION_LOG_GAIN,
+    INDUCTION_PER_REWRITE_MAX,
+    INDUCTION_SHARE_MIN,
+    INTEGER_INDUCTION_SHARE_MIN,
+    REWRITE_PER_INDUCTION_MAX,
+    REWRITE_SHARE_MIN,
+    activity_rate,
+    gain_score,
+    is_relative_gain,
+    log_gain,
+    pct_label,
+)
 
 try:
     from dotenv import load_dotenv
@@ -289,6 +302,15 @@ def classify_status(stdout: str, stderr: str, returncode: int, timed_out: bool) 
     return "unknown"
 
 
+def _vampire_stat_rate(
+    stats: Dict[str, int],
+    elapsed: float,
+    *keys: str,
+) -> float:
+    total = sum(int(stats.get(k, 0)) for k in keys)
+    return activity_rate(total, elapsed)
+
+
 def compute_progress_score(
     baseline: VampireResult,
     candidate: VampireResult,
@@ -299,8 +321,8 @@ def compute_progress_score(
     Score whether adding lemmas made Vampire 'less stuck'.
     Returns (score, human-readable signals). Higher is better; >0 means progress.
 
-    If `control` is provided (e.g. baseline+trivial assert true), only credit
-    signals that exceed the control run — filters out spurious clause inflation.
+    Comparisons use log1p relative gain of per-second rates vs the control
+    (or baseline) run, so small Nat tasks and large ADT searches share one gate.
     """
     if candidate.proved:
         return 100.0, ["proved_goal"]
@@ -310,38 +332,37 @@ def compute_progress_score(
     signals: List[str] = []
     score = 0.0
     b, c = baseline.stats, candidate.stats
-    ctrl = control.stats if control is not None else {}
+    ref_stats = control.stats if control is not None else b
+    ref_elapsed = control.elapsed if control is not None else baseline.elapsed
+    cand_elapsed = candidate.elapsed
 
-    def delta(key: str) -> int:
-        return int(c.get(key, 0)) - int(b.get(key, 0))
-
-    def delta_over_control(key: str) -> int:
-        """Extra gain of candidate vs control, relative to the same baseline."""
-        if control is None:
-            return delta(key)
-        return int(c.get(key, 0)) - int(ctrl.get(key, 0))
-
-    # Rewrite / demodulation growth beyond control ≈ real equational progress.
-    dem_delta = delta_over_control("Fw demodulations") + delta_over_control("Bw demodulations")
-    taut_delta = delta_over_control("Fw demodulations to eq. taut.")
-    ind_delta = (
-        delta_over_control("InductionApplications")
-        + delta_over_control("GeneralizedInductionApplications")
-        + delta_over_control("StructuralInduction")
+    dem_c = _vampire_stat_rate(c, cand_elapsed, "Fw demodulations", "Bw demodulations")
+    dem_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations", "Bw demodulations")
+    taut_c = _vampire_stat_rate(c, cand_elapsed, "Fw demodulations to eq. taut.")
+    taut_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations to eq. taut.")
+    ind_c = _vampire_stat_rate(
+        c, cand_elapsed,
+        "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
+    )
+    ind_r = _vampire_stat_rate(
+        ref_stats, ref_elapsed,
+        "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
     )
 
     strong = 0
-    if dem_delta > 100:
-        score += min(dem_delta / 250.0, 2.5)
-        signals.append(f"more_demodulations(+{dem_delta})")
+    if is_relative_gain(dem_c, dem_r):
+        score += gain_score(dem_c, dem_r, 2.5)
+        signals.append(
+            f"more_demodulations(+{pct_label(dem_c, dem_r)}%)"
+        )
         strong += 1
-    if taut_delta > 8:
-        score += 1.25
-        signals.append(f"more_eq_taut_demod(+{taut_delta})")
+    if is_relative_gain(taut_c, taut_r, rare=True):
+        score += min(1.25, 0.5 + gain_score(taut_c, taut_r, 0.75))
+        signals.append(f"more_eq_taut_demod(+{pct_label(taut_c, taut_r)}%)")
         strong += 1
-    if ind_delta > 8:
-        score += min(ind_delta / 40.0, 2.0)
-        signals.append(f"more_induction_activity(+{ind_delta})")
+    if is_relative_gain(ind_c, ind_r, rare=True):
+        score += gain_score(ind_c, ind_r, 2.0)
+        signals.append(f"more_induction_activity(+{pct_label(ind_c, ind_r)}%)")
         strong += 1
 
     # Fewer leftover passive clauses under similar generation can mean better focus.
@@ -349,21 +370,34 @@ def compute_progress_score(
     gen_c = c.get("Generated clauses", 0)
     pas_b = b.get("Final passive clauses", 0)
     pas_c = c.get("Final passive clauses", 0)
-    if gen_b > 100 and gen_c > 100 and pas_b > 0:
+    if gen_b >= 1 and gen_c >= 1 and pas_b > 0:
         ratio_b = pas_b / max(gen_b, 1)
         ratio_c = pas_c / max(gen_c, 1)
-        # Also require improvement over control passive ratio when available
         better_than_control = True
         if control is not None:
-            gen_k = ctrl.get("Generated clauses", 0)
-            pas_k = ctrl.get("Final passive clauses", 0)
-            if gen_k > 100 and pas_k > 0:
+            gen_k = ref_stats.get("Generated clauses", 0)
+            pas_k = ref_stats.get("Final passive clauses", 0)
+            if gen_k >= 1 and pas_k > 0:
                 ratio_k = pas_k / max(gen_k, 1)
                 better_than_control = ratio_c + 1e-9 < 0.9 * ratio_k
         if better_than_control and ratio_c + 1e-9 < 0.7 * ratio_b:
             score += 1.0
             signals.append("lower_passive_ratio")
             strong += 1
+
+    # Volume-up without product (eq-taut / induction / focus) ≈ explosion.
+    gen_c_rate = activity_rate(gen_c, cand_elapsed)
+    gen_r_rate = activity_rate(ref_stats.get("Generated clauses", 0), ref_elapsed)
+    productive = any(
+        s.startswith("more_eq_taut_demod")
+        or s.startswith("more_induction")
+        or s == "lower_passive_ratio"
+        for s in signals
+    )
+    if log_gain(gen_c_rate, gen_r_rate) >= EXPLOSION_LOG_GAIN and not productive:
+        penalty = min(gain_score(gen_c_rate, gen_r_rate, 1.5), 1.5)
+        score -= penalty
+        signals.append(f"search_explosion(+{pct_label(gen_c_rate, gen_r_rate)}%)")
 
     # Require at least two independent signals, or one strong induction/eq-taut signal.
     if strong < 2 and "more_eq_taut_demod" not in "".join(signals) and "more_induction" not in "".join(signals):
@@ -385,7 +419,17 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
     stats = result.stats
 
     dem = stats.get("Fw demodulations", 0) + stats.get("Bw demodulations", 0)
-    ind = stats.get("InductionApplications", 0) + stats.get("StructuralInduction", 0)
+    ind = (
+        stats.get("InductionApplications", 0)
+        + stats.get("StructuralInduction", 0)
+        + stats.get("GeneralizedInductionApplications", 0)
+    )
+    mix = ind + dem
+    int_ind = (
+        stats.get("IntegerInfiniteIntervalInduction", 0)
+        + stats.get("IntegerFiniteIntervalInduction", 0)
+    )
+    struct_like = ind
 
     if result.induction_focus:
         hints.append({
@@ -404,30 +448,54 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             ],
         })
 
-    if ind >= 10 and dem < 100:
+    # Diagnose mix imbalance (shares), not absolute counts.
+    if mix > 0:
+        ind_share = ind / mix
+        dem_share = dem / mix
+        rewrite_per_ind = dem / max(ind, 1)
+        ind_per_rewrite = ind / max(dem, 1)
+        if ind_share >= INDUCTION_SHARE_MIN and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
+            hints.append({
+                "kind": "need_rewrite",
+                "context": context,
+                "detail": (
+                    "Induction is a large share of Vampire activity but rewriting is "
+                    "scarce relative to it. Likely missing equational lemmas that "
+                    "enable rewriting under the IH."
+                ),
+                "suggested_actions": [
+                    "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
+                    "Prefer lemmas whose LHS matches a subterm of the proof goal",
+                ],
+            })
+        elif dem_share >= REWRITE_SHARE_MIN and ind_per_rewrite < INDUCTION_PER_REWRITE_MAX:
+            hints.append({
+                "kind": "need_induction_lemma",
+                "context": context,
+                "detail": (
+                    "Rewriting dominates search while productive induction stays a "
+                    "small share. Try a stronger inductive lemma (generalization / "
+                    "strengthen conclusion)."
+                ),
+                "suggested_actions": [
+                    "Strengthen or generalize the goal into an inductive lemma",
+                    "Introduce an accumulator / helper-function identity if applicable",
+                ],
+            })
+
+    ind_all = struct_like + int_ind
+    if ind_all > 0 and int_ind / ind_all >= INTEGER_INDUCTION_SHARE_MIN:
         hints.append({
-            "kind": "need_rewrite",
+            "kind": "need_arithmetic_lemma",
             "context": context,
             "detail": (
-                "Many induction applications but little demodulation/rewriting progress. "
-                "Likely missing equational lemmas that enable rewriting under the IH."
+                "Integer-interval induction dominates structural induction. "
+                "Prefer arithmetic bridge / monotonicity / recurrence lemmas "
+                "rather than ADT constructor facts."
             ),
             "suggested_actions": [
-                "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
-                "Prefer lemmas whose LHS matches a subterm of the proof goal",
-            ],
-        })
-    elif dem >= 500 and ind < 5:
-        hints.append({
-            "kind": "need_induction_lemma",
-            "context": context,
-            "detail": (
-                "Plenty of rewriting but little productive induction. "
-                "Try a stronger inductive lemma (generalization / strengthen conclusion)."
-            ),
-            "suggested_actions": [
-                "Strengthen or generalize the goal into an inductive lemma",
-                "Introduce an accumulator / helper-function identity if applicable",
+                "Generate arithmetic bridge or monotonicity lemmas",
+                "Strengthen recurrences rather than adding constructor equalities",
             ],
         })
 

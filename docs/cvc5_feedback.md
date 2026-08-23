@@ -389,7 +389,7 @@ difficulty: List[Tuple[str, int]]
 
 ### 9.1 高难度公理
 
-如果存在 difficulty 较高的递归公理，代码生成：
+Hard axioms 取**当前问题**中 difficulty 为正的 forall 断言的中位数及以上（最多 4 条），而不是全局 `difficulty >= 3`。因此小型任务里最高的 `difficulty=2` 也会进入提示；大型任务里处于分布底部的 `difficulty=3` 则不会。
 
 ```json
 {
@@ -414,10 +414,10 @@ difficulty: List[Tuple[str, int]]
 
 ### 9.2 Difficulty 下降
 
-如果原始目标 difficulty 为 10，加入候选引理后变为 4，则记录：
+如果原始目标 difficulty 为 10，加入候选引理后变为 4（相对下降 60% ≥ 20%），则记录：
 
 ```text
-goal_difficulty_drop(10->4)
+goal_difficulty_drop(10->4,60%)
 ```
 
 如果某些递归公理的 difficulty 显著下降，则记录：
@@ -451,29 +451,16 @@ control 通常类似：
 当前可能产生的 progress signal 包括：
 
 ```text
-more_conjecture_gen(+40)
-more_instantiations(+239)
-more_skolemize(+3)
-more_datatype_inference(+60)
-goal_difficulty_drop(10->4)
+more_conjecture_gen(+40%)
+more_instantiations(+131%)
+more_skolemize(+50%)
+more_datatype_inference(+25%)
+goal_difficulty_drop(10->4,60%)
 axiom_difficulty_drop(x2)
+search_explosion(+80%)
 ```
 
-评分逻辑包括：
-
-```python
-if conj > 20:
-    signals.append(f"more_conjecture_gen(+{conj})")
-
-if skol > 0:
-    signals.append(f"more_skolemize(+{skol})")
-
-if inst > 50:
-    signals.append(f"more_instantiations(+{inst})")
-
-if dt > 10:
-    signals.append(f"more_datatype_inference(+{dt})")
-```
+评分使用每秒活动率的 log1p 相对增益，而不是 `conj > 20` / `inst > 50` 这类固定计数。Difficulty 使用本问题正分数的中位数作为 hard-axiom 截断，下降按相对比例（≥20%）计算。细节见 `docs/relative_metrics.md`。
 
 如果只有一个较弱信号，代码会降低 score，并附加：
 

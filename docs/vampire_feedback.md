@@ -344,8 +344,10 @@ dem_delta =
 可能得到：
 
 ```text
-more_demodulations(+1840)
+more_demodulations(+26%)
 ```
+
+比较的是相对 control 的每秒率 log-gain，而不是 `dem_delta > 100`。小问题 `20→45` 可以触发；大问题 `10000→10040` 不会。
 
 ### 5.3 `Fw demodulations to eq. taut.`
 
@@ -373,15 +375,13 @@ Fw demodulations to eq. taut.: 82
 more_eq_taut_demod(+46)
 ```
 
-当前代码中：
+当前代码对 **每秒活动率** 做 log1p 相对增益（约 +10% 即计入稀有事件），而不是 `taut_delta > 8`：
 
-```python
-if taut_delta > 8:
-    score += 1.25
-    signals.append(f"more_eq_taut_demod(+{taut_delta})")
+```text
+more_eq_taut_demod(+50%)
 ```
 
-这表示候选引理产生了有效等式化简，下一轮可以围绕相同的重写方向生成桥接引理。
+这表示候选引理产生了有效等式化简，下一轮可以围绕相同的重写方向生成桥接引理。相对化细节见 `docs/relative_metrics.md`。
 
 ## 六、Clause 与搜索规模信号
 
@@ -705,6 +705,8 @@ Vampire statistics
 ## 十三、工程注意事项
 
 不要直接比较 Vampire portfolio 的多个 statistics block。当前系统使用单策略 diagnostic run 进行 baseline/candidate/control 比较，避免不同 portfolio 策略的统计混在一起。
+
+Progress / repair 门槛已改为问题内相对量（log-gain、活动份额、搜索爆炸惩罚），见 `docs/relative_metrics.md`。
 
 此外，统计增加不等于证明质量提高。尤其是 superposition、generated clauses 和 demodulation 增加时，需要同时观察：
 
