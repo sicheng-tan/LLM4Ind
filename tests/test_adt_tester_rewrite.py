@@ -36,7 +36,8 @@ VAMPIRE = os.getenv("VAMPIRE_BINARY", str(ROOT / "vampire/vampire"))
 CVC5 = os.getenv("CVC5_BINARY", str(ROOT / "cvc/cvc5-Linux-x86_64-static/bin/cvc5"))
 
 # Effectiveness timeout per rewritten problem (Vampire induction portfolio).
-VAMPIRE_TIMEOUT_S = int(os.getenv("TEST_VAMPIRE_TIMEOUT", "20"))
+# Keep the default fast; increase TEST_VAMPIRE_TIMEOUT for benchmark runs.
+VAMPIRE_TIMEOUT_S = int(os.getenv("TEST_VAMPIRE_TIMEOUT", "2"))
 CVC5_TIMEOUT_MS = int(os.getenv("TEST_CVC5_TIMEOUT_MS", "8000"))
 MAX_WORKERS = int(os.getenv("TEST_MAX_WORKERS", "8"))
 
