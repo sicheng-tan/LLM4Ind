@@ -1,0 +1,21 @@
+Backend: {backend}
+Theory summary: {theory}
+Theory features JSON:
+{theory_features}
+
+The allowed Vampire profiles are:
+{profiles}
+
+The allowed lemma-generation prompt strategies are:
+{prompt_strategies}
+
+Recent solver failure/progress hints:
+{hints}
+
+Previous prompt/profile attempts:
+{history}
+
+Select the profile and the prompt strategy that are most likely to make
+progress on the current goal. Prefer a targeted strategy over a broad search
+when the evidence indicates search explosion. The profile cards describe
+expected effects; they are not proof results. Return only the required JSON.

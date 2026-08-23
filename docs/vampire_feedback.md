@@ -2,6 +2,10 @@
 
 本文整理 Vampire 反馈信息的形式、代码使用方式，以及这些信号如何帮助提高辅助引理的生成质量。
 
+理论分流、solver routing 与实验设计见 [feedback_guided_portfolio.md](feedback_guided_portfolio.md)。
+
+理论分流 / solver routing 的设计、代码改动与实验方案见 [feedback_guided_portfolio.md](feedback_guided_portfolio.md)。
+
 ## 一、Vampire 当前使用的信号
 
 当前 Vampire 路径主要使用五类信号：

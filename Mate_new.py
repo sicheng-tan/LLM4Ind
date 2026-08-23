@@ -3,19 +3,46 @@ import logging
 import sys
 import json
 import itertools
+import os
+import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Dict
 from logger_config import setup_colored_logger
 from env_config import setup_environment, setup_model
 from cvc5_runner import (
     run_cvc_solver_with_timeout,
     run_cvc,
     run_cvc_diagnostic,
+    run_cvc_probe,
+    run_cvc_routed,
     compute_progress_score,
     derive_repair_hints,
     CvcResult,
 )
+from solver_routing import (
+    GoalSearchState,
+    build_search_state,
+    fallback_profiles_for,
+    format_routing_for_prompt,
+    order_prompt_strategies,
+    probe_profile_count,
+    probe_timeout_s,
+    probes_enabled,
+    profile_utility_from_stats,
+    recommend_profiles,
+    record_pair_attempt,
+    record_profile_history,
+    select_top_profiles,
+    set_routing_candidates,
+    routing_enabled,
+)
+from profile_selector import (
+    choose_joint_action,
+    llm_selector_enabled,
+    routing_decider_mode,
+)
+from theory_features import analyze_smt
 
 # 配置彩色日志
 logger = setup_colored_logger()
@@ -49,6 +76,8 @@ def _empty_failed_data() -> dict:
         "useless_lemma_groups": [],
         "progress_lemmas": [],
         "repair_hints": [],
+        "unproved_lemmas": [],
+        "routing": {},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -62,6 +91,8 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("useless_lemma_groups", [])
             data.setdefault("progress_lemmas", [])
             data.setdefault("repair_hints", [])
+            data.setdefault("unproved_lemmas", [])
+            data.setdefault("routing", {})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -70,11 +101,28 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
 def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
     """保存失败引理记录"""
     failed_file = get_failed_lemmas_file(base_path, goal_name)
+    tmp_file = None
     try:
-        with open(failed_file, 'w', encoding='utf-8') as f:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            dir=failed_file.parent,
+            prefix=f".{failed_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_file = Path(f.name)
             json.dump(failed_data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, failed_file)
     except Exception as e:
         logging.error(f"保存失败引理文件出错: {e}")
+        if tmp_file is not None:
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
 
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     """添加无效引理记录"""
@@ -100,10 +148,16 @@ def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[st
     logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
 
 def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
-                       score: float, signals: List[str]):
+                       score: float, signals: List[str],
+                       *, profile: Optional[str] = None,
+                       profile_scores: Optional[dict] = None):
     """记录对卡住目标有统计/难度进展但尚未证出的引理"""
     failed_data = load_failed_lemmas(base_path, goal_name)
     record = {"lemma": lemma, "score": score, "signals": signals}
+    if profile:
+        record["best_profile"] = profile
+    if profile_scores:
+        record["profile_scores"] = profile_scores
     failed_data["progress_lemmas"] = [
         r for r in failed_data["progress_lemmas"] if r.get("lemma") != lemma
     ]
@@ -127,6 +181,76 @@ def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
             existing_keys.add(key)
     failed_data["repair_hints"] = existing[-_MAX_REPAIR_HINTS:]
     save_failed_lemmas(base_path, goal_name, failed_data)
+
+def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None):
+    """Record a lemma that was useful for the parent but whose own proof failed.
+
+    This is NOT invalid: do not put it in invalid_lemmas.
+    """
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data.setdefault("unproved_lemmas", [])
+    record = {"lemma": lemma, **(meta or {})}
+    for item in failed_data["unproved_lemmas"]:
+        if item.get("lemma") == lemma:
+            return
+    failed_data["unproved_lemmas"].append(record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def load_routing_state(base_path: str, goal_name: str) -> GoalSearchState:
+    return GoalSearchState.from_dict(load_failed_lemmas(base_path, goal_name).get("routing"))
+
+def save_routing_state(base_path: str, goal_name: str, state: GoalSearchState) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["routing"] = state.to_dict()
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def _diag_profile(base_path: str, goal_name: str) -> Optional[str]:
+    return load_routing_state(base_path, goal_name).active_profile
+
+def record_solver_attempt(
+    base_path: Optional[str],
+    goal_name: Optional[str],
+    *,
+    prompt_strategy: Optional[str],
+    selected_profile: Optional[str],
+    result: CvcResult,
+) -> None:
+    """Persist one prompt/profile outcome for routing and experiment telemetry."""
+    if not base_path or not goal_name:
+        return
+    state = load_routing_state(base_path, goal_name)
+    hint_kinds = [
+        h.get("kind", "")
+        for h in derive_repair_hints(result, context="attempt")
+        if h.get("kind")
+    ]
+    fallback_used = bool(
+        result.strategy
+        and result.strategy in state.fallback_profiles
+        and result.strategy not in state.candidate_profiles
+    )
+    utility = None
+    if routing_decider_mode() != "llm":
+        utility, _ = profile_utility_from_stats(
+            backend="cvc5",
+            proved=result.proved,
+            status=result.status,
+            stats=result.stats,
+            elapsed=result.elapsed,
+        )
+    state = record_pair_attempt(
+        state,
+        prompt_strategy=prompt_strategy,
+        profile=selected_profile or state.active_profile,
+        status=result.status,
+        proved=result.proved,
+        elapsed=result.elapsed,
+        utility=utility,
+        signals=hint_kinds,
+        fallback_used=fallback_used,
+        winner_profile=result.strategy if result.proved else None,
+    )
+    save_routing_state(base_path, goal_name, state)
 
 def format_solver_feedback_for_prompt(failed_data: dict) -> str:
     """把 cvc5 失败/进展/难度信号格式化进下一轮 LLM prompt。"""
@@ -163,10 +287,29 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
         )
         for i, record in enumerate(failed_data["progress_lemmas"], 1):
             signals = ", ".join(record.get("signals", []))
+            profile = record.get("best_profile")
+            profile_bit = f"; profile={profile}" if profile else ""
             parts.append(
-                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}): "
+                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}): "
                 f"{record['lemma']}"
             )
+
+    if failed_data.get("unproved_lemmas"):
+        parts.append(
+            "\n; USEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
+            "own proofs timed out. Do not discard them; generate weaker variants or "
+            "bridging lemmas for them:"
+        )
+        for i, record in enumerate(failed_data["unproved_lemmas"], 1):
+            parts.append(
+                f"; Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
+            )
+
+    routing_txt = format_routing_for_prompt(
+        GoalSearchState.from_dict(failed_data.get("routing"))
+    )
+    if routing_txt:
+        parts.append(routing_txt)
 
     if failed_data.get("repair_hints"):
         parts.append(
@@ -282,6 +425,19 @@ def _first_datatype_name(smt_content: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _control_lemma(smt_content: str) -> str:
+    """Build a well-typed tautological control for ADT or arithmetic goals."""
+    sort = _first_datatype_name(smt_content)
+    if sort is None:
+        if re.search(r"\bInt\b", smt_content):
+            sort = "Int"
+        elif re.search(r"\bReal\b", smt_content):
+            sort = "Real"
+    if sort:
+        return f"(forall ((x {sort})) (= x x))"
+    return "(= true true)"
+
+
 def _is_trivial_equational_lemma(lemma: str) -> bool:
     compact = re.sub(r'\s+', ' ', lemma.strip())
     eq = re.search(r'\(\s*=\s*', compact)
@@ -333,16 +489,21 @@ def analyze_lemma_progress(
     baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
     baseline_path.write_text(original_content)
     baseline = run_cvc_diagnostic(
-        baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+        baseline_path,
+        timeout=_DIAGNOSTIC_TIMEOUT,
+        collect_difficulty=True,
+        profile=_diag_profile(base_path, goal_name),
     )
     add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
 
-    dt = _first_datatype_name(original_content) or "Nat"
-    control_lemma = f"(forall ((x {dt})) (= x x))"
+    control_lemma = _control_lemma(original_content)
     control_path = work_dir / f"{goal_name}_diag_control.smt2"
     _write_combined_smt([control_lemma], original_content, control_path)
     control = run_cvc_diagnostic(
-        control_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=False
+        control_path,
+        timeout=_DIAGNOSTIC_TIMEOUT,
+        collect_difficulty=False,
+        profile=_diag_profile(base_path, goal_name),
     )
 
     progressive: List[Tuple[float, str, List[str]]] = []
@@ -353,7 +514,10 @@ def analyze_lemma_progress(
         cand_path = work_dir / f"{goal_name}_diag_subset_{idx}.smt2"
         _write_combined_smt(subset, original_content, cand_path)
         cand = run_cvc_diagnostic(
-            cand_path, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+            cand_path,
+            timeout=_DIAGNOSTIC_TIMEOUT,
+            collect_difficulty=True,
+            profile=_diag_profile(base_path, goal_name),
         )
         score, signals = compute_progress_score(baseline, cand, control=control)
         logging.info(
@@ -365,7 +529,10 @@ def analyze_lemma_progress(
                 if _is_trivial_equational_lemma(lemma):
                     continue
                 progressive.append((score, lemma, signals))
-                add_progress_lemma(base_path, goal_name, lemma, score, signals)
+                add_progress_lemma(
+                    base_path, goal_name, lemma, score, signals,
+                    profile=_diag_profile(base_path, goal_name),
+                )
 
     seen = set()
     ordered: List[str] = []
@@ -384,6 +551,9 @@ def verify_combined_lemmas(
     *,
     base_path: str = None,
     goal_name: str = None,
+    prompt_strategy: Optional[str] = None,
+    solver_profile: Optional[str] = None,
+    decision_source: Optional[str] = None,
 ) -> Tuple[bool, List[str], Optional[CvcResult]]:
     """
     验证引理组合有用性。cvc5 路径：
@@ -396,7 +566,25 @@ def verify_combined_lemmas(
     gname = goal_name or output_path.stem
 
     _write_combined_smt(asserts, original_content, output_path)
-    full = run_cvc(output_path, timeout=combined_timeout)
+    state = load_routing_state(base_path, gname) if base_path else GoalSearchState()
+    if solver_profile:
+        set_routing_candidates(
+            state,
+            [solver_profile],
+            active_profile=solver_profile,
+            active_prompt=prompt_strategy,
+        )
+        state.decision_source = decision_source or state.decision_source
+        if base_path:
+            save_routing_state(base_path, gname, state)
+    full = run_cvc_routed(output_path, timeout=combined_timeout, state=state)
+    record_solver_attempt(
+        base_path,
+        gname,
+        prompt_strategy=prompt_strategy,
+        selected_profile=solver_profile or state.active_profile,
+        result=full,
+    )
     if full.proved:
         logging.info("组合引理证出目标（cvc5 portfolio）")
         return True, list(asserts), full
@@ -405,7 +593,18 @@ def verify_combined_lemmas(
     for idx, subset in enumerate(_lemma_subsets(asserts), 1):
         sub_path = work_dir / f"{output_path.stem}_subset_{idx}.smt2"
         _write_combined_smt(subset, original_content, sub_path)
-        sub_res = run_cvc(sub_path, timeout=max(10, combined_timeout // 2))
+        sub_res = run_cvc_routed(
+            sub_path,
+            timeout=max(10, combined_timeout // 2),
+            state=state,
+        )
+        record_solver_attempt(
+            base_path,
+            gname,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or state.active_profile,
+            result=sub_res,
+        )
         if sub_res.proved:
             logging.info("子集引理证出目标: %d 条", len(subset))
             _write_combined_smt(subset, original_content, output_path)
@@ -452,11 +651,29 @@ def verify_combined_lemmas(
     return False, progressive, full
 
 
-def perform_initial_verification(goal_smt_file: Path) -> bool:
+def perform_initial_verification(
+    goal_smt_file: Path,
+    *,
+    base_path: Optional[str] = None,
+    goal_name: Optional[str] = None,
+) -> bool:
     """执行初始验证检查"""
     default_timeout = config['DEFAULT_CVC_TIMEOUT']
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
-    result = run_cvc(goal_smt_file, default_timeout)
+    routing_state = load_routing_state(str(goal_smt_file.parent), goal_smt_file.stem)
+    result = run_cvc_routed(
+        goal_smt_file,
+        default_timeout,
+        state=routing_state,
+    )
+    if routing_enabled() and base_path and goal_name:
+        record_solver_attempt(
+            base_path,
+            goal_name,
+            prompt_strategy=routing_state.active_prompt,
+            selected_profile=routing_state.active_profile,
+            result=result,
+        )
     if result.proved:
         logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
@@ -465,10 +682,117 @@ def perform_initial_verification(goal_smt_file: Path) -> bool:
     return False
 
 
-def seed_baseline_repair_hints(base_path: str, goal_name: str, goal_smt_file: Path) -> None:
-    """首次求助于 LLM 前，用 cvc5 诊断写入 repair hints。"""
+def seed_baseline_repair_hints(
+    base_path: str,
+    goal_name: str,
+    goal_smt_file: Path,
+    *,
+    parent_goal_name: Optional[str] = None,
+) -> None:
+    """首次求助于 LLM 前：理论分流、短 probe、repair hints。"""
+    content = goal_smt_file.read_text(encoding="utf-8")
+    features = analyze_smt(content)
+    parent_profile = None
+    if parent_goal_name:
+        parent_profile = load_routing_state(base_path, parent_goal_name).active_profile
+
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    hints = failed_data.get("repair_hints") or []
+    ranked_state = build_search_state(
+        "cvc5",
+        features,
+        hints,
+        parent_profile=parent_profile,
+    )
+
+    if routing_enabled() and probes_enabled() and not llm_selector_enabled():
+        probe_names = recommend_profiles(
+            "cvc5",
+            features,
+            hints,
+            parent_profile=parent_profile,
+        )[0][:probe_profile_count()]
+        probes = run_cvc_probe(goal_smt_file, probe_names, timeout=probe_timeout_s())
+        utilities: Dict[str, float] = {}
+        history = []
+        reference_name = next(
+            (
+                name for name in ("cvc5_inductive", "cvc5_simple", "cvc4_default")
+                if name in probes
+            ),
+            next(iter(probes), None),
+        )
+        reference = probes.get(reference_name) if reference_name else None
+        for name, res in probes.items():
+            if res.proved:
+                util, signals = (100.0, ["proved"])
+            elif name == reference_name or reference is None:
+                util, signals = (0.0, ["reference_profile"])
+            else:
+                util, signals = profile_utility_from_stats(
+                    backend="cvc5",
+                    proved=res.proved,
+                    status=res.status,
+                    stats=res.stats,
+                    elapsed=res.elapsed,
+                    reference_stats=reference.stats,
+                    reference_elapsed=reference.elapsed,
+                )
+            utilities[name] = util
+            history.append({
+                "profile": name,
+                "status": res.status,
+                "utility": round(util, 3),
+                "signals": signals[:6],
+            })
+            logging.info("cvc5 probe %s utility=%.2f status=%s signals=%s", name, util, res.status, signals)
+        state = build_search_state(
+            "cvc5",
+            features,
+            hints,
+            parent_profile=parent_profile,
+            utilities=utilities,
+            history=history,
+        )
+    elif llm_selector_enabled():
+        ranked_profiles, reasons = recommend_profiles(
+            "cvc5",
+            features,
+            hints,
+            parent_profile=parent_profile,
+        )
+        decision = choose_joint_action(
+            llm=llm,
+            backend="cvc5",
+            features=features,
+            candidate_profiles=ranked_profiles,
+            prompt_strategies=[
+                "prove_prompt_equational_reasoning",
+                "prove_prompt_term_rewrite",
+            ],
+            hints=hints,
+        )
+        state = ranked_state
+        state.routing_reasons = reasons
+        set_routing_candidates(
+            state,
+            [decision.profile],
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "llm"
+        state.decision_source = decision.source
+        state.decision_confidence = decision.confidence
+        state.routing_reasons.append(f"decision:{decision.reason}")
+    else:
+        state = ranked_state
+
+    save_routing_state(base_path, goal_name, state)
     diag = run_cvc_diagnostic(
-        goal_smt_file, timeout=_DIAGNOSTIC_TIMEOUT, collect_difficulty=True
+        goal_smt_file,
+        timeout=_DIAGNOSTIC_TIMEOUT,
+        collect_difficulty=True,
+        profile=state.active_profile,
     )
     add_repair_hints(base_path, goal_name, derive_repair_hints(diag, context="initial_goal"))
     if diag.difficulty:
@@ -476,6 +800,89 @@ def seed_baseline_repair_hints(base_path: str, goal_name: str, goal_smt_file: Pa
             "初始 cvc5 高难度断言: %s",
             [t[:80] for t, s in diag.difficulty[:3]],
         )
+    logging.info(
+        "cvc5 routing: active=%s candidates=%s reasons=%s",
+        state.active_profile, state.candidate_profiles, state.routing_reasons,
+    )
+
+
+def select_attempt_action(
+    base_path: str,
+    goal_name: str,
+    prompt_strategies: List[str],
+    *,
+    parent_goal_name: Optional[str] = None,
+    preferred_prompt: Optional[str] = None,
+) -> Tuple[GoalSearchState, object]:
+    """Select the next prompt/profile pair after the latest feedback."""
+    goal_file = Path(base_path) / f"{goal_name}.smt2"
+    content = goal_file.read_text(encoding="utf-8")
+    features = analyze_smt(content)
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    state = GoalSearchState.from_dict(failed_data.get("routing"))
+    parent_profile = state.parent_profile
+    if not parent_profile and parent_goal_name:
+        parent_profile = load_routing_state(base_path, parent_goal_name).active_profile
+    state.backend = "cvc5"
+    state.theory_features = features.to_dict()
+    state.parent_profile = parent_profile
+    if not state.fallback_profiles:
+        state.fallback_profiles = fallback_profiles_for("cvc5")
+    ranked, reasons = recommend_profiles(
+        "cvc5",
+        features,
+        failed_data.get("repair_hints") or [],
+        parent_profile=parent_profile,
+    )
+    if llm_selector_enabled():
+        decision = choose_joint_action(
+            llm=llm,
+            backend="cvc5",
+            features=features,
+            candidate_profiles=ranked,
+            prompt_strategies=prompt_strategies,
+            hints=failed_data.get("repair_hints") or [],
+            history=state.pair_history,
+            current_profile=state.active_profile,
+            current_prompt=preferred_prompt or state.active_prompt,
+        )
+        state = set_routing_candidates(
+            state,
+            [decision.profile],
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "llm"
+    else:
+        utilities = {
+            item.get("profile"): float(item.get("utility"))
+            for item in state.profile_history
+            if item.get("profile") and item.get("utility") is not None
+        }
+        candidates = select_top_profiles(ranked, utilities or None)
+        decision = choose_joint_action(
+            llm=None,
+            backend="cvc5",
+            features=features,
+            candidate_profiles=candidates,
+            prompt_strategies=prompt_strategies,
+            hints=failed_data.get("repair_hints") or [],
+            history=state.pair_history,
+            current_profile=state.active_profile,
+            current_prompt=preferred_prompt or state.active_prompt,
+        )
+        state = set_routing_candidates(
+            state,
+            candidates,
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "relative"
+    state.routing_reasons = (state.routing_reasons + reasons)[-8:]
+    state.decision_source = getattr(decision, "source", "static")
+    state.decision_confidence = getattr(decision, "confidence", 0.0)
+    save_routing_state(base_path, goal_name, state)
+    return state, decision
 
 
 def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
@@ -778,7 +1185,16 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
     return generated_files
 
 
-def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_path: str, baseline_only: bool = False) -> Tuple[bool, List[str], List[str]]:
+def quick_run(
+    base_path: str,
+    goal_smt_name: str,
+    prompt_strategy: str,
+    folder_path: str,
+    baseline_only: bool = False,
+    *,
+    solver_profile: Optional[str] = None,
+    decision_source: Optional[str] = None,
+) -> Tuple[bool, List[str], List[str]]:
     """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
     smt_file_path = Path(base_path)
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
@@ -801,8 +1217,19 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
 
     # 步骤2.5: 首次 LLM 前写入 cvc5 诊断反馈
     failed_data = load_failed_lemmas(base_path, goal_smt_name)
-    if not failed_data.get("repair_hints"):
+    if routing_enabled() and not failed_data.get("routing"):
         seed_baseline_repair_hints(base_path, goal_smt_name, goal_smt_file)
+    if solver_profile:
+        state = load_routing_state(base_path, goal_smt_name)
+        set_routing_candidates(
+            state,
+            [solver_profile],
+            active_profile=solver_profile,
+            active_prompt=prompt_strategy,
+        )
+        if decision_source:
+            state.decision_source = decision_source
+        save_routing_state(base_path, goal_smt_name, state)
     
     # 步骤3: 使用LLM生成引理
     extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path)
@@ -811,7 +1238,20 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
     if not extracted_asserts:
         logging.info("大模型未返回引理，尝试提高时间限制重新验证原目标")
         retry_timeout = config['RETRY_CVC_TIMEOUT']
-        retry = run_cvc(goal_smt_file, retry_timeout)
+        retry = run_cvc_routed(
+            goal_smt_file,
+            retry_timeout,
+            state=load_routing_state(base_path, goal_smt_name),
+        )
+        record_solver_attempt(
+            base_path,
+            goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or load_routing_state(
+                base_path, goal_smt_name
+            ).active_profile,
+            result=retry,
+        )
         if retry.proved:
             logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
             return True, [], []
@@ -820,12 +1260,36 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
     # TODO: 去掉这一部分做消融实验↓
     # 步骤4: 验证引理是否与原目标相同
     if not validate_lemmas_against_original(extracted_asserts, original_forall, base_path, goal_smt_name):
+        record_solver_attempt(
+            base_path,
+            goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or load_routing_state(
+                base_path, goal_smt_name
+            ).active_profile,
+            result=CvcResult(
+                status="invalid_lemma",
+                strategy=solver_profile or "",
+            ),
+        )
         return False, [], extracted_asserts
 
     # 步骤5: 创建验证文件并并行验证引理有效性
     valid_check_paths = create_validation_files(extracted_asserts, smt_content, smt_file_path, goal_smt_name)
     
     if not validate_lemmas_parallel(valid_check_paths, base_path, goal_smt_name):
+        record_solver_attempt(
+            base_path,
+            goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or load_routing_state(
+                base_path, goal_smt_name
+            ).active_profile,
+            result=CvcResult(
+                status="invalid_lemma",
+                strategy=solver_profile or "",
+            ),
+        )
         return False, [], extracted_asserts
 
 
@@ -838,6 +1302,9 @@ def quick_run(base_path: str, goal_smt_name: str, prompt_strategy: str, folder_p
         combined_path,
         base_path=base_path,
         goal_name=goal_smt_name,
+        prompt_strategy=prompt_strategy,
+        solver_profile=solver_profile,
+        decision_source=decision_source,
     )
     if not useful:
         logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
@@ -865,8 +1332,12 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
     # 使用ThreadPoolExecutor进行并行执行
     with ThreadPoolExecutor(max_workers=min(len(subgoals), 4)) as executor:
         # 提交所有任务，传递递增的深度参数
-        future_to_subgoal = {executor.submit(prove_run, base_path, subgoal, depth + 1, strategy_mode, baseline_only): subgoal 
-                            for subgoal in subgoals}
+        future_to_subgoal = {
+            executor.submit(
+                prove_run, base_path, subgoal, depth + 1, strategy_mode, baseline_only, parent_goal_name
+            ): subgoal
+            for subgoal in subgoals
+        }
         
         try:
             # 等待任务完成，一旦有任何失败就立即返回
@@ -878,9 +1349,13 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
                         if parent_lemmas and parent_goal_name:
                             for lemma in parent_lemmas:
-                                add_invalid_lemma(
+                                add_unproved_lemma(
                                     base_path, parent_goal_name, lemma,
-                                    f"导致子目标{subgoal}验证失败",
+                                    {
+                                        "status": "useful_but_unproved",
+                                        "blocking_subgoal": subgoal,
+                                        "profile": load_routing_state(base_path, subgoal).active_profile,
+                                    },
                                 )
                             subgoal_file = Path(base_path) / f"{subgoal}.smt2"
                             if subgoal_file.exists():
@@ -888,6 +1363,7 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                                     subgoal_file,
                                     timeout=_DIAGNOSTIC_TIMEOUT,
                                     collect_difficulty=True,
+                                    profile=load_routing_state(base_path, subgoal).active_profile,
                                 )
                                 hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
                                 hints.append({
@@ -905,6 +1381,17 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                                     ],
                                 })
                                 add_repair_hints(base_path, parent_goal_name, hints)
+                                parent_state = load_routing_state(base_path, parent_goal_name)
+                                child_state = load_routing_state(base_path, subgoal)
+                                if child_state.active_profile:
+                                    parent_state = record_profile_history(
+                                        parent_state,
+                                        child_state.active_profile or "unknown",
+                                        status="subgoal_failed",
+                                        utility=0.0,
+                                        signals=["subgoal_failed"],
+                                    )
+                                    save_routing_state(base_path, parent_goal_name, parent_state)
                         for f in future_to_subgoal:
                             if not f.done():
                                 f.cancel()
@@ -915,7 +1402,10 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                     logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
                     if parent_lemmas and parent_goal_name:
                         for lemma in parent_lemmas:
-                            add_invalid_lemma(base_path, parent_goal_name, lemma, f"导致子目标{subgoal}执行异常: {e}")
+                            add_unproved_lemma(
+                                base_path, parent_goal_name, lemma,
+                                {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
+                            )
                     for f in future_to_subgoal:
                         if not f.done():
                             f.cancel()
@@ -932,7 +1422,7 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
             return False
 
 
-def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False) -> bool:
+def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     # 检查递归深度限制
     max_depth = config['MAX_RECURSION_DEPTH']
@@ -948,9 +1438,16 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
     
     logging.info(f"开始处理 Path: {base_path}, Name: {base_name} (递归深度: {depth})")
 
-    # 执行初始验证检查
     goal_smt_file = Path(base_path) / f"{base_name}.smt2"
-    if perform_initial_verification(goal_smt_file):
+    if routing_enabled() and not load_failed_lemmas(base_path, base_name).get("routing"):
+        seed_baseline_repair_hints(
+            base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
+        )
+
+    # 执行初始验证检查
+    if perform_initial_verification(
+        goal_smt_file, base_path=base_path, goal_name=base_name
+    ):
         return True
 
     # 定义prompt策略
@@ -990,16 +1487,48 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
     select_use_prompt_strategies = ours_prompt_strategies
 
     max_attempts_per_prompt = select_use_prompt_strategies["max_attempts"]
+    hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+    prompt_order = order_prompt_strategies(
+        select_use_prompt_strategies["strategies"], hint_list
+    )
 
-    # 顺序尝试每种prompt策略
-    for prompt_idx, prompt_strategy in enumerate(select_use_prompt_strategies["strategies"]):
-        logging.info(f"[策略{prompt_idx+1}] 处理 {base_name} - 使用策略 {prompt_strategy}")
-        
-        # 每种prompt尝试max_attempts_per_prompt次（当前默认参数3次）
+    # Keep the paper's bounded prompt loop. In routing mode, each attempt
+    # chooses a fresh prompt/profile pair from the latest feedback.
+    for prompt_idx, default_prompt in enumerate(prompt_order):
+        logging.info(f"[策略{prompt_idx+1}] 处理 {base_name} - 默认提示 {default_prompt}")
         for attempt in range(max_attempts_per_prompt):
-            logging.info(f"[主阶段] 处理 {base_name} - 第{attempt+1}/{max_attempts_per_prompt}次尝试({prompt_strategy})")
+            prompt_strategy = default_prompt
+            solver_profile = None
+            decision_source = None
+            if routing_enabled():
+                state, decision = select_attempt_action(
+                    base_path,
+                    base_name,
+                    select_use_prompt_strategies["strategies"],
+                    parent_goal_name=parent_goal_name,
+                    preferred_prompt=default_prompt,
+                )
+                prompt_strategy = decision.prompt_strategy
+                solver_profile = decision.profile
+                decision_source = decision.source
+            logging.info(
+                "[主阶段] 处理 %s - 第%d/%d次尝试(prompt=%s, profile=%s)",
+                base_name,
+                attempt + 1,
+                max_attempts_per_prompt,
+                prompt_strategy,
+                solver_profile or "paper_portfolio",
+            )
             try:
-                ret, new_subgoals, extracted_asserts = quick_run(base_path, base_name, prompt_strategy, select_use_prompt_strategies["folder_path"], baseline_only=False)
+                ret, new_subgoals, extracted_asserts = quick_run(
+                    base_path,
+                    base_name,
+                    prompt_strategy,
+                    select_use_prompt_strategies["folder_path"],
+                    baseline_only=False,
+                    solver_profile=solver_profile,
+                    decision_source=decision_source,
+                )
                 # ret为True代表发现了可能会有用的子目标 不代表证明成功
                 # lemma 被quick filtering了 
                 # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
@@ -1029,8 +1558,8 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
             except Exception as e:
                 logging.error(f"策略 {prompt_strategy} 第{attempt+1}次尝试出错: {e}")
                 continue
-            
-        logging.error(f"策略 {prompt_strategy} 所有尝试均失败，切换到下一个策略")
+
+        logging.error(f"策略 {default_prompt} 所有尝试均失败，切换到下一个策略")
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")

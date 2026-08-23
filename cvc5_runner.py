@@ -16,10 +16,19 @@ import os
 import re
 import signal
 import tempfile
+import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from solver_routing import (
+    CVC5_FALLBACK_PROFILES,
+    GoalSearchState,
+    fallback_enabled,
+    fallback_fraction,
+    fallback_min_timeout,
+    routing_enabled,
+)
 from solver_relative_metrics import (
     CONJ_SHARE_MIN,
     EXPLOSION_LOG_GAIN,
@@ -86,6 +95,7 @@ class CvcResult:
     stdout: str = ""
     stderr: str = ""
     error: Optional[str] = None
+    portfolio_results: Dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -96,17 +106,10 @@ def run_cvc_solver_with_timeout(smt2_path, timeout=60) -> bool:
     return run_cvc(smt2_path, timeout=timeout).proved
 
 
-def run_cvc(smt2_path, timeout: int = 60, *, collect_stats: bool = False) -> CvcResult:
-    """
-    Portfolio prove: several CVC5/CVC4 strategies in parallel.
-    First unsat wins. Stats are only collected on the winning strategy if requested
-    (re-run diagnostic separately for comparable progress scores).
-    """
-    smt2_path = Path(smt2_path)
+def cvc_profile_specs() -> Dict[str, dict]:
     cvc5 = _cvc5_binary()
     cvc4 = _cvc4_binary()
-
-    strategies = {
+    return {
         "cvc5_simple": {
             "binary": cvc5,
             "options": ["--lang=smt2", "--full-saturate-quant"],
@@ -144,29 +147,172 @@ def run_cvc(smt2_path, timeout: int = 60, *, collect_stats: bool = False) -> Cvc
             ],
             "type": "CVC4",
         },
+        "adt_structural": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--dt-stc-ind",
+            ],
+            "type": "CVC5",
+        },
+        "integer_recursive": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--int-wf-ind",
+            ],
+            "type": "CVC5",
+        },
+        "controlled_conjecture": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--conjecture-gen",
+                "--conjecture-gen-max-depth=2",
+                "--conjecture-gen-per-round=5",
+            ],
+            "type": "CVC5",
+        },
     }
+
+
+def _compact_cvc(result: CvcResult) -> dict:
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": round(result.elapsed, 3),
+        "strategy": result.strategy,
+        "stats": result.stats,
+        "error": result.error,
+    }
+
+
+def run_cvc(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    collect_stats: bool = False,
+    profiles: Optional[List[str]] = None,
+) -> CvcResult:
+    """
+    Portfolio prove: named CVC5/CVC4 strategies in parallel.
+    Default profiles match the paper (simple / inductive / no-ematching / cvc4).
+    First unsat wins.
+    """
+    names = profiles or list(CVC5_FALLBACK_PROFILES)
+    return _run_cvc_parallel(
+        smt2_path, timeout, names, collect_stats=collect_stats
+    )
+
+
+def run_cvc_probe(
+    smt2_path,
+    profiles: List[str],
+    timeout: int = 2,
+) -> Dict[str, CvcResult]:
+    """Short sequential diagnostic probes for routing."""
+    out: Dict[str, CvcResult] = {}
+    for name in profiles:
+        if name not in cvc_profile_specs():
+            continue
+        out[name] = run_cvc_diagnostic(
+            smt2_path,
+            timeout=timeout,
+            collect_difficulty=False,
+            profile=name,
+        )
+    return out
+
+
+def run_cvc_routed(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    state: Optional[GoalSearchState] = None,
+    collect_stats: bool = False,
+) -> CvcResult:
+    """Prove with recommended profiles first, then the paper 4-way portfolio."""
+    if not routing_enabled() or state is None or not state.candidate_profiles:
+        return run_cvc(smt2_path, timeout, collect_stats=collect_stats)
+
+    start = time.time()
+    specs = cvc_profile_specs()
+    primary = [p for p in state.candidate_profiles if p in specs]
+    fallback = [
+        p for p in (state.fallback_profiles or CVC5_FALLBACK_PROFILES)
+        if p in specs and p not in primary
+    ]
+    reserve = 0
+    if fallback_enabled() and fallback:
+        reserve = max(fallback_min_timeout(), int(timeout * fallback_fraction()))
+        reserve = min(reserve, max(0, timeout - 1))
+    primary_timeout = max(1, timeout - reserve)
+    result = _run_cvc_parallel(
+        smt2_path, primary_timeout, primary, collect_stats=collect_stats
+    )
+    summaries = dict(result.portfolio_results)
+    if result.proved:
+        result.portfolio_results = summaries
+        return result
+
+    remaining = timeout - (time.time() - start)
+    if fallback_enabled() and fallback and remaining >= 0.5:
+        fb = _run_cvc_parallel(
+            smt2_path,
+            max(1, min(timeout, math.ceil(remaining))),
+            fallback,
+            collect_stats=collect_stats,
+        )
+        summaries.update(fb.portfolio_results)
+        fb.portfolio_results = summaries
+        return fb
+    result.portfolio_results = summaries
+    return result
+
+
+def _run_cvc_parallel(
+    smt2_path,
+    timeout: int,
+    names: List[str],
+    *,
+    collect_stats: bool,
+) -> CvcResult:
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    strategies = {n: specs[n] for n in names if n in specs}
+    if not strategies:
+        return CvcResult(status="error", error="no known cvc profiles requested")
 
     processes = {}
     start = time.time()
+    summaries: Dict[str, dict] = {}
     try:
         for name, cfg in strategies.items():
             cmd = [cfg["binary"]] + cfg["options"] + [str(smt2_path)]
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE, 
                     text=True,
                     preexec_fn=os.setsid,
                 )
                 processes[name] = proc
             except FileNotFoundError:
                 logging.error("%s binary not found: %s", cfg["type"], cfg["binary"])
+                summaries[name] = {"status": "error", "error": "binary not found", "strategy": name}
             except Exception as e:
                 logging.error("Failed to start %s: %s", name, e)
-
+                summaries[name] = {"status": "error", "error": str(e), "strategy": name}
+        
         if not processes:
-            return CvcResult(status="error", error="no solver process started")
+            return CvcResult(status="error", error="no solver process started", portfolio_results=summaries)
 
         completed = set()
         while time.time() - start < timeout:
@@ -180,36 +326,73 @@ def run_cvc(smt2_path, timeout: int = 60, *, collect_stats: bool = False) -> Cvc
                     stdout, stderr = proc.communicate(timeout=1)
                 except Exception as e:
                     logging.error("communicate %s failed: %s", name, e)
+                    summaries[name] = {
+                        "proved": False,
+                        "status": "error",
+                        "elapsed": round(time.time() - start, 3),
+                        "strategy": name,
+                        "error": str(e),
+                    }
                     continue
 
                 text = (stdout or "") + "\n" + (stderr or "")
                 if _stdout_is_unsat(stdout or ""):
-                        _cleanup_processes(processes, exclude=name)
-                        elapsed = time.time() - start
-                        logging.info(
-                            "%s验证成功: unsat (策略: %s, %.2fs)",
-                            strategies[name]["type"], name, elapsed,
-                        )
-                        result = CvcResult(
-                            proved=True,
-                            status="unsat",
-                            elapsed=elapsed,
-                            strategy=name,
-                            stdout=stdout or "",
-                            stderr=stderr or "",
-                        )
-                        if collect_stats:
-                            result.stats = parse_cvc_stats(text)
-                        return result
+                    _cleanup_processes(processes, exclude=name)
+                    elapsed = time.time() - start
+                    logging.info(
+                        "%s验证成功: unsat (策略: %s, %.2fs)",
+                        strategies[name]["type"], name, elapsed,
+                    )
+                    result = CvcResult(
+                        proved=True,
+                        status="unsat",
+                        elapsed=elapsed,
+                        strategy=name,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                    )
+                    if collect_stats:
+                        result.stats = parse_cvc_stats(text)
+                    summaries[name] = _compact_cvc(result)
+                    result.portfolio_results = summaries
+                    return result
+                summaries[name] = {
+                    "proved": False,
+                    "status": "sat" if re.search(r"(?m)^sat\s*$", (stdout or "").lower()) else "unknown",
+                    "elapsed": round(time.time() - start, 3),
+                    "strategy": name,
+                    "stats": parse_cvc_stats(text) if collect_stats else {},
+                }
 
             if len(completed) == len(processes):
                 break
             time.sleep(0.05)
 
         elapsed = time.time() - start
+        timed_out = len(completed) < len(processes)
+        for name in strategies:
+            if name not in summaries:
+                summaries[name] = {"status": "timeout", "elapsed": round(elapsed, 3), "strategy": name}
         logging.warning("CVC5/CVC4验证超时或失败 (耗时: %.2f秒)", elapsed)
-        return CvcResult(proved=False, status="timeout", elapsed=elapsed)
-
+        statuses = [item.get("status") for item in summaries.values()]
+        if timed_out:
+            final_status = "timeout"
+        elif statuses and all(status == "error" for status in statuses):
+            final_status = "error"
+        elif "unknown" in statuses:
+            final_status = "unknown"
+        elif "sat" in statuses:
+            final_status = "sat"
+        else:
+            final_status = "unknown"
+        return CvcResult(
+            proved=False,
+            status=final_status,
+            elapsed=elapsed,
+            strategy=next(iter(strategies)),
+            portfolio_results=summaries,
+        )
+        
     finally:
         _cleanup_processes(processes)
 
@@ -219,45 +402,34 @@ def run_cvc_diagnostic(
     timeout: int = 3,
     *,
     collect_difficulty: bool = True,
+    profile: Optional[str] = None,
 ) -> CvcResult:
     """
-    Single-strategy inductive cvc5 run with --stats (+ optional difficulty).
+    Single-strategy cvc5 run with --stats (+ optional difficulty).
     Used for progress comparison / repair hints, not as portfolio prover.
     """
     smt2_path = Path(smt2_path)
-    binary = _cvc5_binary()
+    specs = cvc_profile_specs()
+    name = profile if profile in specs and specs[profile]["type"] == "CVC5" else "cvc5_inductive"
+    cfg = specs[name]
     ms = max(1, int(timeout * 1000))
-    cmd = [
-        binary,
-        "--lang=smt2",
-        "--full-saturate-quant",
-        "--quant-ind",
-        "--conjecture-gen",
-        f"--tlimit-per={ms}",
-        "--stats",
-        str(smt2_path),
-    ]
-    result = _execute_single(cmd, timeout + 2, strategy="cvc5_inductive_diag")
-    if collect_difficulty and not result.proved:
-        # Difficulty is most useful on failures; also fine on success.
-        diff = run_cvc_difficulty(smt2_path, timeout=min(timeout, 3))
-        result.difficulty = diff.difficulty
-        if diff.status == "unsat":
-            # Difficulty run may prove with same budget; keep diagnostic status authoritative
-            pass
-    elif collect_difficulty and result.proved:
-        diff = run_cvc_difficulty(smt2_path, timeout=min(timeout, 3))
+    cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", "--stats", str(smt2_path)]
+    result = _execute_single(cmd, timeout + 2, strategy=name)
+    if collect_difficulty:
+        diff = run_cvc_difficulty(smt2_path, timeout=min(timeout, 3), profile=name)
         result.difficulty = diff.difficulty
     return result
 
 
-def run_cvc_difficulty(smt2_path, timeout: int = 3) -> CvcResult:
+def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = None) -> CvcResult:
     """
     Run cvc5 on a rewritten SMT script that enables produce-difficulty and
     calls (get-difficulty) after check-sat.
     """
     smt2_path = Path(smt2_path)
-    binary = _cvc5_binary()
+    specs = cvc_profile_specs()
+    name = profile if profile in specs and specs[profile]["type"] == "CVC5" else "cvc5_inductive"
+    cfg = specs[name]
     content = smt2_path.read_text(encoding="utf-8")
     script = _inject_difficulty_script(content)
     ms = max(1, int(timeout * 1000))
@@ -269,16 +441,8 @@ def run_cvc_difficulty(smt2_path, timeout: int = 3) -> CvcResult:
         tmp_path = tf.name
 
     try:
-        cmd = [
-            binary,
-            "--lang=smt2",
-            "--full-saturate-quant",
-            "--quant-ind",
-            "--conjecture-gen",
-            f"--tlimit-per={ms}",
-            tmp_path,
-        ]
-        result = _execute_single(cmd, timeout + 2, strategy="cvc5_difficulty")
+        cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", tmp_path]
+        result = _execute_single(cmd, timeout + 2, strategy=f"{name}_difficulty")
         result.difficulty = parse_cvc_difficulty(result.stdout)
         return result
     finally:
@@ -615,7 +779,9 @@ def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:
         start = time.time()
         timed_out = False
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            # Keep collection overhead bounded; routed calls reserve time for
+            # the paper fallback.
+            stdout, stderr = proc.communicate(timeout=timeout + 1)
         except subprocess.TimeoutExpired:
             timed_out = True
             _kill_proc(proc)

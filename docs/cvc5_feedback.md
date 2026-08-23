@@ -2,6 +2,8 @@
 
 本文整理 CVC5 新增反馈代码中实际使用的信号、信号的具体形式，以及这些信号如何帮助提高辅助引理生成质量。
 
+理论分流、solver routing 与实验设计见 [feedback_guided_portfolio.md](feedback_guided_portfolio.md)。
+
 ## 一、CVC5 当前使用的信号
 
 当前 CVC5 路径主要使用四类信号：

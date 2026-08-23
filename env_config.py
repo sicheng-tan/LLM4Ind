@@ -26,6 +26,12 @@ def setup_environment():
     max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # 最大递归深度限制
     task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # 单个任务的超时时间（秒）
     max_parallel_tasks = int(os.getenv('MAX_PARALLEL_TASKS', '20'))  # 最大并行任务数
+    solver_routing = os.getenv('SOLVER_ROUTING', 'on')
+    solver_routing_decider = os.getenv('SOLVER_ROUTING_DECIDER', 'relative')
+    solver_routing_probes = os.getenv('SOLVER_ROUTING_PROBES', 'on')
+    solver_routing_llm_min_confidence = float(
+        os.getenv('SOLVER_ROUTING_LLM_MIN_CONFIDENCE', '0.55')
+    )
 
     # 代理配置
     if http_proxy and https_proxy:
@@ -61,7 +67,11 @@ def setup_environment():
         'COMBINED_CVC_TIMEOUT': combined_cvc_timeout,
         'MAX_RECURSION_DEPTH': max_recursion_depth,
         'TASK_TIMEOUT': task_timeout,
-        'MAX_PARALLEL_TASKS': max_parallel_tasks
+        'MAX_PARALLEL_TASKS': max_parallel_tasks,
+        'SOLVER_ROUTING': solver_routing,
+        'SOLVER_ROUTING_DECIDER': solver_routing_decider,
+        'SOLVER_ROUTING_PROBES': solver_routing_probes,
+        'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
     }
 
 def setup_model(config):

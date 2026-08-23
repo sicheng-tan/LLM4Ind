@@ -5,11 +5,21 @@ import os
 import re
 import signal
 import tempfile
+import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
+from solver_routing import (
+    VAMPIRE_FALLBACK_PROFILE,
+    GoalSearchState,
+    fallback_enabled,
+    fallback_fraction,
+    fallback_min_timeout,
+    profile_utility_from_stats,
+    routing_enabled,
+)
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
     INDUCTION_PER_REWRITE_MAX,
@@ -56,6 +66,7 @@ class VampireResult:
     proved: bool = False
     status: str = "unknown"  # unsat | timeout | unknown | error | incomplete | sat
     elapsed: float = 0.0
+    strategy: str = ""
     stats: Dict[str, int] = field(default_factory=dict)
     induction_focus: List[str] = field(default_factory=list)
     induction_formulas: List[str] = field(default_factory=list)
@@ -63,9 +74,80 @@ class VampireResult:
     stdout: str = ""
     stderr: str = ""
     error: Optional[str] = None
+    portfolio_results: Dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+# Named theory profiles. The paper default is induction_portfolio.
+# alasca_arith approximates ALASCA-style arithmetic superposition on this
+# Vampire binary (UWA + theory instantiation + arithmetic generalization).
+VAMPIRE_PROFILES: Dict[str, dict] = {
+    "induction_portfolio": {
+        "kind": "portfolio",
+        "schedule": "induction",
+        "diag": "struct_single",
+        "label": "mixed structural/integer induction portfolio (paper default)",
+    },
+    "struct_induction": {
+        "kind": "portfolio",
+        "schedule": "struct_induction",
+        "diag": "struct_single",
+        "label": "structural induction schedule",
+    },
+    "struct_induction_tip": {
+        "kind": "portfolio",
+        "schedule": "struct_induction_tip",
+        "diag": "struct_single",
+        "label": "TIP-oriented structural induction",
+    },
+    "integer_induction": {
+        "kind": "portfolio",
+        "schedule": "integer_induction",
+        "diag": "int_single",
+        "label": "integer induction schedule",
+    },
+    "smtcomp": {
+        "kind": "portfolio",
+        "schedule": "smtcomp",
+        "diag": "alasca_arith",
+        "label": "SMT-COMP schedule (arithmetic / mixed theories)",
+    },
+    "struct_single": {
+        "kind": "vampire",
+        "extra": [
+            "--induction", "struct",
+            "--induction_gen", "on",
+            "--induction_on_complex_terms", "on",
+            "--avatar", "off",
+        ],
+        "diag": "struct_single",
+        "label": "single-strategy structural induction",
+    },
+    "int_single": {
+        "kind": "vampire",
+        "extra": [
+            "--induction", "int",
+            "--induction_gen", "on",
+            "--avatar", "off",
+        ],
+        "diag": "int_single",
+        "label": "single-strategy integer induction",
+    },
+    "alasca_arith": {
+        "kind": "vampire",
+        "extra": [
+            "--induction", "both",
+            "--theory_instantiation", "all",
+            "--unification_with_abstraction", "interpreted_only",
+            "--arithmetic_subterm_generalizations", "cautious",
+            "--avatar", "off",
+        ],
+        "diag": "alasca_arith",
+        "label": "ALASCA-style arithmetic superposition (UWA + theory instantiation)",
+    },
+}
 
 
 def run_vampire_with_timeout(smt2_path, timeout=60) -> bool:
@@ -117,24 +199,193 @@ def run_vampire(
     collect_stats: bool = True,
     collect_ucore: bool = False,
     proof_file: Optional[Path] = None,
+    profile: Optional[str] = None,
 ) -> VampireResult:
     """
-    Portfolio induction run used for proving.
-    Optionally collect statistics and/or SMT-LIB unsat cores (named lemmas).
+    Prove with a named Vampire profile.
+
+    Default profile is the paper schedule: portfolio + induction.
+    """
+    profile = profile or "induction_portfolio"
+    vampire_binary = _vampire_binary()
+    if not vampire_binary:
+        return VampireResult(status="error", error="VAMPIRE_BINARY not configured", strategy=profile)
+    
+        smt2_path = Path(smt2_path)
+    run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
+    command = _vampire_command(
+        vampire_binary,
+        profile,
+        timeout,
+        collect_stats=collect_stats,
+        collect_ucore=collect_ucore,
+        proof_file=proof_file,
+    )
+    command.append(str(run_path))
+    try:
+        result = _execute_vampire(command, timeout, collect_ucore=collect_ucore, strategy=profile)
+        return result
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def run_vampire_diagnostic(
+    smt2_path,
+    timeout: int = 3,
+    *,
+    show_induction: bool = True,
+    profile: Optional[str] = None,
+) -> VampireResult:
+    """
+    Single-strategy diagnostic run for progress comparison and induction traces.
+    Not used as the main prover; portfolio remains authoritative for proved=True.
+
+    If `profile` is a portfolio schedule, the mapped diagnostic single-strategy
+    is used so baseline/control/candidate stats stay comparable.
     """
     vampire_binary = _vampire_binary()
     if not vampire_binary:
         return VampireResult(status="error", error="VAMPIRE_BINARY not configured")
 
+    spec = VAMPIRE_PROFILES.get(profile or "struct_single", VAMPIRE_PROFILES["struct_single"])
+    diag_name = spec.get("diag") or "struct_single"
     smt2_path = Path(smt2_path)
     run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
-    command = [
+    command = _vampire_command(
         vampire_binary,
+        diag_name,
+        timeout,
+        collect_stats=True,
+        collect_ucore=False,
+        proof_file=None,
+    )
+    if show_induction:
+        command.extend(["--show_induction", "on"])
+    command.append(str(run_path))
+    try:
+        return _execute_vampire(command, timeout, collect_ucore=False, strategy=diag_name)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def run_vampire_probe(
+    smt2_path,
+    profiles: List[str],
+    timeout: int = 2,
+) -> Dict[str, VampireResult]:
+    """Short sequential probe of named profiles for routing (Phase 1 observability)."""
+    out: Dict[str, VampireResult] = {}
+    for name in profiles:
+        if name not in VAMPIRE_PROFILES:
+            continue
+        out[name] = run_vampire(
+            smt2_path,
+            timeout=timeout,
+            collect_stats=True,
+            collect_ucore=False,
+            profile=name,
+        )
+    return out
+
+
+def run_vampire_routed(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    state: Optional[GoalSearchState] = None,
+    collect_stats: bool = True,
+    collect_ucore: bool = False,
+) -> VampireResult:
+    """
+    Prove with recommended profiles first, then the paper induction portfolio.
+
+    When routing is disabled, this is identical to run_vampire(...).
+    """
+    if not routing_enabled() or state is None or not state.candidate_profiles:
+        return run_vampire(
+            smt2_path,
+            timeout,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+        )
+
+    summaries: Dict[str, dict] = {}
+    start = time.time()
+
+    primary = [p for p in state.candidate_profiles if p in VAMPIRE_PROFILES]
+    fallback = [
+        p for p in (state.fallback_profiles or [VAMPIRE_FALLBACK_PROFILE])
+        if p in VAMPIRE_PROFILES and p not in primary
+    ]
+    reserve = 0
+    if fallback_enabled() and fallback:
+        reserve = max(fallback_min_timeout(), int(timeout * fallback_fraction()))
+        reserve = min(reserve, max(0, timeout - 1))
+    primary_timeout = max(1, timeout - reserve)
+    result = _run_vampire_parallel(
+        smt2_path,
+        primary_timeout,
+        primary,
+        collect_stats=collect_stats,
+        collect_ucore=collect_ucore,
+    )
+    summaries.update(result.portfolio_results)
+    if result.proved:
+        result.portfolio_results = summaries
+        return result
+
+    remaining = timeout - (time.time() - start)
+    if fallback_enabled() and fallback and remaining >= 0.5:
+        fb = _run_vampire_parallel(
+            smt2_path,
+            max(1, min(timeout, math.ceil(remaining))),
+            fallback,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+        )
+        summaries.update(fb.portfolio_results)
+        if fb.proved:
+            fb.portfolio_results = summaries
+            return fb
+        result = fb
+        result.portfolio_results = summaries
+        return result
+
+    result.portfolio_results = summaries
+    return result
+
+
+def _vampire_command(
+    binary: str,
+    profile: str,
+    timeout: int,
+    *,
+    collect_stats: bool,
+    collect_ucore: bool,
+    proof_file: Optional[Path],
+) -> List[str]:
+    spec = VAMPIRE_PROFILES.get(profile)
+    if spec is None:
+        spec = VAMPIRE_PROFILES["induction_portfolio"]
+        profile = "induction_portfolio"
+    command = [
+        binary,
         "-t", f"{timeout}s",
-        "--mode", "portfolio",
-        "--schedule", "induction",
         "--input_syntax", "smtlib2",
     ]
+    if spec["kind"] == "portfolio":
+        command.extend(["--mode", "portfolio", "--schedule", spec["schedule"]])
+    else:
+        command.extend(["--mode", "vampire"])
+        command.extend(spec.get("extra") or [])
 
     if collect_ucore:
         command.extend([
@@ -150,59 +401,150 @@ def run_vampire(
             "--proof", "off",
         ])
         if proof_file is not None:
-            # Replace proof off with proof on + file sink
             command = [c for c in command if c not in ("--proof", "off")]
             command.extend([
                 "--proof", "on",
                 "--print_proofs_to_file", str(proof_file),
             ])
-
-    command.append(str(run_path))
-    try:
-        return _execute_vampire(command, timeout, collect_ucore=collect_ucore)
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+    return command
 
 
-def run_vampire_diagnostic(
+def _compact_vampire(result: VampireResult) -> dict:
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": round(result.elapsed, 3),
+        "strategy": result.strategy,
+        "stats": result.stats,
+        "error": result.error,
+    }
+
+
+def _run_vampire_parallel(
     smt2_path,
-    timeout: int = 3,
+    timeout: int,
+    profiles: List[str],
     *,
-    show_induction: bool = True,
+    collect_stats: bool,
+    collect_ucore: bool,
 ) -> VampireResult:
-    """
-    Single-strategy diagnostic run for progress comparison and induction traces.
-    Not used as the main prover; portfolio remains authoritative for proved=True.
-    """
-    vampire_binary = _vampire_binary()
-    if not vampire_binary:
-        return VampireResult(status="error", error="VAMPIRE_BINARY not configured")
+    profiles = [p for p in profiles if p in VAMPIRE_PROFILES]
+    if not profiles:
+        return run_vampire(
+            smt2_path, timeout, collect_stats=collect_stats, collect_ucore=collect_ucore
+        )
+    if len(profiles) == 1:
+        result = run_vampire(
+            smt2_path,
+            timeout,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            profile=profiles[0],
+        )
+        result.portfolio_results = {profiles[0]: _compact_vampire(result)}
+        return result
 
+    vampire_binary = _vampire_binary()
     smt2_path = Path(smt2_path)
     run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
-    command = [
-        vampire_binary,
-        "-t", f"{timeout}s",
-        "--mode", "vampire",
-        "--input_syntax", "smtlib2",
-        "--output_mode", "vampire",
-        "--statistics", "full",
-        "--proof", "off",
-        "--induction", "struct",
-        "--induction_gen", "on",
-        "--induction_on_complex_terms", "on",
-        "--avatar", "off",
-    ]
-    if show_induction:
-        command.extend(["--show_induction", "on"])
-    command.append(str(run_path))
+    processes = {}
+    start = time.time()
+    summaries: Dict[str, dict] = {}
     try:
-        return _execute_vampire(command, timeout, collect_ucore=False)
+        for name in profiles:
+            cmd = _vampire_command(
+                vampire_binary,
+                name,
+                timeout,
+                collect_stats=collect_stats,
+                collect_ucore=collect_ucore,
+                proof_file=None,
+            ) + [str(run_path)]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=os.setsid,
+                )
+                processes[name] = proc
+            except FileNotFoundError:
+                summaries[name] = {"status": "error", "error": "binary not found"}
+            except Exception as e:
+                summaries[name] = {"status": "error", "error": str(e)}
+
+        if not processes:
+            return VampireResult(status="error", error="no vampire process started")
+
+        completed = set()
+        while time.time() - start < timeout:
+            for name, proc in processes.items():
+                if name in completed:
+                    continue
+                if proc.poll() is None:
+                    continue
+                completed.add(name)
+                try:
+                    stdout, stderr = proc.communicate(timeout=1)
+                except Exception as e:
+                    summaries[name] = {
+                        "proved": False,
+                        "status": "error",
+                        "elapsed": round(time.time() - start, 3),
+                        "strategy": name,
+                        "error": str(e),
+                    }
+                    continue
+                result = VampireResult(strategy=name)
+                result.elapsed = time.time() - start
+                result.stdout = stdout or ""
+                result.stderr = stderr or ""
+                result.status = classify_status(
+                    result.stdout, result.stderr, proc.returncode or -1, False
+                )
+                result.proved = result.status == "unsat"
+                result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
+                if collect_ucore and result.proved:
+                    result.used_lemma_names = parse_ucore_lemma_names(result.stdout)
+                summaries[name] = _compact_vampire(result)
+                if result.proved:
+                    for other, op in processes.items():
+                        if other != name:
+                            _cleanup_process(op)
+                    result.portfolio_results = summaries
+                    return result
+            if len(completed) == len(processes):
+                break
+            time.sleep(0.05)
+
+        elapsed = time.time() - start
+        timed_out = len(completed) < len(processes)
+        for name, proc in processes.items():
+            if name in summaries:
+                continue
+            summaries[name] = {"status": "timeout", "elapsed": round(elapsed, 3), "strategy": name}
+        statuses = [item.get("status") for item in summaries.values()]
+        if timed_out:
+            final_status = "timeout"
+        elif statuses and all(status == "error" for status in statuses):
+            final_status = "error"
+        elif "unknown" in statuses:
+            final_status = "unknown"
+        elif "sat" in statuses:
+            final_status = "sat"
+        else:
+            final_status = "unknown"
+        return VampireResult(
+            proved=False,
+            status=final_status,
+            elapsed=elapsed,
+            strategy=profiles[0],
+            portfolio_results=summaries,
+        )
     finally:
+        for proc in processes.values():
+            _cleanup_process(proc)
         if tmp_path is not None and tmp_path.exists():
             try:
                 tmp_path.unlink()
@@ -528,8 +870,9 @@ def _execute_vampire(
     timeout: int,
     *,
     collect_ucore: bool,
+    strategy: str = "",
 ) -> VampireResult:
-    result = VampireResult()
+    result = VampireResult(strategy=strategy)
     try:
         logging.debug("启动Vampire: %s", " ".join(command))
         proc = subprocess.Popen(
@@ -542,7 +885,9 @@ def _execute_vampire(
         start = time.time()
         timed_out = False
         try:
-            stdout, stderr = proc.communicate(timeout=timeout + 5)
+            # Leave only a small collection grace period so routed fallback
+            # retains its reserved wall-clock budget.
+            stdout, stderr = proc.communicate(timeout=timeout + 1)
         except subprocess.TimeoutExpired:
             timed_out = True
             _cleanup_process(proc)
@@ -577,7 +922,7 @@ def _execute_vampire(
                 result.status, result.elapsed, list(result.stats.keys())[:6],
             )
         return result
-
+            
     except FileNotFoundError:
         logging.error("Vampire可执行文件未找到: %s", command[0] if command else "?")
         return VampireResult(status="error", error="binary not found")

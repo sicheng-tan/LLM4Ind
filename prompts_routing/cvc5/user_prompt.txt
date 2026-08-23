@@ -1,0 +1,23 @@
+Backend: {backend}
+Theory summary: {theory}
+Theory features JSON:
+{theory_features}
+
+The allowed CVC5/CVC4 profiles are:
+{profiles}
+
+The allowed lemma-generation prompt strategies are:
+{prompt_strategies}
+
+Recent solver failure/progress hints:
+{hints}
+
+Previous prompt/profile attempts:
+{history}
+
+Select the profile and prompt strategy most likely to make progress.
+Interpret profiles as follows: quantifier induction and conjecture generation
+are useful for generalized lemmas; datatype structural induction is useful for
+constructor/selector reasoning; integer well-founded induction is useful for
+integer recurrences; disabling E-matching or controlling conjecture generation
+can reduce instantiation explosion. Return only the required JSON.
