@@ -66,22 +66,6 @@ def _cvc4_binary() -> str:
     return os.getenv("CVC4_BINARY", "./cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt")
 
 
-# Keys we extract from --stats for progress scoring.
-STAT_KEY_PATTERNS = [
-    (r"QUANTIFIERS_INST_E_MATCHING(?:_SIMPLE)?\s*:\s*(\d+)", "INST_E_MATCHING"),
-    (r"QUANTIFIERS_INST_E_MATCHING_SIMPLE\s*:\s*(\d+)", "INST_E_MATCHING_SIMPLE"),
-    (r"QUANTIFIERS_INST_CBQI_PROP\s*:\s*(\d+)", "INST_CBQI_PROP"),
-    (r"QUANTIFIERS_INST_CBQI_CONFLICT\s*:\s*(\d+)", "INST_CBQI_CONFLICT"),
-    (r"QUANTIFIERS_SKOLEMIZE\s*:\s*(\d+)", "SKOLEMIZE"),
-    (r"QUANTIFIERS_CONJ_GEN_GT_ENUM\s*:\s*(\d+)", "CONJ_GEN_GT_ENUM"),
-    (r"QUANTIFIERS_CONJ_GEN_SPLIT\s*:\s*(\d+)", "CONJ_GEN_SPLIT"),
-    (r"DATATYPES_INST\s*:\s*(\d+)", "DATATYPES_INST"),
-    (r"DATATYPES_SPLIT\s*:\s*(\d+)", "DATATYPES_SPLIT"),
-    (r"DATATYPES_UNIF\s*:\s*(\d+)", "DATATYPES_UNIF"),
-    (r"global::totalTime\s*=\s*(\d+)ms", "TOTAL_TIME_MS"),
-]
-
-
 @dataclass
 class CvcResult:
     """Rich CVC5/CVC4 outcome for usefulness scoring and repair feedback."""
@@ -97,6 +81,8 @@ class CvcResult:
     stderr: str = ""
     error: Optional[str] = None
     portfolio_results: Dict[str, dict] = field(default_factory=dict)
+    # Proof-goal assertion body from the SMT script, when known.
+    goal_term: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -321,6 +307,7 @@ def _cvc_result_from_output(
     collect_stats: bool,
     collect_difficulty: bool,
     timed_out: bool = False,
+    goal_term: Optional[str] = None,
 ) -> CvcResult:
     stdout = stdout or ""
     stderr = stderr or ""
@@ -349,6 +336,8 @@ def _cvc_result_from_output(
         result.stats = parse_cvc_stats(text)
     if collect_difficulty:
         result.difficulty = parse_cvc_difficulty(text)
+    if goal_term:
+        result.goal_term = goal_term
     return result
 
 
@@ -391,8 +380,13 @@ def _run_cvc_parallel(
     full_results: Dict[str, CvcResult] = {}
     injected_path = None
     try:
+        try:
+            smt_content = smt2_path.read_text(encoding="utf-8")
+        except OSError:
+            smt_content = ""
+        goal_term = extract_proof_goal_term(smt_content) if smt_content else None
         if collect_difficulty:
-            script = _inject_difficulty_script(smt2_path.read_text(encoding="utf-8"))
+            script = _inject_difficulty_script(smt_content or smt2_path.read_text(encoding="utf-8"))
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".smt2", delete=False, encoding="utf-8"
             ) as tf:
@@ -460,6 +454,7 @@ def _run_cvc_parallel(
                     elapsed,
                     collect_stats=collect_stats,
                     collect_difficulty=collect_difficulty,
+                    goal_term=goal_term,
                 )
                 full_results[name] = result
                 if result.proved:
@@ -491,6 +486,7 @@ def _run_cvc_parallel(
                 collect_stats=collect_stats,
                 collect_difficulty=collect_difficulty,
                 timed_out=True,
+                goal_term=goal_term,
             )
             full_results[name] = result
             summaries[name] = _compact_cvc(result)
@@ -520,6 +516,7 @@ def _run_cvc_parallel(
             stdout=richest.stdout if richest else "",
             stderr=richest.stderr if richest else "",
             portfolio_results=summaries,
+            goal_term=goal_term or (richest.goal_term if richest else None),
         )
 
     finally:
@@ -549,9 +546,15 @@ def run_cvc_diagnostic(
     ms = max(1, int(timeout * 1000))
     cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", "--stats", str(smt2_path)]
     result = _execute_single(cmd, timeout + 2, strategy=name)
+    try:
+        result.goal_term = extract_proof_goal_term(smt2_path.read_text(encoding="utf-8"))
+    except OSError:
+        result.goal_term = None
     if collect_difficulty:
         diff = run_cvc_difficulty(smt2_path, timeout=min(timeout, 3), profile=name)
         result.difficulty = diff.difficulty
+        if not result.goal_term:
+            result.goal_term = diff.goal_term
     return result
 
 
@@ -578,6 +581,7 @@ def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = 
         cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", tmp_path]
         result = _execute_single(cmd, timeout + 2, strategy=f"{name}_difficulty")
         result.difficulty = parse_cvc_difficulty(result.stdout)
+        result.goal_term = extract_proof_goal_term(content)
         return result
     finally:
         try:
@@ -630,39 +634,283 @@ def parse_cvc_stats(text: str) -> Dict[str, int]:
     return stats
 
 
+
+def _skip_ws_and_comments(text: str, i: int) -> int:
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if c == ";":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        break
+    return i
+
+
+def _read_sexpr(text: str, i: int):
+    """Return (lexeme, next_index) or (None, i) at EOF / closing paren."""
+    i = _skip_ws_and_comments(text, i)
+    n = len(text)
+    if i >= n or text[i] == ")":
+        return None, i
+    if text[i] == "(":
+        start = i
+        i += 1
+        depth = 1
+        while i < n and depth:
+            c = text[i]
+            if c == ";":
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if c == "|":
+                i += 1
+                while i < n and text[i] != "|":
+                    i += 1
+                i = min(i + 1, n)
+                continue
+            if c == '"':
+                i += 1
+                while i < n:
+                    if text[i] == "\\":
+                        i += 2
+                        continue
+                    if text[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        return text[start:i], i
+    start = i
+    if text[i] == "|":
+        i += 1
+        while i < n and text[i] != "|":
+            i += 1
+        i = min(i + 1, n)
+        return text[start:i], i
+    if text[i] == '"':
+        i += 1
+        while i < n:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                i += 1
+                break
+            i += 1
+        return text[start:i], i
+    while i < n and text[i] not in " \t\r\n();|\"":
+        i += 1
+    return text[start:i], i
+
+
+def _sexpr_children(expr: str) -> List[str]:
+    expr = expr.strip()
+    if not expr.startswith("("):
+        return []
+    inner = expr[1:-1] if expr.endswith(")") else expr[1:]
+    kids: List[str] = []
+    i = 0
+    while True:
+        kid, i = _read_sexpr(inner, i)
+        if kid is None:
+            break
+        kids.append(kid)
+    return kids
+
+
+def normalize_smt_term(term: str) -> str:
+    return re.sub(r"\s+", " ", (term or "").strip())
+
+
+def strip_named_annotation(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids and kids[0] == "!" and len(kids) >= 2:
+        return strip_named_annotation(kids[1])
+    return term
+
+
+def _unwrap_assert(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids and kids[0] == "assert" and len(kids) >= 2:
+        return kids[1]
+    return term
+
+
+def _sorted_vars(expr: str) -> List[Tuple[str, str]]:
+    kids = _sexpr_children(expr)
+    if not kids:
+        return []
+    if not kids[0].startswith("(") and len(kids) >= 2:
+        return [(kids[0], kids[1])]
+    out: List[Tuple[str, str]] = []
+    for kid in kids:
+        parts = _sexpr_children(kid)
+        if len(parts) >= 2:
+            out.append((parts[0], parts[1]))
+    return out
+
+
+def _alpha_normalize(expr: str, env=None, nxt=None) -> str:
+    env = dict(env or {})
+    nxt = nxt if nxt is not None else [0]
+    expr = expr.strip()
+    if not expr.startswith("("):
+        return env.get(expr, expr)
+    kids = _sexpr_children(expr)
+    if not kids:
+        return "()"
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        new_env = dict(env)
+        bind_parts = []
+        for name, sort in binders:
+            fresh = f"_b{nxt[0]}"
+            nxt[0] += 1
+            new_env[name] = fresh
+            bind_parts.append(f"({fresh} {_alpha_normalize(sort, env, nxt)})")
+        body = _alpha_normalize(kids[2], new_env, nxt)
+        extra = " ".join(_alpha_normalize(k, new_env, nxt) for k in kids[3:])
+        core = f"({head} ({' '.join(bind_parts)}) {body}"
+        return core + (f" {extra})" if extra else ")")
+    return "(" + " ".join(_alpha_normalize(k, env, nxt) for k in kids) + ")"
+
+
+def canonical_smt_term(term: str) -> str:
+    body = _unwrap_assert(strip_named_annotation(normalize_smt_term(term)))
+    return _alpha_normalize(normalize_smt_term(body))
+
+
+def terms_match(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return canonical_smt_term(a) == canonical_smt_term(b)
+
+
+def _head_symbol(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids:
+        return kids[0]
+    return term.strip()
+
+
+def classify_difficulty_term(term: str, goal_term: Optional[str] = None) -> str:
+    """Return 'goal', 'axiom', or 'other'."""
+    body = _unwrap_assert(strip_named_annotation(term))
+    if goal_term and terms_match(body, goal_term):
+        return "goal"
+    head = _head_symbol(body)
+    if head == "not":
+        kids = _sexpr_children(body)
+        inner = kids[1] if len(kids) > 1 else ""
+        inner_head = _head_symbol(inner)
+        if goal_term:
+            # A negated formula that is not the proof goal is still an axiom/lemma.
+            return "axiom" if inner_head in ("forall", "exists") else "other"
+        if inner_head in ("forall", "exists"):
+            return "goal"
+        return "other"
+    if head in ("forall", "exists"):
+        return "axiom"
+    return "other"
+
+
+_PROOF_GOAL_BLOCK = re.compile(
+    r";\s*proof goal\b[^\n]*\n(?P<body>.*?);\s*proof goal end\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _assert_bodies(smt: str) -> List[str]:
+    bodies: List[str] = []
+    i = 0
+    while True:
+        expr, i = _read_sexpr(smt, i)
+        if expr is None:
+            break
+        kids = _sexpr_children(expr)
+        if kids and kids[0] == "assert" and len(kids) >= 2:
+            bodies.append(kids[1])
+    return bodies
+
+
+def extract_proof_goal_term(smt: str) -> Optional[str]:
+    """Proof-goal assertion body from `; proof goal` markers, else last negated quantifier."""
+    if not smt:
+        return None
+    m = _PROOF_GOAL_BLOCK.search(smt)
+    if m:
+        bodies = _assert_bodies(m.group("body"))
+        if bodies:
+            return normalize_smt_term(strip_named_annotation(bodies[0]))
+    for body in reversed(_assert_bodies(smt)):
+        if classify_difficulty_term(body, None) == "goal":
+            return normalize_smt_term(strip_named_annotation(body))
+    return None
+
+
+def _parse_difficulty_entry(expr: str) -> Optional[Tuple[str, int]]:
+    kids = _sexpr_children(expr)
+    if len(kids) != 2:
+        return None
+    term, score_tok = kids
+    if not re.fullmatch(r"-?\d+", score_tok):
+        return None
+    if not term.startswith("("):
+        return None
+    return normalize_smt_term(term), int(score_tok)
+
+
+def _parse_difficulty_list(expr: str) -> List[Tuple[str, int]]:
+    items: List[Tuple[str, int]] = []
+    for kid in _sexpr_children(expr):
+        parsed = _parse_difficulty_entry(kid)
+        if parsed is None:
+            return []
+        items.append(parsed)
+    return items
+
+
 def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
     """
-    Parse (get-difficulty) output:
-      (
-      ((forall ...) 10)
-      ((not (forall ...)) 1)
-      )
+    Parse (get-difficulty) output with a balanced s-expr scan.
+
+    Each entry is `( <s-expr> <int> )`. Nested SMT such as
+    `(plus (succ n) m)` is allowed; a one-level parenthesis regex is not.
     """
     items: List[Tuple[str, int]] = []
-    # Find the first s-expression block after unsat/sat that looks like difficulty
-    # Each entry: ( <term> <int> )
-    for m in re.finditer(
-        r"\(\s*(\((?:[^()]|\([^()]*\))*\))\s+(\d+)\s*\)",
-        text,
-        flags=re.DOTALL,
-    ):
-        term = re.sub(r"\s+", " ", m.group(1).strip())
-        score = int(m.group(2))
-        # Skip empty / nonsense
-        if term.startswith("(") and score >= 0:
-            items.append((term, score))
+    i = 0
+    while True:
+        expr, i = _read_sexpr(text, i)
+        if expr is None:
+            break
+        if not expr.startswith("("):
+            continue
+        as_entry = _parse_difficulty_entry(expr)
+        if as_entry is not None:
+            items.append(as_entry)
+            continue
+        items.extend(_parse_difficulty_list(expr))
 
-    # Prefer assertions (forall / not / named) with positive difficulty
     items = [(t, s) for t, s in items if s > 0]
     items.sort(key=lambda x: -x[1])
-    # Dedup by term
     seen = set()
-    out = []
+    out: List[Tuple[str, int]] = []
     for t, s in items:
         if t not in seen:
             seen.add(t)
             out.append((t, s))
     return out[:12]
+
 
 
 def _cvc_stat_rate(stats: Dict[str, int], elapsed: float, key: str) -> float:
@@ -726,9 +974,14 @@ def compute_progress_score(
         signals.append(f"more_datatype_inference(+{pct_label(dt_c, dt_r)}%)")
         strong += 1
 
+    goal_term = candidate.goal_term or baseline.goal_term
+    if control is not None and not goal_term:
+        goal_term = control.goal_term
+
     def goal_diff(res: CvcResult) -> Optional[int]:
+        g = goal_term or res.goal_term
         for term, s in res.difficulty:
-            if "(not" in term and "forall" in term:
+            if classify_difficulty_term(term, g) == "goal":
                 return s
         return None
 
@@ -740,10 +993,21 @@ def compute_progress_score(
         strong += 1
 
     if baseline.difficulty and candidate.difficulty:
-        b_map = {t: s for t, s in baseline.difficulty}
+        def axiom_map(res: CvcResult) -> dict:
+            g = goal_term or res.goal_term
+            out = {}
+            for t, s in res.difficulty:
+                if classify_difficulty_term(t, g) == "axiom":
+                    out[canonical_smt_term(t)] = s
+            return out
+
+        b_ax = axiom_map(baseline)
+        c_ax = axiom_map(candidate)
         dropped = 0
-        for t, s in candidate.difficulty:
-            if t in b_map and is_relative_drop(b_map[t], s):
+        for key, old_s in b_ax.items():
+            if key not in c_ax:
+                dropped += 1
+            elif is_relative_drop(old_s, c_ax[key]):
                 dropped += 1
         if dropped >= 1:
             score += min(dropped * 0.75, 2.0)
@@ -782,13 +1046,15 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     hints: List[dict] = []
     stats = result.stats
 
-    axiom_items = [
-        (t, s) for t, s in result.difficulty
-        if "forall" in t and "(not" not in t and s > 0
+    roles = [
+        (t, s, classify_difficulty_term(t, result.goal_term))
+        for t, s in result.difficulty
+        if s > 0
     ]
+    axiom_items = [(t, s) for t, s, role in roles if role == "axiom"]
     cutoff = in_problem_hard_cutoff([s for _, s in axiom_items])
     hard_axioms = [t for t, s in axiom_items if s >= cutoff][:4]
-    goal_bits = [t for t, s in result.difficulty if "(not" in t][:2]
+    goal_bits = [t for t, s, role in roles if role == "goal"][:2]
 
     if hard_axioms or goal_bits:
         hints.append({

@@ -47,7 +47,15 @@ def test_log_gain_scale_free() -> None:
 def test_rare_vs_volume() -> None:
     _ok(is_relative_gain(1, 0, rare=True), "0→1 skolem is meaningful")
     _ok(not is_relative_gain(101, 100, rare=True), "100→101 skolem is noise")
-    _ok(not is_relative_gain(1.0, 0.0, rare=False), "high-volume still wants a floor")
+    _ok(
+        not is_relative_gain(1.0, 0.0, rare=False, kind="count"),
+        "high-volume count still wants a floor",
+    )
+    _ok(is_relative_gain(0.9, 0.4, kind="rate"), "rate 0.4→0.9 is a gain")
+    _ok(
+        not is_relative_gain(101, 100, kind="count"),
+        "count 100→101 non-rare is not a gain",
+    )
 
 
 def test_difficulty_in_problem() -> None:

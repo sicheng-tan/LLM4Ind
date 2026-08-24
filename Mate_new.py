@@ -220,6 +220,7 @@ def _compact_cvc_diag(result: CvcResult) -> dict:
         "strategy": result.strategy,
         "stats": dict(result.stats or {}),
         "difficulty": [[t, s] for t, s in (result.difficulty or [])],
+        "goal_term": result.goal_term,
     }
 
 
@@ -237,6 +238,7 @@ def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
         strategy=str(data.get("strategy", "")),
         stats=dict(data.get("stats") or {}),
         difficulty=difficulty,
+        goal_term=data.get("goal_term") or None,
     )
 
 

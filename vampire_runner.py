@@ -719,7 +719,11 @@ def classify_status(stdout: str, stderr: str, returncode: int, timed_out: bool) 
             return "sat"
     if "incomplete strategy" in text or "refutation not found" in text:
         return "incomplete"
-    if "user:" in text or "user:" in stderr.lower():
+    # Vampire prints "User error: ...", which lowercases to "user error:"
+    # and does *not* contain the substring "user:".
+    if "user error" in text:
+        return "error"
+    if re.search(r"(?m)^error:", text) or "szs status error" in text:
         return "error"
     if "timeout" in text or "time limit" in text:
         return "timeout"

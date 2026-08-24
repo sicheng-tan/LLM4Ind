@@ -373,7 +373,7 @@ def profile_utility_from_stats(
     else:
         inst = int(stats.get("INST_TOTAL", 0))
         conj = int(stats.get("CONJ_TOTAL", 0))
-        skol = int(stats.get("QUANTIFIERS_SKOLEMIZE", 0) or stats.get("SKOLEMIZE", 0))
+        skol = int(stats.get("QUANTIFIERS_SKOLEMIZE", 0))
         dt = int(stats.get("DT_TOTAL", 0))
         if skol > 0:
             score += min(1.5 + skol / elapsed / 2.0, 3.0)
