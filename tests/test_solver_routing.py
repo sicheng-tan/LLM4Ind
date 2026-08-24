@@ -112,8 +112,9 @@ def test_utility_explosion_penalty() -> None:
         stats={"Generated clauses": 8000, "InductionApplications": 0, "StructuralInduction": 0},
         elapsed=2.0,
     )
-    _ok(any("explosion" in s for s in signals), signals)
-    _ok(score < 0, score)
+    _ok("search_explosion" not in "".join(signals), signals)
+    _ok("status_only" in signals, signals)
+    _ok(abs(score + 0.1) < 1e-9, score)
 
     proved, sig = profile_utility_from_stats(
         backend="cvc5", proved=True, status="unsat", stats={}, elapsed=0.4
@@ -131,6 +132,18 @@ def test_utility_explosion_penalty() -> None:
     )
     _ok(relative > 0, relative)
     _ok(any("relative_induction" in s for s in relative_signals), relative_signals)
+
+    boom, boom_sig = profile_utility_from_stats(
+        backend="vampire",
+        proved=False,
+        status="timeout",
+        stats={"Generated clauses": 8000, "InductionApplications": 0},
+        elapsed=2.0,
+        reference_stats={"Generated clauses": 100, "InductionApplications": 0},
+        reference_elapsed=2.0,
+    )
+    _ok(any("explosion" in s for s in boom_sig), boom_sig)
+    _ok(boom < 0, boom)
 
 
 def test_search_state_prompt() -> None:

@@ -177,7 +177,7 @@ sidecar 仍按 **singleton** 记功。整组写入 `useless_lemma_groups`（「�
 
 没有 `(set-logic …)` 的 SMT 不会打开 difficulty，`get-difficulty` 可能报错，整条 difficulty 信号为空（与 P0-1 叠加）。
 
-**改法：** 若没有 `set-logic`，在首条非注释命令后插入 `(set-option :produce-difficulty true)`；`get-difficulty` 仍紧跟第一条 `(check-sat)`。
+**改法：** 若没有 `set-logic`，在首条非注释命令**之前**插入 `(set-option :produce-difficulty true)`。第一条命令本身可能已是 `(assert …)`，插在其后会让 option 落在约束后面，cvc5 可能拒收或漏记该断言。`get-difficulty` 仍紧跟第一条 `(check-sat)`。
 
 ---
 

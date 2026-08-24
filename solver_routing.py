@@ -326,7 +326,7 @@ def profile_utility_from_stats(
     """Score a probe.
 
     When a matched reference is supplied, use scale-free rate gains. Without
-    one, retain the conservative activity heuristic for backward compatibility.
+    one, score status only — never absolute volume cutoffs such as gen>2000.
     """
     if proved:
         return 100.0, ["proved"]
@@ -342,59 +342,10 @@ def profile_utility_from_stats(
             reference_elapsed=reference_elapsed if reference_elapsed is not None else elapsed,
         )
 
-    signals: List[str] = []
+    signals: List[str] = ["status_only"]
     score = 0.0
-    elapsed = max(float(elapsed), 0.2)
-
-    if backend == "vampire":
-        ind = (
-            int(stats.get("InductionApplications", 0))
-            + int(stats.get("StructuralInduction", 0))
-            + int(stats.get("GeneralizedInductionApplications", 0))
-        )
-        int_ind = (
-            int(stats.get("IntegerInfiniteIntervalInduction", 0))
-            + int(stats.get("IntegerFiniteIntervalInduction", 0))
-        )
-        dem = int(stats.get("Fw demodulations", 0)) + int(stats.get("Bw demodulations", 0))
-        gen = int(stats.get("Generated clauses", 0))
-        if ind > 0:
-            score += min(ind / elapsed / 5.0, 3.0)
-            signals.append(f"induction_activity({ind})")
-        if int_ind > 0:
-            score += min(int_ind / elapsed / 4.0, 2.5)
-            signals.append(f"integer_induction({int_ind})")
-        if dem > 0:
-            score += min(dem / elapsed / 80.0, 1.5)
-            signals.append(f"demodulations({dem})")
-        if gen > 2000 and ind + int_ind == 0:
-            score -= 1.5
-            signals.append("search_explosion")
-    else:
-        inst = int(stats.get("INST_TOTAL", 0))
-        conj = int(stats.get("CONJ_TOTAL", 0))
-        skol = int(stats.get("QUANTIFIERS_SKOLEMIZE", 0))
-        dt = int(stats.get("DT_TOTAL", 0))
-        if skol > 0:
-            score += min(1.5 + skol / elapsed / 2.0, 3.0)
-            signals.append(f"skolemize({skol})")
-        if dt > 0:
-            score += min(dt / elapsed / 20.0, 2.0)
-            signals.append(f"datatype({dt})")
-        if inst > 0:
-            score += min(inst / elapsed / 400.0, 1.5)
-            signals.append(f"inst({inst})")
-        if conj > 0 and skol == 0:
-            score += min(conj / elapsed / 200.0, 0.8)
-            signals.append(f"conjecture({conj})")
-        if conj > 400 and skol <= 1 and inst < 30:
-            score -= 1.5
-            signals.append("search_explosion")
-
     if status in ("timeout", "unknown", "incomplete"):
         score -= 0.1
-    if not signals:
-        signals.append("no_probe_signal")
     return score, signals
 
 

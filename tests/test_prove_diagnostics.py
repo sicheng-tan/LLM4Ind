@@ -40,6 +40,18 @@ def test_inject_difficulty_script() -> None:
     assert script.count("(check-sat)") == 1
 
 
+def test_inject_difficulty_without_set_logic() -> None:
+    smt = """(declare-fun P (Int) Bool)
+(assert (forall ((x Int)) (P x)))
+(assert (not (P 0)))
+(check-sat)
+"""
+    script = _inject_difficulty_script(smt)
+    assert script.splitlines()[0] == "(set-option :produce-difficulty true)"
+    assert "(get-difficulty)" in script
+    assert "(set-logic" not in script
+
+
 def test_parse_cvc_difficulty_simple() -> None:
     text = "unsat\n(\n((P x) 10)\n((Q y) 3)\n)\n"
     items = parse_cvc_difficulty(text)
@@ -183,13 +195,14 @@ def test_subgoal_reuses_child_cache() -> None:
         mate._store_cached_diag(tmp, "template_1", "baseline_diag", child)
         with patch("Mate_new.run_cvc_diagnostic") as diag:
             mate._record_subgoal_failure_feedback(
-                tmp, "template", "template_1", ["(assert true)"]
+                tmp, "template", "template_1", ["(assert true)", "(assert false)"]
             )
         diag.assert_not_called()
         parent = mate.load_failed_lemmas(tmp, "template")
         kinds = [h.get("kind") for h in parent.get("repair_hints") or []]
         assert "subgoal_failed" in kinds
         assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["(assert true)"]
 
 
 def test_subgoal_falls_back_when_cache_missing() -> None:
@@ -226,11 +239,12 @@ def test_vampire_compact_and_subgoal_cache() -> None:
         mv._store_cached_diag(tmp, "template_1", "baseline_diag", original)
         with patch("Mate_new_vampire.run_vampire_diagnostic") as diag:
             mv._record_subgoal_failure_feedback(
-                tmp, "template", "template_1", ["(assert true)"]
+                tmp, "template", "template_1", ["(assert true)", "(assert false)"]
             )
         diag.assert_not_called()
         parent = mv.load_failed_lemmas(tmp, "template")
         assert any(h.get("kind") == "subgoal_failed" for h in parent["repair_hints"])
+        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["(assert true)"]
 
 
 def test_empty_stats_skip_hint_and_utility() -> None:
@@ -297,8 +311,119 @@ def test_cvc_diagnostic_single_process() -> None:
         second.assert_not_called()
 
 
+def test_repair_hint_quota_keeps_structure() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.add_repair_hints(tmp, "template", [
+            {"kind": "high_difficulty_assertions", "detail": "hard"},
+            {"kind": "need_rewrite", "detail": "mix"},
+            {"kind": "need_induction_lemma", "detail": "ind"},
+        ])
+        mate.add_repair_hints(tmp, "template", [
+            {"kind": "timeout", "detail": "t1", "context": "attempt"},
+            {"kind": "no_progress", "detail": "np"},
+            {"kind": "timeout", "detail": "t2", "context": "usefulness"},
+        ])
+        data = mate.load_failed_lemmas(tmp, "template")
+        kinds = [h["kind"] for h in data["repair_hints"]]
+        assert kinds.count("timeout") == 1
+        assert "no_progress" in kinds
+        assert "need_rewrite" in kinds
+        assert "need_induction_lemma" in kinds
+        assert "high_difficulty_assertions" not in kinds
+
+
+def test_blocking_lemma_only_and_unmatched_skips_unproved() -> None:
+    import Mate_new as mate
+
+    child = CvcResult(status="timeout", difficulty=[("(hard)", 3)])
+    with tempfile.TemporaryDirectory() as tmp:
+        mate._store_cached_diag(tmp, "template_2", "baseline_diag", child)
+        mate._record_subgoal_failure_feedback(
+            tmp, "template", "template_2", ["lemma-a", "lemma-b"]
+        )
+        parent = mate.load_failed_lemmas(tmp, "template")
+        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["lemma-b"]
+
+        mate._store_cached_diag(tmp, "template_1_2", "baseline_diag", child)
+        mate._record_subgoal_failure_feedback(
+            tmp, "template", "template_1_2", ["lemma-a", "lemma-b"]
+        )
+        parent = mate.load_failed_lemmas(tmp, "template")
+        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["lemma-b"]
+
+
+def test_trivial_implication_and_control_shape() -> None:
+    import Mate_new as mate
+
+    assert mate._is_trivial_equational_lemma("(= x x)")
+    assert mate._is_trivial_equational_lemma("(=> P P)")
+    assert mate._is_trivial_equational_lemma("(forall ((x Nat)) (= x x))")
+    assert not mate._is_trivial_equational_lemma(
+        "(forall ((x Nat)) (= (plus x zero) x))"
+    )
+    kept = mate._progress_singleton_lemmas([
+        "(=> P P)",
+        "(forall ((n Nat)) (= (plus n zero) n))",
+    ])
+    assert kept == ["(forall ((n Nat)) (= (plus n zero) n))"]
+
+
+def test_progress_prompt_does_not_fight_useless_group() -> None:
+    import Mate_new as mate
+
+    txt = mate.format_solver_feedback_for_prompt({
+        "useless_lemma_groups": [{"lemmas": ["(L1)", "(L2)"], "status": "timeout"}],
+        "progress_lemmas": [{"lemma": "(L1)", "score": 1.2, "signals": ["more_demodulations"]}],
+        "repair_hints": [],
+        "invalid_lemmas": [],
+        "unproved_lemmas": [],
+        "routing": {},
+    })
+    assert "GROUPS (combinations)" in txt
+    assert "in_failed_group" in txt
+    assert "NOT proof of usefulness" in txt
+
+
+def test_empty_llm_does_not_retry_immediately() -> None:
+    import Mate_new as mate
+
+    goal_smt = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(goal_smt, encoding="utf-8")
+        with patch("Mate_new.generate_lemmas_with_llm", return_value=[]), patch(
+            "Mate_new.run_cvc_routed"
+        ) as routed, patch("Mate_new.seed_baseline_repair_hints"):
+            proved, _, _ = mate.quick_run(tmp, "template", "p", "./prompts_ours")
+        assert proved is False
+        routed.assert_not_called()
+
+
+def test_stats_without_reference_skip_utility() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.record_solver_attempt(
+            tmp,
+            "template",
+            prompt_strategy="prove_prompt",
+            selected_profile="cvc5_inductive",
+            result=CvcResult(status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 99}),
+        )
+        last = mate.load_routing_state(tmp, "template").pair_history[-1]
+        assert last["utility"] is None
+
+
 def main() -> int:
     test_inject_difficulty_script()
+    test_inject_difficulty_without_set_logic()
     test_parse_cvc_difficulty_simple()
     test_cvc_prove_cmd_adds_stats_and_tlimit()
     test_vampire_command_show_induction()
@@ -312,6 +437,12 @@ def main() -> int:
     test_empty_stats_skip_hint_and_utility()
     test_progress_uses_3s_short_baseline()
     test_cvc_diagnostic_single_process()
+    test_repair_hint_quota_keeps_structure()
+    test_blocking_lemma_only_and_unmatched_skips_unproved()
+    test_trivial_implication_and_control_shape()
+    test_progress_prompt_does_not_fight_useless_group()
+    test_empty_llm_does_not_retry_immediately()
+    test_stats_without_reference_skip_utility()
     print("prove diagnostics tests passed")
     return 0
 

@@ -51,6 +51,9 @@ config = setup_environment()
 llm = setup_model(config)
 
 _MAX_REPAIR_HINTS = 4
+_STRUCTURE_HINT_QUOTA = 2
+_ROUND_HINT_QUOTA = 2
+_ROUND_HINT_KINDS = frozenset({"no_progress", "timeout", "partial_progress"})
 _MAX_PROGRESS_LEMMAS = 6
 _PROGRESS_SCORE_THRESHOLD = 0.5
 _DIAGNOSTIC_TIMEOUT = 3
@@ -173,19 +176,31 @@ def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
     save_failed_lemmas(base_path, goal_name, failed_data)
     logging.info(f"记录进展引理到{goal_name}: score={score:.2f} signals={signals}")
 
+def _compact_repair_hints(hints: List[dict]) -> List[dict]:
+    """Keep the latest hint per kind; reserve structure vs round-progress slots."""
+    latest: Dict[str, dict] = {}
+    order: List[str] = []
+    for hint in hints:
+        kind = str(hint.get("kind") or "")
+        if kind in latest:
+            order = [k for k in order if k != kind]
+        latest[kind] = hint
+        order.append(kind)
+    unique = [latest[k] for k in order]
+    structure = [h for h in unique if str(h.get("kind") or "") not in _ROUND_HINT_KINDS]
+    round_h = [h for h in unique if str(h.get("kind") or "") in _ROUND_HINT_KINDS]
+    compacted = structure[-_STRUCTURE_HINT_QUOTA:] + round_h[-_ROUND_HINT_QUOTA:]
+    return compacted[:_MAX_REPAIR_HINTS]
+
+
 def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
     """追加 cvc5 solver-guided repair hints"""
     if not hints:
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
-    existing = failed_data["repair_hints"]
-    existing_keys = {(h.get("kind"), h.get("detail", "")[:80]) for h in existing}
-    for hint in hints:
-        key = (hint.get("kind"), hint.get("detail", "")[:80])
-        if key not in existing_keys:
-            existing.append(hint)
-            existing_keys.add(key)
-    failed_data["repair_hints"] = existing[-_MAX_REPAIR_HINTS:]
+    failed_data["repair_hints"] = _compact_repair_hints(
+        list(failed_data["repair_hints"]) + list(hints)
+    )
     save_failed_lemmas(base_path, goal_name, failed_data)
 
 def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None):
@@ -201,6 +216,32 @@ def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optiona
             return
     failed_data["unproved_lemmas"].append(record)
     save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _lemmas_in_useless_groups(failed_data: dict) -> set:
+    members = set()
+    for group in failed_data.get("useless_lemma_groups") or []:
+        lemmas = group if isinstance(group, list) else group.get("lemmas", [])
+        members.update(lemmas)
+    return members
+
+
+def _lemma_for_blocking_subgoal(
+    parent_goal_name: str,
+    subgoal: str,
+    parent_lemmas: List[str],
+) -> Optional[str]:
+    """Map template_k / parent_k to the k-th parent lemma (1-based)."""
+    prefix = f"{parent_goal_name}_"
+    if not subgoal.startswith(prefix):
+        return None
+    rest = subgoal[len(prefix):]
+    if not rest.isdigit():
+        return None
+    idx = int(rest)
+    if 1 <= idx <= len(parent_lemmas):
+        return parent_lemmas[idx - 1]
+    return None
 
 def load_routing_state(base_path: str, goal_name: str) -> GoalSearchState:
     return GoalSearchState.from_dict(load_failed_lemmas(base_path, goal_name).get("routing"))
@@ -283,9 +324,10 @@ def _record_subgoal_failure_feedback(
 ) -> None:
     """Reuse the child's first-prove diagnostics; fall back to a short diagnostic only if missing."""
     child_profile = load_routing_state(base_path, subgoal).active_profile
-    for lemma in parent_lemmas:
+    blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
+    if blocking is not None:
         add_unproved_lemma(
-            base_path, parent_goal_name, lemma,
+            base_path, parent_goal_name, blocking,
             {
                 "status": "useful_but_unproved",
                 "blocking_subgoal": subgoal,
@@ -376,7 +418,7 @@ def record_solver_attempt(
         and result.strategy not in state.candidate_profiles
     )
     utility = None
-    if routing_decider_mode() != "llm" and (result.proved or has_stats):
+    if routing_decider_mode() != "llm" and result.proved:
         utility, _ = profile_utility_from_stats(
             backend="cvc5",
             proved=result.proved,
@@ -410,10 +452,13 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
         for i, record in enumerate(failed_data["invalid_lemmas"], 1):
             parts.append(f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}")
 
+    useless_members = _lemmas_in_useless_groups(failed_data)
+
     if failed_data.get("useless_lemma_groups"):
         parts.append(
-            "\n; IMPORTANT: The following lemma groups are USELESS for proving the "
-            "original goal. DO NOT generate the exact same group:"
+            "\n; IMPORTANT: The following lemma GROUPS (combinations) did not prove "
+            "the original goal. Do not emit the exact same combination again. "
+            "Individual members may still be useful if refined or paired differently:"
         )
         for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
             lemmas = group if isinstance(group, list) else group.get("lemmas", [])
@@ -427,16 +472,21 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
 
     if failed_data.get("progress_lemmas"):
         parts.append(
-            "\n; SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty): The following lemmas "
-            "did NOT finish the proof, but made measurable progress. Prefer refining "
-            "or extending these:"
+            "\n; SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty): singleton search "
+            "changes vs control. This is NOT proof of usefulness; a lemma here can "
+            "still belong to a failed combination. Prefer refining these, but do "
+            "not resend the same group:"
         )
         for i, record in enumerate(failed_data["progress_lemmas"], 1):
             signals = ", ".join(record.get("signals", []))
             profile = record.get("best_profile")
             profile_bit = f"; profile={profile}" if profile else ""
+            in_group = (
+                "; in_failed_group: refine this lemma, do not resend the whole group"
+                if record.get("lemma") in useless_members else ""
+            )
             parts.append(
-                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}): "
+                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}{in_group}): "
                 f"{record['lemma']}"
             )
 
@@ -576,44 +626,58 @@ def _control_lemma(smt_content: str) -> str:
     return "(= true true)"
 
 
-def _is_trivial_equational_lemma(lemma: str) -> bool:
-    compact = re.sub(r'\s+', ' ', lemma.strip())
-    eq = re.search(r'\(\s*=\s*', compact)
-    if not eq:
-        return False
-    start = eq.start()
+def _extract_binary_args(compact: str, op: str) -> Optional[Tuple[str, str]]:
+    m = re.search(rf"\(\s*{re.escape(op)}\s*", compact)
+    if not m:
+        return None
+    start = m.start()
     bal = 0
     end = None
     for i, ch in enumerate(compact[start:], start):
-        if ch == '(':
+        if ch == "(":
             bal += 1
-        elif ch == ')':
+        elif ch == ")":
             bal -= 1
             if bal == 0:
                 end = i + 1
                 break
     if end is None:
-        return False
-    body = compact[start + 2:end - 1].strip()
+        return None
+    inner = compact[m.end():end - 1].strip()
     bal = 0
-    parts = []
-    cur = []
-    for ch in body:
-        if ch == '(':
+    parts: List[str] = []
+    cur: List[str] = []
+    for ch in inner:
+        if ch == "(":
             bal += 1
             cur.append(ch)
-        elif ch == ')':
+        elif ch == ")":
             bal -= 1
             cur.append(ch)
-        elif ch == ' ' and bal == 0:
+        elif ch == " " and bal == 0:
             if cur:
-                parts.append(''.join(cur).strip())
+                parts.append("".join(cur).strip())
                 cur = []
         else:
             cur.append(ch)
     if cur:
-        parts.append(''.join(cur).strip())
-    return len(parts) >= 2 and parts[0] == parts[1]
+        parts.append("".join(cur).strip())
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _is_trivial_equational_lemma(lemma: str) -> bool:
+    """Skip tautologies: (= t t), (=> P P), and (forall ((x T)) (= x x))."""
+    compact = re.sub(r"\s+", " ", lemma.strip())
+    for op in ("=", "=>"):
+        args = _extract_binary_args(compact, op)
+        if args and args[0] == args[1]:
+            return True
+    return bool(re.search(
+        r"\(\s*forall\s*\(\s*\(\s*\w+\s+\w+\s*\)\s*\)\s*\(\s*=\s*(\w+)\s+\1\s*\)\s*\)",
+        compact,
+    ))
 
 
 def analyze_lemma_progress(
@@ -1355,27 +1419,9 @@ def quick_run(
     # 步骤3: 使用LLM生成引理
     extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path)
 
-    # 如果没有生成引理，尝试延长时间重新验证
+    # 如果没有生成引理，与调用失败一样进入下一 attempt；加时只在节点全部失败后做一次
     if not extracted_asserts:
-        logging.info("大模型未返回引理，尝试提高时间限制重新验证原目标")
-        retry_timeout = config['RETRY_CVC_TIMEOUT']
-        retry = run_cvc_routed(
-            goal_smt_file,
-            retry_timeout,
-            state=load_routing_state(base_path, goal_smt_name),
-        )
-        record_solver_attempt(
-            base_path,
-            goal_smt_name,
-            prompt_strategy=prompt_strategy,
-            selected_profile=solver_profile or load_routing_state(
-                base_path, goal_smt_name
-            ).active_profile,
-            result=retry,
-        )
-        if retry.proved:
-            logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
-            return True, [], []
+        logging.info("大模型未返回引理，跳过本 attempt（不加时）")
         return False, [], []
 
     # TODO: 去掉这一部分做消融实验↓
@@ -1481,9 +1527,12 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                 except Exception as e:
                     logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
                     if parent_lemmas and parent_goal_name:
-                        for lemma in parent_lemmas:
+                        blocking = _lemma_for_blocking_subgoal(
+                            parent_goal_name, subgoal, parent_lemmas
+                        )
+                        if blocking is not None:
                             add_unproved_lemma(
-                                base_path, parent_goal_name, lemma,
+                                base_path, parent_goal_name, blocking,
                                 {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
                             )
                     for f in future_to_subgoal:
@@ -1643,4 +1692,27 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")
+    return _retry_original_after_llm_exhausted(base_path, base_name)
+
+
+def _retry_original_after_llm_exhausted(base_path: str, goal_name: str) -> bool:
+    """After every LLM attempt on this node failed, retry the original goal once."""
+    goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
+    retry_timeout = config["RETRY_CVC_TIMEOUT"]
+    logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
+    retry = run_cvc_routed(
+        goal_smt_file,
+        retry_timeout,
+        state=load_routing_state(base_path, goal_name),
+    )
+    record_solver_attempt(
+        base_path,
+        goal_name,
+        prompt_strategy=None,
+        selected_profile=load_routing_state(base_path, goal_name).active_profile,
+        result=retry,
+    )
+    if retry.proved:
+        logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
+        return True
     return False

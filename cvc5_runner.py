@@ -1165,14 +1165,29 @@ def _stdout_is_unsat(stdout: str) -> bool:
 
 
 def _inject_difficulty_script(content: str) -> str:
+    option = "(set-option :produce-difficulty true)"
     lines = content.splitlines()
+    has_set_logic = any(line.strip().startswith("(set-logic") for line in lines)
     out: List[str] = []
     injected = False
     for line in lines:
-        out.append(line)
-        if not injected and line.strip().startswith("(set-logic"):
-            out.append("(set-option :produce-difficulty true)")
+        stripped = line.strip()
+        if not injected and has_set_logic and stripped.startswith("(set-logic"):
+            out.append(line)
+            out.append(option)
             injected = True
+            continue
+        if (
+            not injected
+            and not has_set_logic
+            and stripped.startswith("(")
+            and not stripped.startswith(";")
+        ):
+            out.append(option)
+            injected = True
+        out.append(line)
+    if not injected:
+        out.insert(0, option)
     text = "\n".join(out)
     if "(check-sat)" in text:
         text = text.replace(
