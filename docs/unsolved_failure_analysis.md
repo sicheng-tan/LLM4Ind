@@ -277,7 +277,7 @@ LLM4Ind / ProofMate 的核心流程：
 ### E. 长引理链与递归预算
 
 - `rotate(len,x)=x`、Nicomachus、`count_tsort_flatten`、部分 isa/clam 超时题。  
-- **建议**：提高难例子目标超时或深度；利用 Vampire induction focus / repair hints（见 `docs/vampire_feedback.md`）做定向补引理；对已显示 progress 的引理子集加大保留。
+- **建议**：提高难例子目标超时或深度；利用 Vampire induction focus / repair hints（见 `docs/vampire_feedback.md`）做定向补引理；对已显示 progress 的引理加大保留（不再靠子集证明去「捞」有用组合）。
 
 ### F. 过滤误杀
 

@@ -2,7 +2,6 @@ import re
 import logging
 import sys
 import json
-import itertools
 import os
 import tempfile
 from pathlib import Path
@@ -56,7 +55,8 @@ _MAX_REPAIR_HINTS = 4
 _MAX_PROGRESS_LEMMAS = 6
 _PROGRESS_SCORE_THRESHOLD = 0.5
 _DIAGNOSTIC_TIMEOUT = 3
-_MAX_SUBSET_LEMMAS = 4  # exhaustive pairs only if len(lemmas) <= this
+# Cheap failure-sidecar: score at most this many singleton lemmas (not pairs).
+_MAX_PROGRESS_DIAG_LEMMAS = 3
 
 # 在文件开头添加失败引理管理函数
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
@@ -79,6 +79,8 @@ def _empty_failed_data() -> dict:
         "repair_hints": [],
         "unproved_lemmas": [],
         "routing": {},
+        "baseline_diag": {},
+        "control_diag": {},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -95,6 +97,8 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("repair_hints", [])
             data.setdefault("unproved_lemmas", [])
             data.setdefault("routing", {})
+            data.setdefault("baseline_diag", {})
+            data.setdefault("control_diag", {})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -211,6 +215,131 @@ def save_routing_state(base_path: str, goal_name: str, state: GoalSearchState) -
 
 def _diag_profile(base_path: str, goal_name: str) -> Optional[str]:
     return load_routing_state(base_path, goal_name).active_profile
+
+
+def _compact_vampire_diag(result: VampireResult) -> dict:
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": result.elapsed,
+        "strategy": result.strategy,
+        "stats": dict(result.stats or {}),
+        "induction_focus": list(result.induction_focus or []),
+        "induction_formulas": list(result.induction_formulas or []),
+    }
+
+
+def _vampire_diag_from_compact(data: Optional[dict]) -> Optional[VampireResult]:
+    if not isinstance(data, dict) or "status" not in data:
+        return None
+    return VampireResult(
+        proved=bool(data.get("proved", False)),
+        status=str(data.get("status", "unknown")),
+        elapsed=float(data.get("elapsed", 0.0) or 0.0),
+        strategy=str(data.get("strategy", "")),
+        stats=dict(data.get("stats") or {}),
+        induction_focus=list(data.get("induction_focus") or []),
+        induction_formulas=list(data.get("induction_formulas") or []),
+    )
+
+
+def _load_cached_diag(base_path: str, goal_name: str, key: str) -> Optional[VampireResult]:
+    return _vampire_diag_from_compact(load_failed_lemmas(base_path, goal_name).get(key))
+
+
+def _store_cached_diag(base_path: str, goal_name: str, key: str, result: VampireResult) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data[key] = _compact_vampire_diag(result)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _record_failed_prove_diagnostics(
+    base_path: str,
+    goal_name: str,
+    result: VampireResult,
+    *,
+    context: str = "initial_goal",
+) -> None:
+    """Cache first-prove stats/induction as baseline; do not overwrite later runs."""
+    if result.proved:
+        return
+    if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
+        _store_cached_diag(base_path, goal_name, "baseline_diag", result)
+    add_repair_hints(base_path, goal_name, derive_repair_hints(result, context=context))
+    if result.induction_focus:
+        logging.info("归纳焦点 (%s): %s", context, result.induction_focus[:4])
+
+
+def _record_subgoal_failure_feedback(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    parent_lemmas: List[str],
+) -> None:
+    """Reuse the child's first-prove diagnostics; fall back to a short diagnostic only if missing."""
+    child_profile = load_routing_state(base_path, subgoal).active_profile
+    for lemma in parent_lemmas:
+        add_unproved_lemma(
+            base_path, parent_goal_name, lemma,
+            {
+                "status": "useful_but_unproved",
+                "blocking_subgoal": subgoal,
+                "profile": child_profile,
+            },
+        )
+    diag = _load_cached_diag(base_path, subgoal, "baseline_diag")
+    if diag is None:
+        subgoal_file = Path(base_path) / f"{subgoal}.smt2"
+        if subgoal_file.exists():
+            logging.info("子目标 %s 无缓存诊断，回退短诊断", subgoal)
+            diag = run_vampire_diagnostic(
+                subgoal_file,
+                timeout=_DIAGNOSTIC_TIMEOUT,
+                show_induction=True,
+                profile=child_profile,
+            )
+            _store_cached_diag(base_path, subgoal, "baseline_diag", diag)
+    if diag is None:
+        return
+    hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
+    hints.append({
+        "kind": "subgoal_failed",
+        "context": f"subgoal:{subgoal}",
+        "detail": (
+            f"Lemma was useful for the parent goal but its own proof "
+            f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
+            f"help prove this subgoal directly."
+        ),
+        "induction_focus": diag.induction_focus[:6],
+        "suggested_actions": [
+            "Propose a weaker/simpler variant of the failing lemma",
+            "Add bridging lemmas targeting the subgoal induction focus",
+        ],
+    })
+    add_repair_hints(base_path, parent_goal_name, hints)
+    parent_state = load_routing_state(base_path, parent_goal_name)
+    child_state = load_routing_state(base_path, subgoal)
+    if child_state.active_profile:
+        parent_state = record_profile_history(
+            parent_state,
+            child_state.active_profile or "unknown",
+            status="subgoal_failed",
+            utility=0.0,
+            signals=["subgoal_failed"],
+        )
+        save_routing_state(base_path, parent_goal_name, parent_state)
+
+
+def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
+    """Lemmas to score after a failed usefulness check: skip tautologies, cap count."""
+    out: List[str] = []
+    for lemma in asserts:
+        if _is_trivial_equational_lemma(lemma):
+            continue
+        out.append(lemma)
+        if len(out) >= _MAX_PROGRESS_DIAG_LEMMAS:
+            break
+    return out
 
 def record_solver_attempt(
     base_path: Optional[str],
@@ -426,15 +555,6 @@ def _write_combined_smt(
     output_path.write_text(new_content)
 
 
-def _lemma_subsets(asserts: List[str]) -> List[List[str]]:
-    """Generate singleton (and small pairwise) subsets for usefulness search."""
-    subsets: List[List[str]] = [[a] for a in asserts]
-    if 2 <= len(asserts) <= _MAX_SUBSET_LEMMAS:
-        for a, b in itertools.combinations(asserts, 2):
-            subsets.append([a, b])
-    return subsets
-
-
 def _first_datatype_name(smt_content: str) -> Optional[str]:
     m = re.search(r'\(declare-datatypes\s*\(\s*\(\s*(\w+)', smt_content)
     return m.group(1) if m else None
@@ -505,53 +625,50 @@ def analyze_lemma_progress(
     goal_name: str,
     base_path: str,
 ) -> Tuple[List[str], VampireResult]:
-    """
-    Diagnostic pass: compare baseline vs each lemma subset.
-    Records progress lemmas + repair hints. Returns progressive lemmas and baseline result.
-    """
-    baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
-    baseline_path.write_text(original_content)
+    """Failure sidecar: score singleton lemmas vs cached baseline/control (not a second prove)."""
     diag = _diag_profile(base_path, goal_name)
-    baseline = run_vampire_diagnostic(
-        baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
-    )
-    add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+    baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    if baseline is None:
+        baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
+        baseline_path.write_text(original_content)
+        baseline = run_vampire_diagnostic(
+            baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
+        )
+        _store_cached_diag(base_path, goal_name, "baseline_diag", baseline)
+        add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+    else:
+        logging.info("复用缓存的 Vampire baseline 诊断")
 
-    # Control: quantified reflexivity on first datatype (closer to a useless forall lemma).
-    control_lemma = _control_lemma(original_content)
-    control_path = work_dir / f"{goal_name}_diag_control.smt2"
-    _write_combined_smt(
-        original_assert, [control_lemma], original_content, control_path, named=False
-    )
-    control = run_vampire_diagnostic(
-        control_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=False, profile=diag
-    )
+    control = _load_cached_diag(base_path, goal_name, "control_diag")
+    if control is None:
+        control_lemma = _control_lemma(original_content)
+        control_path = work_dir / f"{goal_name}_diag_control.smt2"
+        _write_combined_smt(
+            original_assert, [control_lemma], original_content, control_path, named=False
+        )
+        control = run_vampire_diagnostic(
+            control_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=False, profile=diag
+        )
+        _store_cached_diag(base_path, goal_name, "control_diag", control)
 
     progressive: List[Tuple[float, str, List[str]]] = []
-    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
-        if all(_is_trivial_equational_lemma(a) for a in subset):
-            logging.info("诊断子集#%d 跳过：平凡重言式引理", idx)
-            continue
-        cand_path = work_dir / f"{goal_name}_diag_subset_{idx}.smt2"
-        _write_combined_smt(original_assert, subset, original_content, cand_path, named=False)
+    for idx, lemma in enumerate(_progress_singleton_lemmas(asserts), 1):
+        cand_path = work_dir / f"{goal_name}_diag_lemma_{idx}.smt2"
+        _write_combined_smt(original_assert, [lemma], original_content, cand_path, named=False)
         cand = run_vampire_diagnostic(
             cand_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=False, profile=diag
         )
         score, signals = compute_progress_score(baseline, cand, control=control)
         logging.info(
-            "诊断子集#%d score=%.2f signals=%s lemmas=%d",
-            idx, score, signals, len(subset),
+            "诊断单条#%d score=%.2f signals=%s",
+            idx, score, signals,
         )
         if score >= _PROGRESS_SCORE_THRESHOLD:
-            for lemma in subset:
-                if _is_trivial_equational_lemma(lemma):
-                    continue
-                progressive.append((score, lemma, signals))
-                add_progress_lemma(
-                    base_path, goal_name, lemma, score, signals, profile=diag
-                )
+            progressive.append((score, lemma, signals))
+            add_progress_lemma(
+                base_path, goal_name, lemma, score, signals, profile=diag
+            )
 
-    # Unique lemmas keeping best score order
     seen = set()
     ordered: List[str] = []
     for score, lemma, _ in sorted(progressive, key=lambda x: -x[0]):
@@ -574,12 +691,9 @@ def verify_combined_lemmas(
     decision_source: Optional[str] = None,
 ) -> Tuple[bool, List[str], Optional[VampireResult]]:
     """
-    验证引理组合有用性，并在失败时做子集搜索 / 进展评分 / repair hints。
-
-    Returns:
-        (useful, selected_lemmas, result)
-        selected_lemmas: on success, lemmas that appear in Vampire unsat core when available;
-                         otherwise the original asserts. On failure, progressive lemmas (may be empty).
+    有用性检查，对齐原文：只做一次整组 A∧C→P。
+    成功时用同一次 run 的 unsat core 剪枝（不额外超时）。
+    失败后不二次满超时、不枚举子集再证明，仅做短诊断写入下一轮。
     """
     combined_timeout = config['COMBINED_CVC_TIMEOUT']
     work_dir = output_path.parent
@@ -628,45 +742,9 @@ def verify_combined_lemmas(
         )
         return True, selected, ucore_result
 
-    # 2) Fallback prove without ucore (same lemmas) in case ucore mode misfires
+    # Same lemmas, one attempt: do not re-prove at full timeout or search subsets.
     _write_combined_smt(original_assert, asserts, original_content, output_path, named=False)
-    plain_result = run_vampire_routed(
-        output_path, timeout=combined_timeout, state=state, collect_stats=True
-    )
-    record_solver_attempt(
-        base_path,
-        gname,
-        prompt_strategy=prompt_strategy,
-        selected_profile=solver_profile or state.active_profile,
-        result=plain_result,
-    )
-    if plain_result.proved:
-        logging.info("组合引理证出目标（非 ucore 路径）")
-        return True, list(asserts), plain_result
 
-    # 3) Subset prove search: any singleton/pair that already proves the goal?
-    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
-        sub_path = work_dir / f"{output_path.stem}_subset_{idx}.smt2"
-        _write_combined_smt(original_assert, subset, original_content, sub_path, named=False)
-        sub_res = run_vampire_routed(
-            sub_path,
-            timeout=max(10, combined_timeout // 2),
-            state=state,
-            collect_stats=False,
-        )
-        record_solver_attempt(
-            base_path,
-            gname,
-            prompt_strategy=prompt_strategy,
-            selected_profile=solver_profile or state.active_profile,
-            result=sub_res,
-        )
-        if sub_res.proved:
-            logging.info("子集引理证出目标: %d 条", len(subset))
-            _write_combined_smt(original_assert, subset, original_content, output_path, named=False)
-            return True, list(subset), sub_res
-
-    # 4) Not useful enough to prove: diagnostic progress + repair hints
     progressive: List[str] = []
     baseline = VampireResult(status="unknown")
     if base_path and goal_name:
@@ -681,7 +759,7 @@ def verify_combined_lemmas(
             goal_name,
             asserts,
             meta={
-                "status": plain_result.status,
+                "status": ucore_result.status,
                 "hint_kind": hint_kind,
                 "progressive_count": len(progressive),
             },
@@ -696,7 +774,7 @@ def verify_combined_lemmas(
                     f"{len(progressive)} lemma(s) showed partial rewrite/induction progress; "
                     "refine them or add bridging lemmas."
                     if progressive else
-                    "No lemma subset showed measurable progress; try a different lemma shape "
+                    "No lemma showed measurable progress; try a different lemma shape "
                     "(generalization / rewrite bridge)."
                 )
             ),
@@ -708,7 +786,7 @@ def verify_combined_lemmas(
             ],
         }])
 
-    return False, progressive, plain_result
+    return False, progressive, ucore_result
 
 
 def perform_initial_verification(
@@ -725,6 +803,7 @@ def perform_initial_verification(
         goal_smt_file,
         default_timeout,
         collect_stats=True,
+        show_induction=True,
         state=routing_state,
     )
     if routing_enabled() and base_path and goal_name:
@@ -738,7 +817,9 @@ def perform_initial_verification(
     if result.proved:
         logging.info("✅ 原目标直接验证成功!")
         return True
-    
+
+    if base_path and goal_name:
+        _record_failed_prove_diagnostics(base_path, goal_name, result)
     logging.error(
         "Vampire验证未通过 (status=%s)，开始生成新引理...",
         result.status,
@@ -753,7 +834,7 @@ def seed_baseline_repair_hints(
     *,
     parent_goal_name: Optional[str] = None,
 ) -> None:
-    """首次求助于 LLM 前：理论分流、短 probe、repair hints。"""
+    """首次求助于 LLM 前：理论分流、短 probe。repair hints 来自首次 60s prove。"""
     content = goal_smt_file.read_text(encoding="utf-8")
     features = analyze_smt(content)
     parent_profile = None
@@ -855,15 +936,6 @@ def seed_baseline_repair_hints(
         state = ranked_state
 
     save_routing_state(base_path, goal_name, state)
-    diag = run_vampire_diagnostic(
-        goal_smt_file,
-        timeout=_DIAGNOSTIC_TIMEOUT,
-        show_induction=True,
-        profile=state.active_profile,
-    )
-    add_repair_hints(base_path, goal_name, derive_repair_hints(diag, context="initial_goal"))
-    if diag.induction_focus:
-        logging.info("初始归纳焦点: %s", diag.induction_focus[:4])
     logging.info(
         "vampire routing: active=%s candidates=%s reasons=%s",
         state.active_profile, state.candidate_profiles, state.routing_reasons,
@@ -1363,7 +1435,7 @@ def quick_run(
         return False, [], extracted_asserts
 
 
-    # 步骤6: 检查引理是否有助于证明原目标（含子集搜索 / ucore / 进展评分）
+    # 步骤6: 一次整组有用性检查；失败则短诊断反馈（不搜索子集证明）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
     useful, selected_lemmas, _vres = verify_combined_lemmas(
         original_assert,
@@ -1419,50 +1491,9 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
                         # 记录导致子目标失败的引理 + Vampire 诊断到父目标
                         if parent_lemmas and parent_goal_name:
-                            for lemma in parent_lemmas:
-                                add_unproved_lemma(
-                                    base_path, parent_goal_name, lemma,
-                                    {
-                                        "status": "useful_but_unproved",
-                                        "blocking_subgoal": subgoal,
-                                        "profile": load_routing_state(base_path, subgoal).active_profile,
-                                    },
-                                )
-                            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
-                            if subgoal_file.exists():
-                                diag = run_vampire_diagnostic(
-                                    subgoal_file,
-                                    timeout=_DIAGNOSTIC_TIMEOUT,
-                                    show_induction=True,
-                                    profile=load_routing_state(base_path, subgoal).active_profile,
-                                )
-                                hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
-                                hints.append({
-                                    "kind": "subgoal_failed",
-                                    "context": f"subgoal:{subgoal}",
-                                    "detail": (
-                                        f"Lemma was useful for the parent goal but its own proof "
-                                        f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
-                                        f"help prove this subgoal directly."
-                                    ),
-                                    "induction_focus": diag.induction_focus[:6],
-                                    "suggested_actions": [
-                                        "Propose a weaker/simpler variant of the failing lemma",
-                                        "Add bridging lemmas targeting the subgoal induction focus",
-                                    ],
-                                })
-                                add_repair_hints(base_path, parent_goal_name, hints)
-                                parent_state = load_routing_state(base_path, parent_goal_name)
-                                child_state = load_routing_state(base_path, subgoal)
-                                if child_state.active_profile:
-                                    parent_state = record_profile_history(
-                                        parent_state,
-                                        child_state.active_profile or "unknown",
-                                        status="subgoal_failed",
-                                        utility=0.0,
-                                        signals=["subgoal_failed"],
-                                    )
-                                    save_routing_state(base_path, parent_goal_name, parent_state)
+                            _record_subgoal_failure_feedback(
+                                base_path, parent_goal_name, subgoal, parent_lemmas
+                            )
                         # 取消所有未完成的任务
                         for f in future_to_subgoal:
                             if not f.done():

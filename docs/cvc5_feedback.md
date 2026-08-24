@@ -55,8 +55,8 @@ error       执行或输入错误
 
 - 判断原目标是否已经证明；
 - 判断候选引理组合是否有用；
-- 在失败后触发 CVC5 诊断；
-- 生成 timeout 或 unknown 类型的 repair hint。
+- 失败后写 timeout / unknown 类 repair hint；
+- 有用性失败时才触发短 sidecar 诊断（不是入口 60s prove 之前的另一次求解）。
 
 ## 三、CVC5 诊断模式
 
@@ -84,7 +84,9 @@ cmd = [
 ]
 ```
 
-这样做是为了使 baseline 和 candidate 的统计可比。不能直接比较不同 portfolio 策略混合出来的统计。
+首次 60s prove 在 CVC5 策略上会带 `--stats`、`--tlimit-per`，并注入 `produce-difficulty` / `get-difficulty`，失败结果缓存为 `baseline_diag`。有用性失败后的 sidecar 仍用上面这条单策略，超时 3s，用于和 control/candidate 比 progress。不要把不同 portfolio 策略混出来的计数直接相比。
+
+**注意：** sidecar 默认 3s，baseline 可能来自 60s prove，两者不完全可比；这是已知问题，见 `docs/feedback_fix_plan.md`。
 
 ## 四、`--stats` 统计信号
 
@@ -494,21 +496,20 @@ no_measurable_progress
      (add y x)))
 ```
 
-第一条是平凡恒真式，因此诊断时会跳过：
+第一条是平凡恒真式，因此 sidecar 诊断时会跳过：
 
 ```text
-诊断子集#1 跳过：平凡重言式引理
+诊断单条#1 跳过：平凡重言式引理
 ```
 
 加入加法交换律后，CVC5 可能产生：
 
 ```text
-cvc5诊断子集#2 score=2.70
+cvc5诊断单条#2 score=2.70
 signals=[
   'more_instantiations(+239)',
   'more_datatype_inference(+60)'
 ]
-lemmas=1
 ```
 
 保存结果：
@@ -642,13 +643,7 @@ unsat
 )
 ```
 
-因此当前代码不依赖 CVC5 unsat core 进行引理剪枝，而是采用：
-
-```text
-全组证明
-→ 单条引理证明
-→ 二元子集证明
-```
+因此当前代码不依赖 CVC5 unsat core 做引理剪枝。有用性只做 **一次整组** `A ∧ C → P`（默认 60s）。失败后不再枚举单条/pair 再证明，只对最多 3 条 singleton 做短诊断写下一轮反馈。
 
 ### 14.2 Proof
 

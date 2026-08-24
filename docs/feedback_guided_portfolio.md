@@ -7,6 +7,7 @@
 - Vampire 统计 / 归纳焦点 / unsat core：[vampire_feedback.md](vampire_feedback.md)
 - CVC5 stats / difficulty：[cvc5_feedback.md](cvc5_feedback.md)
 - 相对进度度量：[relative_metrics.md](relative_metrics.md)
+- 已知反馈缺陷与修复方案：[feedback_fix_plan.md](feedback_fix_plan.md)
 
 ---
 
@@ -40,17 +41,17 @@ ProveRun(P)
 
 | 环节 | Vampire | CVC5 |
 |---|---|---|
-| 初始诊断 | `show_induction` + 统计 | `--stats` + `get-difficulty` |
-| 有用性失败 | 子集证明、progress score、repair hints | 子集证明、stats/difficulty、repair hints |
+| 首次 prove | 同一次 60s：stats + `--show_induction` | 同一次 60s：`--stats` + `get-difficulty` |
+| 有用性失败 | 不再子集证明；≤3 条 singleton 短诊断 + repair hints | 同样：短 sidecar，不搜子集 |
 | 写入 prompt | invalid / useless / progress / hints | 同类，外加 high-difficulty assertions |
-| 子目标失败 | 诊断 + `subgoal_failed` hint | 同类 |
+| 子目标失败 | 复用子目标 `baseline_diag`，缺缓存才短诊断 | 同类 |
 
-问题：
+问题（部分已缓解，见 §3.5.1）：
 
-1. 反馈只进入 LLM prompt，不进入 solver 配置。
-2. 诊断策略固定（Vampire 结构归纳；CVC5 `--quant-ind --conjecture-gen`）。
-3. portfolio 失败时丢掉各策略的独立结果。
-4. 子目标超时把父引理记为 `invalid_lemmas`，语义过严。
+1. 反馈主要进入 LLM prompt；routing 开启后也会影响 solver profile（§1.3）。
+2. sidecar 诊断策略需与 progress baseline 可比（见 `feedback_fix_plan.md`）。
+3. portfolio 失败时各策略独立结果的利用仍有限。
+4. 子目标超时曾误记为 `invalid_lemmas`；现记为 `useful_but_unproved`。
 
 ### 1.3 现在的双层 Feedback-Guided 设计
 
@@ -176,13 +177,30 @@ hint 再提升：
 
 ### 3.5 Mate 闭环（`Mate_new.py` / `Mate_new_vampire.py`）
 
-1. `ProveRun` 进入节点时 `seed_baseline_repair_hints`：理论分析 + relative 模式下最多 `SOLVER_ROUTING_PROBE_MAX_PROFILES` 个 probe；LLM 模式跳过 probe utility。
-2. 初始验证 / 有用性验证 / 重试超时走 `run_*_routed`，并保留 fallback 预算。
-3. 诊断 progress score 使用当前 `active_profile` 对应的单策略，保证 baseline/control/candidate 可比。
-4. 每个 LLM 生成 attempt 重新选择 prompt/profile；prompt 注入 `SOLVER ROUTING` 段，并按 hint 或 selector 结果选择两种论文 prompt，不删除候选。
-5. 子目标失败：`unproved_lemmas` + repair hints，不再写入 `invalid_lemmas`。
-6. 子目标 `ProveRun(..., parent_goal_name=)` 可继承父 profile。
-7. 有用性验证、子集验证和重试结果写入 `routing.pair_history`，包括 status、elapsed、winner/fallback 信息。
+1. `ProveRun` 进入节点时 `seed_baseline_repair_hints`：理论分析 + relative 模式下最多 `SOLVER_ROUTING_PROBE_MAX_PROFILES` 个 probe（各 2s，串行，最多约 6s）。**不再**在首次 prove 前单独跑 3s 诊断。
+2. 初始验证：一次 routed 60s prove。失败则把该次结果缓存为 `baseline_diag` 并写 repair hints。routing fallback 只切分这 60s（约 45s+15s），不另加超时。
+3. LLM 循环：filter 1s → 有用性 **一次**整组 60s。成功时 Vampire 用**同一次** unsat core 剪枝；CVC5 不依赖 core。失败不枚举子集、Vampire 不再二次满超时。
+4. 有用性失败 sidecar：最多 3 条非平凡 singleton × 3s（CVC 若仍分两次取 difficulty，单条最坏约 6s）+ 节点级 3s control（可缓存）。progress 用当前 `active_profile` 对应单策略。
+5. 每个 LLM attempt 可重选 prompt/profile；prompt 注入 `SOLVER ROUTING` 段。
+6. 子目标失败：复用子目标首次 prove 的 `baseline_diag`；`unproved_lemmas` + repair hints，不写入 `invalid_lemmas`。
+7. 子目标 `ProveRun(..., parent_goal_name=)` 可继承父 profile。
+8. 有用性与重试结果写入 `routing.pair_history`（不再有子集证明记录）。
+
+LLM 返回空列表时，当前实现仍会在该 attempt **立刻**用 `RETRY_CVC_TIMEOUT`（默认 100s）再证原目标；调用抛错则不加时。这不是论文步骤。
+
+### 3.5.1 相对论文的求解器时间
+
+论文主路径：filter 1s + 一次 60s `A ∧ C → P`，失败则下一轮 LLM。另有节点入口一次「SMT 直接证 P」（实现里同样 60s）。
+
+实现里**故意多出来的**：
+
+| 项 | 默认上限 | 说明 |
+|---|---|---|
+| 入口 probe | ≤ 6s / 节点首次 | `SOLVER_ROUTING_PROBES=off` 可关 |
+| 有用性失败 sidecar | Vampire 约 ≤9s；CVC 因 difficulty 二次进程可能到 ~21s | 不是第二轮证明搜索 |
+| stats / induction | 挂在同一次 60s prove | 不另开超时 |
+
+**已经拿掉的成本：** singleton/pair 子集 routed 证明、Vampire 有用性失败后再跑一次满 60s、入口单独 3s 诊断、子目标失败时默认再诊断。
 
 `failed_lemmas.json` 新增字段：
 

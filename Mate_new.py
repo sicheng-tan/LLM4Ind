@@ -2,7 +2,6 @@ import re
 import logging
 import sys
 import json
-import itertools
 import os
 import tempfile
 from pathlib import Path
@@ -55,7 +54,8 @@ _MAX_REPAIR_HINTS = 4
 _MAX_PROGRESS_LEMMAS = 6
 _PROGRESS_SCORE_THRESHOLD = 0.5
 _DIAGNOSTIC_TIMEOUT = 3
-_MAX_SUBSET_LEMMAS = 4
+# Cheap failure-sidecar: score at most this many singleton lemmas (not pairs).
+_MAX_PROGRESS_DIAG_LEMMAS = 3
 
 # 在文件开头添加失败引理管理函数
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
@@ -78,6 +78,8 @@ def _empty_failed_data() -> dict:
         "repair_hints": [],
         "unproved_lemmas": [],
         "routing": {},
+        "baseline_diag": {},
+        "control_diag": {},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -93,6 +95,8 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("repair_hints", [])
             data.setdefault("unproved_lemmas", [])
             data.setdefault("routing", {})
+            data.setdefault("baseline_diag", {})
+            data.setdefault("control_diag", {})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -206,6 +210,137 @@ def save_routing_state(base_path: str, goal_name: str, state: GoalSearchState) -
 
 def _diag_profile(base_path: str, goal_name: str) -> Optional[str]:
     return load_routing_state(base_path, goal_name).active_profile
+
+
+def _compact_cvc_diag(result: CvcResult) -> dict:
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": result.elapsed,
+        "strategy": result.strategy,
+        "stats": dict(result.stats or {}),
+        "difficulty": [[t, s] for t, s in (result.difficulty or [])],
+    }
+
+
+def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
+    if not isinstance(data, dict) or "status" not in data:
+        return None
+    difficulty: List[Tuple[str, int]] = []
+    for item in data.get("difficulty") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            difficulty.append((str(item[0]), int(item[1])))
+    return CvcResult(
+        proved=bool(data.get("proved", False)),
+        status=str(data.get("status", "unknown")),
+        elapsed=float(data.get("elapsed", 0.0) or 0.0),
+        strategy=str(data.get("strategy", "")),
+        stats=dict(data.get("stats") or {}),
+        difficulty=difficulty,
+    )
+
+
+def _load_cached_diag(base_path: str, goal_name: str, key: str) -> Optional[CvcResult]:
+    return _cvc_diag_from_compact(load_failed_lemmas(base_path, goal_name).get(key))
+
+
+def _store_cached_diag(base_path: str, goal_name: str, key: str, result: CvcResult) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data[key] = _compact_cvc_diag(result)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _record_failed_prove_diagnostics(
+    base_path: str,
+    goal_name: str,
+    result: CvcResult,
+    *,
+    context: str = "initial_goal",
+) -> None:
+    """Cache first-prove stats/difficulty as baseline; do not overwrite later runs."""
+    if result.proved:
+        return
+    if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
+        _store_cached_diag(base_path, goal_name, "baseline_diag", result)
+    add_repair_hints(base_path, goal_name, derive_repair_hints(result, context=context))
+    if result.difficulty:
+        logging.info(
+            "cvc5 高难度断言 (%s): %s",
+            context,
+            [t[:80] for t, _s in result.difficulty[:3]],
+        )
+
+
+def _record_subgoal_failure_feedback(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    parent_lemmas: List[str],
+) -> None:
+    """Reuse the child's first-prove diagnostics; fall back to a short diagnostic only if missing."""
+    child_profile = load_routing_state(base_path, subgoal).active_profile
+    for lemma in parent_lemmas:
+        add_unproved_lemma(
+            base_path, parent_goal_name, lemma,
+            {
+                "status": "useful_but_unproved",
+                "blocking_subgoal": subgoal,
+                "profile": child_profile,
+            },
+        )
+    diag = _load_cached_diag(base_path, subgoal, "baseline_diag")
+    if diag is None:
+        subgoal_file = Path(base_path) / f"{subgoal}.smt2"
+        if subgoal_file.exists():
+            logging.info("子目标 %s 无缓存诊断，回退短诊断", subgoal)
+            diag = run_cvc_diagnostic(
+                subgoal_file,
+                timeout=_DIAGNOSTIC_TIMEOUT,
+                collect_difficulty=True,
+                profile=child_profile,
+            )
+            _store_cached_diag(base_path, subgoal, "baseline_diag", diag)
+    if diag is None:
+        return
+    hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
+    hints.append({
+        "kind": "subgoal_failed",
+        "context": f"subgoal:{subgoal}",
+        "detail": (
+            f"Lemma was useful for the parent goal but its own proof "
+            f"({subgoal}) failed under cvc5. Generate easier lemmas, "
+            f"or lemmas that help prove this subgoal directly."
+        ),
+        "hard_axioms": [t for t, _s in diag.difficulty[:4]],
+        "suggested_actions": [
+            "Propose a weaker/simpler variant of the failing lemma",
+            "Add bridging lemmas targeting high-difficulty axioms",
+        ],
+    })
+    add_repair_hints(base_path, parent_goal_name, hints)
+    parent_state = load_routing_state(base_path, parent_goal_name)
+    child_state = load_routing_state(base_path, subgoal)
+    if child_state.active_profile:
+        parent_state = record_profile_history(
+            parent_state,
+            child_state.active_profile or "unknown",
+            status="subgoal_failed",
+            utility=0.0,
+            signals=["subgoal_failed"],
+        )
+        save_routing_state(base_path, parent_goal_name, parent_state)
+
+
+def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
+    """Lemmas to score after a failed usefulness check: skip tautologies, cap count."""
+    out: List[str] = []
+    for lemma in asserts:
+        if _is_trivial_equational_lemma(lemma):
+            continue
+        out.append(lemma)
+        if len(out) >= _MAX_PROGRESS_DIAG_LEMMAS:
+            break
+    return out
 
 def record_solver_attempt(
     base_path: Optional[str],
@@ -412,14 +547,6 @@ def _write_combined_smt(
     output_path.write_text(new_content)
 
 
-def _lemma_subsets(asserts: List[str]) -> List[List[str]]:
-    subsets: List[List[str]] = [[a] for a in asserts]
-    if 2 <= len(asserts) <= _MAX_SUBSET_LEMMAS:
-        for a, b in itertools.combinations(asserts, 2):
-            subsets.append([a, b])
-    return subsets
-
-
 def _first_datatype_name(smt_content: str) -> Optional[str]:
     m = re.search(r'\(declare-datatypes\s*\(\s*\(\s*(\w+)', smt_content)
     return m.group(1) if m else None
@@ -485,54 +612,57 @@ def analyze_lemma_progress(
     goal_name: str,
     base_path: str,
 ) -> Tuple[List[str], CvcResult]:
-    """Diagnostic: baseline vs control vs lemma subsets using cvc5 stats/difficulty."""
-    baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
-    baseline_path.write_text(original_content)
-    baseline = run_cvc_diagnostic(
-        baseline_path,
-        timeout=_DIAGNOSTIC_TIMEOUT,
-        collect_difficulty=True,
-        profile=_diag_profile(base_path, goal_name),
-    )
-    add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+    """Failure sidecar: score singleton lemmas vs cached baseline/control (not a second prove)."""
+    profile = _diag_profile(base_path, goal_name)
+    baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    if baseline is None:
+        baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
+        baseline_path.write_text(original_content)
+        baseline = run_cvc_diagnostic(
+            baseline_path,
+            timeout=_DIAGNOSTIC_TIMEOUT,
+            collect_difficulty=True,
+            profile=profile,
+        )
+        _store_cached_diag(base_path, goal_name, "baseline_diag", baseline)
+        add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+    else:
+        logging.info("复用缓存的 cvc5 baseline 诊断")
 
-    control_lemma = _control_lemma(original_content)
-    control_path = work_dir / f"{goal_name}_diag_control.smt2"
-    _write_combined_smt([control_lemma], original_content, control_path)
-    control = run_cvc_diagnostic(
-        control_path,
-        timeout=_DIAGNOSTIC_TIMEOUT,
-        collect_difficulty=False,
-        profile=_diag_profile(base_path, goal_name),
-    )
+    control = _load_cached_diag(base_path, goal_name, "control_diag")
+    if control is None:
+        control_lemma = _control_lemma(original_content)
+        control_path = work_dir / f"{goal_name}_diag_control.smt2"
+        _write_combined_smt([control_lemma], original_content, control_path)
+        control = run_cvc_diagnostic(
+            control_path,
+            timeout=_DIAGNOSTIC_TIMEOUT,
+            collect_difficulty=False,
+            profile=profile,
+        )
+        _store_cached_diag(base_path, goal_name, "control_diag", control)
 
     progressive: List[Tuple[float, str, List[str]]] = []
-    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
-        if all(_is_trivial_equational_lemma(a) for a in subset):
-            logging.info("诊断子集#%d 跳过：平凡重言式引理", idx)
-            continue
-        cand_path = work_dir / f"{goal_name}_diag_subset_{idx}.smt2"
-        _write_combined_smt(subset, original_content, cand_path)
+    for idx, lemma in enumerate(_progress_singleton_lemmas(asserts), 1):
+        cand_path = work_dir / f"{goal_name}_diag_lemma_{idx}.smt2"
+        _write_combined_smt([lemma], original_content, cand_path)
         cand = run_cvc_diagnostic(
             cand_path,
             timeout=_DIAGNOSTIC_TIMEOUT,
             collect_difficulty=True,
-            profile=_diag_profile(base_path, goal_name),
+            profile=profile,
         )
         score, signals = compute_progress_score(baseline, cand, control=control)
         logging.info(
-            "cvc5诊断子集#%d score=%.2f signals=%s lemmas=%d",
-            idx, score, signals, len(subset),
+            "cvc5诊断单条#%d score=%.2f signals=%s",
+            idx, score, signals,
         )
         if score >= _PROGRESS_SCORE_THRESHOLD:
-            for lemma in subset:
-                if _is_trivial_equational_lemma(lemma):
-                    continue
-                progressive.append((score, lemma, signals))
-                add_progress_lemma(
-                    base_path, goal_name, lemma, score, signals,
-                    profile=_diag_profile(base_path, goal_name),
-                )
+            progressive.append((score, lemma, signals))
+            add_progress_lemma(
+                base_path, goal_name, lemma, score, signals,
+                profile=profile,
+            )
 
     seen = set()
     ordered: List[str] = []
@@ -556,10 +686,8 @@ def verify_combined_lemmas(
     decision_source: Optional[str] = None,
 ) -> Tuple[bool, List[str], Optional[CvcResult]]:
     """
-    验证引理组合有用性。cvc5 路径：
-    1) 全组 portfolio 证明
-    2) 子集证明搜索（不依赖 unsat core）
-    3) 失败则 stats/difficulty 进展评分 + repair hints
+    有用性检查，对齐原文：只做一次整组 A∧C→P。
+    失败后不枚举子集再证明，仅做短诊断写入下一轮 LLM / routing。
     """
     combined_timeout = config['COMBINED_CVC_TIMEOUT']
     work_dir = output_path.parent
@@ -589,27 +717,6 @@ def verify_combined_lemmas(
         logging.info("组合引理证出目标（cvc5 portfolio）")
         return True, list(asserts), full
 
-    # Subset prove search
-    for idx, subset in enumerate(_lemma_subsets(asserts), 1):
-        sub_path = work_dir / f"{output_path.stem}_subset_{idx}.smt2"
-        _write_combined_smt(subset, original_content, sub_path)
-        sub_res = run_cvc_routed(
-            sub_path,
-            timeout=max(10, combined_timeout // 2),
-            state=state,
-        )
-        record_solver_attempt(
-            base_path,
-            gname,
-            prompt_strategy=prompt_strategy,
-            selected_profile=solver_profile or state.active_profile,
-            result=sub_res,
-        )
-        if sub_res.proved:
-            logging.info("子集引理证出目标: %d 条", len(subset))
-            _write_combined_smt(subset, original_content, output_path)
-            return True, list(subset), sub_res
-
     progressive: List[str] = []
     baseline = CvcResult(status="unknown")
     if base_path and goal_name:
@@ -636,7 +743,7 @@ def verify_combined_lemmas(
                     f"{len(progressive)} lemma(s) showed partial stats/difficulty progress; "
                     "refine them or add bridging lemmas."
                     if progressive else
-                    "No lemma subset showed measurable progress; try a different lemma shape "
+                    "No lemma showed measurable progress; try a different lemma shape "
                     "(generalization / rewrite bridge) targeting high-difficulty axioms."
                 )
             ),
@@ -665,6 +772,8 @@ def perform_initial_verification(
         goal_smt_file,
         default_timeout,
         state=routing_state,
+        collect_stats=True,
+        collect_difficulty=True,
     )
     if routing_enabled() and base_path and goal_name:
         record_solver_attempt(
@@ -678,6 +787,8 @@ def perform_initial_verification(
         logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
 
+    if base_path and goal_name:
+        _record_failed_prove_diagnostics(base_path, goal_name, result)
     logging.error("CVC5验证未通过 (status=%s)，开始生成新引理...", result.status)
     return False
 
@@ -689,7 +800,7 @@ def seed_baseline_repair_hints(
     *,
     parent_goal_name: Optional[str] = None,
 ) -> None:
-    """首次求助于 LLM 前：理论分流、短 probe、repair hints。"""
+    """首次求助于 LLM 前：理论分流、短 probe。repair hints 来自首次 60s prove。"""
     content = goal_smt_file.read_text(encoding="utf-8")
     features = analyze_smt(content)
     parent_profile = None
@@ -788,18 +899,6 @@ def seed_baseline_repair_hints(
         state = ranked_state
 
     save_routing_state(base_path, goal_name, state)
-    diag = run_cvc_diagnostic(
-        goal_smt_file,
-        timeout=_DIAGNOSTIC_TIMEOUT,
-        collect_difficulty=True,
-        profile=state.active_profile,
-    )
-    add_repair_hints(base_path, goal_name, derive_repair_hints(diag, context="initial_goal"))
-    if diag.difficulty:
-        logging.info(
-            "初始 cvc5 高难度断言: %s",
-            [t[:80] for t, s in diag.difficulty[:3]],
-        )
     logging.info(
         "cvc5 routing: active=%s candidates=%s reasons=%s",
         state.active_profile, state.candidate_profiles, state.routing_reasons,
@@ -1293,7 +1392,7 @@ def quick_run(
         return False, [], extracted_asserts
 
 
-    # 步骤6: 检查引理是否有助于证明原目标（子集搜索 / stats / difficulty）
+    # 步骤6: 一次整组有用性检查；失败则短诊断反馈（不搜索子集证明）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
     useful, selected_lemmas, _cres = verify_combined_lemmas(
         original_assert,
@@ -1348,50 +1447,9 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                     if not result:
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
                         if parent_lemmas and parent_goal_name:
-                            for lemma in parent_lemmas:
-                                add_unproved_lemma(
-                                    base_path, parent_goal_name, lemma,
-                                    {
-                                        "status": "useful_but_unproved",
-                                        "blocking_subgoal": subgoal,
-                                        "profile": load_routing_state(base_path, subgoal).active_profile,
-                                    },
-                                )
-                            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
-                            if subgoal_file.exists():
-                                diag = run_cvc_diagnostic(
-                                    subgoal_file,
-                                    timeout=_DIAGNOSTIC_TIMEOUT,
-                                    collect_difficulty=True,
-                                    profile=load_routing_state(base_path, subgoal).active_profile,
-                                )
-                                hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
-                                hints.append({
-                                    "kind": "subgoal_failed",
-                                    "context": f"subgoal:{subgoal}",
-                                    "detail": (
-                                        f"Lemma was useful for the parent goal but its own proof "
-                                        f"({subgoal}) failed under cvc5. Generate easier lemmas, "
-                                        f"or lemmas that help prove this subgoal directly."
-                                    ),
-                                    "hard_axioms": [t for t, _ in diag.difficulty[:4]],
-                                    "suggested_actions": [
-                                        "Propose a weaker/simpler variant of the failing lemma",
-                                        "Add bridging lemmas targeting high-difficulty axioms",
-                                    ],
-                                })
-                                add_repair_hints(base_path, parent_goal_name, hints)
-                                parent_state = load_routing_state(base_path, parent_goal_name)
-                                child_state = load_routing_state(base_path, subgoal)
-                                if child_state.active_profile:
-                                    parent_state = record_profile_history(
-                                        parent_state,
-                                        child_state.active_profile or "unknown",
-                                        status="subgoal_failed",
-                                        utility=0.0,
-                                        signals=["subgoal_failed"],
-                                    )
-                                    save_routing_state(base_path, parent_goal_name, parent_state)
+                            _record_subgoal_failure_feedback(
+                                base_path, parent_goal_name, subgoal, parent_lemmas
+                            )
                         for f in future_to_subgoal:
                             if not f.done():
                                 f.cancel()

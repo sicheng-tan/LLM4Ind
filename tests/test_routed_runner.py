@@ -20,8 +20,8 @@ from vampire_runner import VampireResult, run_vampire_routed
 def test_cvc5_routed_fallback() -> None:
     calls = []
 
-    def fake_parallel(path, timeout, names, *, collect_stats):
-        calls.append((timeout, list(names), collect_stats))
+    def fake_parallel(path, timeout, names, *, collect_stats, collect_difficulty=False):
+        calls.append((timeout, list(names), collect_stats, collect_difficulty))
         if names == ["adt_structural"]:
             return CvcResult(
                 status="timeout",
@@ -52,7 +52,7 @@ def test_cvc5_routed_fallback() -> None:
 
     assert result.proved
     assert result.strategy == "cvc5_simple"
-    assert [names for _, names, _ in calls] == [
+    assert [names for _, names, _, _ in calls] == [
         ["adt_structural"],
         ["cvc5_simple"],
     ]
@@ -62,8 +62,8 @@ def test_cvc5_routed_fallback() -> None:
 def test_vampire_routed_fallback() -> None:
     calls = []
 
-    def fake_parallel(path, timeout, names, *, collect_stats, collect_ucore):
-        calls.append((timeout, list(names), collect_stats, collect_ucore))
+    def fake_parallel(path, timeout, names, *, collect_stats, collect_ucore, show_induction=False):
+        calls.append((timeout, list(names), collect_stats, collect_ucore, show_induction))
         if names == ["struct_induction"]:
             return VampireResult(
                 status="timeout",
@@ -94,7 +94,7 @@ def test_vampire_routed_fallback() -> None:
 
     assert result.proved
     assert result.strategy == "induction_portfolio"
-    assert [names for _, names, _, _ in calls] == [
+    assert [names for _, names, _, _, _ in calls] == [
         ["struct_induction"],
         ["induction_portfolio"],
     ]
@@ -114,7 +114,9 @@ def test_routing_off_uses_paper_runner() -> None:
             timeout=7,
             state=GoalSearchState(backend="cvc5", candidate_profiles=["adt_structural"]),
         ) is cvc_result
-    cvc_run.assert_called_once_with("unused.smt2", 7, collect_stats=False)
+    cvc_run.assert_called_once_with(
+        "unused.smt2", 7, collect_stats=False, collect_difficulty=False
+    )
 
     vampire_result = VampireResult(status="timeout", strategy="induction_portfolio")
     with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}, clear=False), patch(
@@ -132,6 +134,7 @@ def test_routing_off_uses_paper_runner() -> None:
         7,
         collect_stats=False,
         collect_ucore=True,
+        show_induction=False,
     )
 
 

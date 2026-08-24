@@ -262,7 +262,7 @@ need_arithmetic_lemma:
 |----|------|--------|
 | 多次 matched control | 诊断时间 ×N | 在 `analyze_lemma_progress` 对 2～3 个平凡断言取均值/方差 |
 | 按数据集分桶标定 | 需要离线统计 | 对 ind-ben / autoproof / dtt 分别估 log-gain 分位数 |
-| 学习排序/逻辑回归 | 需要标签 | 用“最终 unsat / 子集证明 / ucore 成员”当正例 |
+| 学习排序/逻辑回归 | 需要标签 | 用“最终 unsat / 同次 ucore 成员”当正例 |
 | 证明图 / instantiation dump | 另一条线 | 见先前关于 proof DAG 的讨论，与阈值无关 |
 
 ---

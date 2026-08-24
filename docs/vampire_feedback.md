@@ -601,7 +601,7 @@ L3: x = x
 组合引理证出目标；ucore 保留 2/3 条引理
 ```
 
-注意：unsat core 是证明成功后的筛选信号，不是失败时的卡住信号。
+注意：unsat core 只在 **同一次** 有用性 prove 已经 `unsat` 之后剪枝，不再另开超时。失败时抽不出 core，也不会再跑第二次满超时 plain prove。
 
 ## 十一、失败后的 `failed_lemmas.json`
 
@@ -686,7 +686,7 @@ more_instantiations(+1000)
 InductionApplications 增加
 Fw demodulations to eq. taut. 增加
 Final passive clause ratio 下降
-最终能够证明目标或某个子集能够证明目标
+最终能够证明目标（整组有用性一次超时，不用子集再搜一遍）
 ```
 
 整体反馈链路是：

@@ -2,9 +2,10 @@
 CVC5/CVC4 runner with rich feedback for solver-guided lemma repair.
 
 Design notes vs Vampire:
-- Main prove path: multi-strategy portfolio (unchanged behaviour).
-- Diagnostic path: single cvc5 inductive strategy + --stats (comparable runs).
-- Difficulty path: SMT-LIB produce-difficulty / get-difficulty (cvc5-specific).
+- Main prove path: multi-strategy portfolio. Optional --stats / get-difficulty
+  hang on that same process (no extra 3s diagnostic before the 60s prove).
+- Diagnostic path: short single-strategy run for usefulness-failure sidecars.
+- Difficulty: SMT-LIB produce-difficulty / get-difficulty (cvc5-specific).
 - Unsat cores on inductive problems are unreliable; we do NOT depend on them
   for lemma pruning (unlike Vampire ucore).
 """
@@ -198,16 +199,24 @@ def run_cvc(
     timeout: int = 60,
     *,
     collect_stats: bool = False,
+    collect_difficulty: bool = False,
     profiles: Optional[List[str]] = None,
 ) -> CvcResult:
     """
     Portfolio prove: named CVC5/CVC4 strategies in parallel.
     Default profiles match the paper (simple / inductive / no-ematching / cvc4).
     First unsat wins.
+
+    When collect_stats / collect_difficulty are set, CVC5 strategies get --stats
+    and --tlimit-per so a timeout still yields counters / get-difficulty.
     """
     names = profiles or list(CVC5_FALLBACK_PROFILES)
     return _run_cvc_parallel(
-        smt2_path, timeout, names, collect_stats=collect_stats
+        smt2_path,
+        timeout,
+        names,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
     )
 
 
@@ -236,10 +245,16 @@ def run_cvc_routed(
     *,
     state: Optional[GoalSearchState] = None,
     collect_stats: bool = False,
+    collect_difficulty: bool = False,
 ) -> CvcResult:
     """Prove with recommended profiles first, then the paper 4-way portfolio."""
     if not routing_enabled() or state is None or not state.candidate_profiles:
-        return run_cvc(smt2_path, timeout, collect_stats=collect_stats)
+        return run_cvc(
+            smt2_path,
+            timeout,
+            collect_stats=collect_stats,
+            collect_difficulty=collect_difficulty,
+        )
 
     start = time.time()
     specs = cvc_profile_specs()
@@ -254,7 +269,11 @@ def run_cvc_routed(
         reserve = min(reserve, max(0, timeout - 1))
     primary_timeout = max(1, timeout - reserve)
     result = _run_cvc_parallel(
-        smt2_path, primary_timeout, primary, collect_stats=collect_stats
+        smt2_path,
+        primary_timeout,
+        primary,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
     )
     summaries = dict(result.portfolio_results)
     if result.proved:
@@ -268,6 +287,7 @@ def run_cvc_routed(
             max(1, min(timeout, math.ceil(remaining))),
             fallback,
             collect_stats=collect_stats,
+            collect_difficulty=collect_difficulty,
         )
         summaries.update(fb.portfolio_results)
         fb.portfolio_results = summaries
@@ -276,12 +296,88 @@ def run_cvc_routed(
     return result
 
 
+def _cvc_prove_cmd(
+    cfg: dict,
+    input_path: Path,
+    timeout: int,
+    *,
+    collect_stats: bool,
+    collect_difficulty: bool,
+) -> List[str]:
+    cmd = [cfg["binary"]] + list(cfg["options"])
+    if cfg.get("type") == "CVC5" and (collect_stats or collect_difficulty):
+        cmd.append("--stats")
+        cmd.append(f"--tlimit-per={max(1, int(timeout * 1000))}")
+    cmd.append(str(input_path))
+    return cmd
+
+
+def _cvc_result_from_output(
+    name: str,
+    stdout: str,
+    stderr: str,
+    elapsed: float,
+    *,
+    collect_stats: bool,
+    collect_difficulty: bool,
+    timed_out: bool = False,
+) -> CvcResult:
+    stdout = stdout or ""
+    stderr = stderr or ""
+    text = stdout + "\n" + stderr
+    if timed_out:
+        status = "timeout"
+        proved = False
+    elif _stdout_is_unsat(stdout):
+        status = "unsat"
+        proved = True
+    elif re.search(r"(?m)^sat\s*$", stdout.lower()):
+        status = "sat"
+        proved = False
+    else:
+        status = "unknown"
+        proved = False
+    result = CvcResult(
+        proved=proved,
+        status=status,
+        elapsed=elapsed,
+        strategy=name,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    if collect_stats:
+        result.stats = parse_cvc_stats(text)
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(text)
+    return result
+
+
+def _richest_cvc(results: List[CvcResult]) -> Optional[CvcResult]:
+    if not results:
+        return None
+    return max(
+        results,
+        key=lambda r: (len(r.stats or {}), len(r.difficulty or []), len(r.stdout or "")),
+    )
+
+
+def _harvest_proc_output(proc) -> Tuple[str, str]:
+    if proc.poll() is None:
+        _kill_proc(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except Exception:
+        return "", ""
+    return stdout or "", stderr or ""
+
+
 def _run_cvc_parallel(
     smt2_path,
     timeout: int,
     names: List[str],
     *,
     collect_stats: bool,
+    collect_difficulty: bool = False,
 ) -> CvcResult:
     smt2_path = Path(smt2_path)
     specs = cvc_profile_specs()
@@ -292,14 +388,35 @@ def _run_cvc_parallel(
     processes = {}
     start = time.time()
     summaries: Dict[str, dict] = {}
+    full_results: Dict[str, CvcResult] = {}
+    injected_path = None
     try:
+        if collect_difficulty:
+            script = _inject_difficulty_script(smt2_path.read_text(encoding="utf-8"))
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".smt2", delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(script)
+                injected_path = Path(tf.name)
+
         for name, cfg in strategies.items():
-            cmd = [cfg["binary"]] + cfg["options"] + [str(smt2_path)]
+            input_path = (
+                injected_path
+                if collect_difficulty and cfg.get("type") == "CVC5" and injected_path is not None
+                else smt2_path
+            )
+            cmd = _cvc_prove_cmd(
+                cfg,
+                input_path,
+                timeout,
+                collect_stats=collect_stats,
+                collect_difficulty=collect_difficulty,
+            )
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE, 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     preexec_fn=os.setsid,
                 )
@@ -310,7 +427,7 @@ def _run_cvc_parallel(
             except Exception as e:
                 logging.error("Failed to start %s: %s", name, e)
                 summaries[name] = {"status": "error", "error": str(e), "strategy": name}
-        
+
         if not processes:
             return CvcResult(status="error", error="no solver process started", portfolio_results=summaries)
 
@@ -335,34 +452,26 @@ def _run_cvc_parallel(
                     }
                     continue
 
-                text = (stdout or "") + "\n" + (stderr or "")
-                if _stdout_is_unsat(stdout or ""):
+                elapsed = time.time() - start
+                result = _cvc_result_from_output(
+                    name,
+                    stdout or "",
+                    stderr or "",
+                    elapsed,
+                    collect_stats=collect_stats,
+                    collect_difficulty=collect_difficulty,
+                )
+                full_results[name] = result
+                if result.proved:
                     _cleanup_processes(processes, exclude=name)
-                    elapsed = time.time() - start
                     logging.info(
                         "%s验证成功: unsat (策略: %s, %.2fs)",
                         strategies[name]["type"], name, elapsed,
                     )
-                    result = CvcResult(
-                        proved=True,
-                        status="unsat",
-                        elapsed=elapsed,
-                        strategy=name,
-                        stdout=stdout or "",
-                        stderr=stderr or "",
-                    )
-                    if collect_stats:
-                        result.stats = parse_cvc_stats(text)
                     summaries[name] = _compact_cvc(result)
                     result.portfolio_results = summaries
                     return result
-                summaries[name] = {
-                    "proved": False,
-                    "status": "sat" if re.search(r"(?m)^sat\s*$", (stdout or "").lower()) else "unknown",
-                    "elapsed": round(time.time() - start, 3),
-                    "strategy": name,
-                    "stats": parse_cvc_stats(text) if collect_stats else {},
-                }
+                summaries[name] = _compact_cvc(result)
 
             if len(completed) == len(processes):
                 break
@@ -370,6 +479,21 @@ def _run_cvc_parallel(
 
         elapsed = time.time() - start
         timed_out = len(completed) < len(processes)
+        for name, proc in processes.items():
+            if name in summaries:
+                continue
+            stdout, stderr = _harvest_proc_output(proc)
+            result = _cvc_result_from_output(
+                name,
+                stdout,
+                stderr,
+                elapsed,
+                collect_stats=collect_stats,
+                collect_difficulty=collect_difficulty,
+                timed_out=True,
+            )
+            full_results[name] = result
+            summaries[name] = _compact_cvc(result)
         for name in strategies:
             if name not in summaries:
                 summaries[name] = {"status": "timeout", "elapsed": round(elapsed, 3), "strategy": name}
@@ -385,16 +509,26 @@ def _run_cvc_parallel(
             final_status = "sat"
         else:
             final_status = "unknown"
+        richest = _richest_cvc(list(full_results.values()))
         return CvcResult(
             proved=False,
             status=final_status,
             elapsed=elapsed,
-            strategy=next(iter(strategies)),
+            strategy=richest.strategy if richest else next(iter(strategies)),
+            stats=dict(richest.stats) if richest else {},
+            difficulty=list(richest.difficulty) if richest else [],
+            stdout=richest.stdout if richest else "",
+            stderr=richest.stderr if richest else "",
             portfolio_results=summaries,
         )
-        
+
     finally:
         _cleanup_processes(processes)
+        if injected_path is not None:
+            try:
+                injected_path.unlink()
+            except OSError:
+                pass
 
 
 def run_cvc_diagnostic(

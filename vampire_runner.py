@@ -198,6 +198,7 @@ def run_vampire(
     *,
     collect_stats: bool = True,
     collect_ucore: bool = False,
+    show_induction: bool = False,
     proof_file: Optional[Path] = None,
     profile: Optional[str] = None,
 ) -> VampireResult:
@@ -205,13 +206,14 @@ def run_vampire(
     Prove with a named Vampire profile.
 
     Default profile is the paper schedule: portfolio + induction.
+    When show_induction is set, induction traces come from this same prove run.
     """
     profile = profile or "induction_portfolio"
     vampire_binary = _vampire_binary()
     if not vampire_binary:
         return VampireResult(status="error", error="VAMPIRE_BINARY not configured", strategy=profile)
-    
-        smt2_path = Path(smt2_path)
+
+    smt2_path = Path(smt2_path)
     run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
     command = _vampire_command(
         vampire_binary,
@@ -220,6 +222,7 @@ def run_vampire(
         collect_stats=collect_stats,
         collect_ucore=collect_ucore,
         proof_file=proof_file,
+        show_induction=show_induction,
     )
     command.append(str(run_path))
     try:
@@ -262,9 +265,8 @@ def run_vampire_diagnostic(
         collect_stats=True,
         collect_ucore=False,
         proof_file=None,
+        show_induction=show_induction,
     )
-    if show_induction:
-        command.extend(["--show_induction", "on"])
     command.append(str(run_path))
     try:
         return _execute_vampire(command, timeout, collect_ucore=False, strategy=diag_name)
@@ -303,6 +305,7 @@ def run_vampire_routed(
     state: Optional[GoalSearchState] = None,
     collect_stats: bool = True,
     collect_ucore: bool = False,
+    show_induction: bool = False,
 ) -> VampireResult:
     """
     Prove with recommended profiles first, then the paper induction portfolio.
@@ -315,6 +318,7 @@ def run_vampire_routed(
             timeout,
             collect_stats=collect_stats,
             collect_ucore=collect_ucore,
+            show_induction=show_induction,
         )
 
     summaries: Dict[str, dict] = {}
@@ -336,6 +340,7 @@ def run_vampire_routed(
         primary,
         collect_stats=collect_stats,
         collect_ucore=collect_ucore,
+        show_induction=show_induction,
     )
     summaries.update(result.portfolio_results)
     if result.proved:
@@ -350,6 +355,7 @@ def run_vampire_routed(
             fallback,
             collect_stats=collect_stats,
             collect_ucore=collect_ucore,
+            show_induction=show_induction,
         )
         summaries.update(fb.portfolio_results)
         if fb.proved:
@@ -371,6 +377,7 @@ def _vampire_command(
     collect_stats: bool,
     collect_ucore: bool,
     proof_file: Optional[Path],
+    show_induction: bool = False,
 ) -> List[str]:
     spec = VAMPIRE_PROFILES.get(profile)
     if spec is None:
@@ -406,6 +413,8 @@ def _vampire_command(
                 "--proof", "on",
                 "--print_proofs_to_file", str(proof_file),
             ])
+        if show_induction:
+            command.extend(["--show_induction", "on"])
     return command
 
 
@@ -420,6 +429,56 @@ def _compact_vampire(result: VampireResult) -> dict:
     }
 
 
+def _vampire_result_from_output(
+    name: str,
+    stdout: str,
+    stderr: str,
+    elapsed: float,
+    returncode: int,
+    *,
+    collect_ucore: bool,
+    timed_out: bool = False,
+) -> VampireResult:
+    result = VampireResult(strategy=name)
+    result.elapsed = elapsed
+    result.stdout = stdout or ""
+    result.stderr = stderr or ""
+    result.status = classify_status(
+        result.stdout, result.stderr, returncode, timed_out
+    )
+    result.proved = result.status == "unsat"
+    result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
+    focus, formulas = parse_induction_trace(result.stdout + "\n" + result.stderr)
+    result.induction_focus = focus
+    result.induction_formulas = formulas
+    if collect_ucore and result.proved:
+        result.used_lemma_names = parse_ucore_lemma_names(result.stdout)
+    return result
+
+
+def _richest_vampire(results: List[VampireResult]) -> Optional[VampireResult]:
+    if not results:
+        return None
+    return max(
+        results,
+        key=lambda r: (
+            len(r.stats or {}),
+            len(r.induction_focus or []),
+            len(r.stdout or ""),
+        ),
+    )
+
+
+def _harvest_proc_output(proc) -> Tuple[str, str]:
+    if proc.poll() is None:
+        _cleanup_process(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except Exception:
+        return "", ""
+    return stdout or "", stderr or ""
+
+
 def _run_vampire_parallel(
     smt2_path,
     timeout: int,
@@ -427,11 +486,16 @@ def _run_vampire_parallel(
     *,
     collect_stats: bool,
     collect_ucore: bool,
+    show_induction: bool = False,
 ) -> VampireResult:
     profiles = [p for p in profiles if p in VAMPIRE_PROFILES]
     if not profiles:
         return run_vampire(
-            smt2_path, timeout, collect_stats=collect_stats, collect_ucore=collect_ucore
+            smt2_path,
+            timeout,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            show_induction=show_induction,
         )
     if len(profiles) == 1:
         result = run_vampire(
@@ -439,6 +503,7 @@ def _run_vampire_parallel(
             timeout,
             collect_stats=collect_stats,
             collect_ucore=collect_ucore,
+            show_induction=show_induction,
             profile=profiles[0],
         )
         result.portfolio_results = {profiles[0]: _compact_vampire(result)}
@@ -459,6 +524,7 @@ def _run_vampire_parallel(
                 collect_stats=collect_stats,
                 collect_ucore=collect_ucore,
                 proof_file=None,
+                show_induction=show_induction,
             ) + [str(run_path)]
             try:
                 proc = subprocess.Popen(
@@ -478,6 +544,7 @@ def _run_vampire_parallel(
             return VampireResult(status="error", error="no vampire process started")
 
         completed = set()
+        full_results: Dict[str, VampireResult] = {}
         while time.time() - start < timeout:
             for name, proc in processes.items():
                 if name in completed:
@@ -496,17 +563,15 @@ def _run_vampire_parallel(
                         "error": str(e),
                     }
                     continue
-                result = VampireResult(strategy=name)
-                result.elapsed = time.time() - start
-                result.stdout = stdout or ""
-                result.stderr = stderr or ""
-                result.status = classify_status(
-                    result.stdout, result.stderr, proc.returncode or -1, False
+                result = _vampire_result_from_output(
+                    name,
+                    stdout or "",
+                    stderr or "",
+                    time.time() - start,
+                    proc.returncode or -1,
+                    collect_ucore=collect_ucore,
                 )
-                result.proved = result.status == "unsat"
-                result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
-                if collect_ucore and result.proved:
-                    result.used_lemma_names = parse_ucore_lemma_names(result.stdout)
+                full_results[name] = result
                 summaries[name] = _compact_vampire(result)
                 if result.proved:
                     for other, op in processes.items():
@@ -523,7 +588,18 @@ def _run_vampire_parallel(
         for name, proc in processes.items():
             if name in summaries:
                 continue
-            summaries[name] = {"status": "timeout", "elapsed": round(elapsed, 3), "strategy": name}
+            stdout, stderr = _harvest_proc_output(proc)
+            result = _vampire_result_from_output(
+                name,
+                stdout,
+                stderr,
+                elapsed,
+                proc.returncode if proc.returncode is not None else -1,
+                collect_ucore=collect_ucore,
+                timed_out=True,
+            )
+            full_results[name] = result
+            summaries[name] = _compact_vampire(result)
         statuses = [item.get("status") for item in summaries.values()]
         if timed_out:
             final_status = "timeout"
@@ -535,11 +611,17 @@ def _run_vampire_parallel(
             final_status = "sat"
         else:
             final_status = "unknown"
+        richest = _richest_vampire(list(full_results.values()))
         return VampireResult(
             proved=False,
             status=final_status,
             elapsed=elapsed,
-            strategy=profiles[0],
+            strategy=richest.strategy if richest else profiles[0],
+            stats=dict(richest.stats) if richest else {},
+            induction_focus=list(richest.induction_focus) if richest else [],
+            induction_formulas=list(richest.induction_formulas) if richest else [],
+            stdout=richest.stdout if richest else "",
+            stderr=richest.stderr if richest else "",
             portfolio_results=summaries,
         )
     finally:
