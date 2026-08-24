@@ -79,6 +79,7 @@ def _empty_failed_data() -> dict:
         "unproved_lemmas": [],
         "routing": {},
         "baseline_diag": {},
+        "baseline_diag_short": {},
         "control_diag": {},
     }
 
@@ -96,6 +97,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("unproved_lemmas", [])
             data.setdefault("routing", {})
             data.setdefault("baseline_diag", {})
+            data.setdefault("baseline_diag_short", {})
             data.setdefault("control_diag", {})
             return data
         except Exception as e:
@@ -344,6 +346,10 @@ def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
             break
     return out
 
+def _result_has_stats(result: CvcResult) -> bool:
+    return any(int(v or 0) > 0 for v in (result.stats or {}).values())
+
+
 def record_solver_attempt(
     base_path: Optional[str],
     goal_name: Optional[str],
@@ -356,18 +362,21 @@ def record_solver_attempt(
     if not base_path or not goal_name:
         return
     state = load_routing_state(base_path, goal_name)
-    hint_kinds = [
-        h.get("kind", "")
-        for h in derive_repair_hints(result, context="attempt")
-        if h.get("kind")
-    ]
+    has_stats = _result_has_stats(result)
+    hint_kinds = []
+    if has_stats:
+        hint_kinds = [
+            h.get("kind", "")
+            for h in derive_repair_hints(result, context="attempt")
+            if h.get("kind")
+        ]
     fallback_used = bool(
         result.strategy
         and result.strategy in state.fallback_profiles
         and result.strategy not in state.candidate_profiles
     )
     utility = None
-    if routing_decider_mode() != "llm":
+    if routing_decider_mode() != "llm" and (result.proved or has_stats):
         utility, _ = profile_utility_from_stats(
             backend="cvc5",
             proved=result.proved,
@@ -614,22 +623,33 @@ def analyze_lemma_progress(
     goal_name: str,
     base_path: str,
 ) -> Tuple[List[str], CvcResult]:
-    """Failure sidecar: score singleton lemmas vs cached baseline/control (not a second prove)."""
+    """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove)."""
     profile = _diag_profile(base_path, goal_name)
-    baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
-    if baseline is None:
+    hint_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    progress_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag_short")
+    if progress_baseline is None:
         baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
         baseline_path.write_text(original_content)
-        baseline = run_cvc_diagnostic(
+        progress_baseline = run_cvc_diagnostic(
             baseline_path,
             timeout=_DIAGNOSTIC_TIMEOUT,
             collect_difficulty=True,
             profile=profile,
         )
-        _store_cached_diag(base_path, goal_name, "baseline_diag", baseline)
-        add_repair_hints(base_path, goal_name, derive_repair_hints(baseline, context="baseline_goal"))
+        _store_cached_diag(base_path, goal_name, "baseline_diag_short", progress_baseline)
+        if hint_baseline is None:
+            _store_cached_diag(base_path, goal_name, "baseline_diag", progress_baseline)
+            add_repair_hints(
+                base_path, goal_name,
+                derive_repair_hints(progress_baseline, context="baseline_goal"),
+            )
+            hint_baseline = progress_baseline
+        else:
+            logging.info("cvc5 progress 使用 3s short baseline；60s 结果只用于 repair hint")
     else:
-        logging.info("复用缓存的 cvc5 baseline 诊断")
+        logging.info("复用缓存的 cvc5 3s progress baseline")
+    if hint_baseline is None:
+        hint_baseline = progress_baseline
 
     control = _load_cached_diag(base_path, goal_name, "control_diag")
     if control is None:
@@ -654,7 +674,7 @@ def analyze_lemma_progress(
             collect_difficulty=True,
             profile=profile,
         )
-        score, signals = compute_progress_score(baseline, cand, control=control)
+        score, signals = compute_progress_score(progress_baseline, cand, control=control)
         logging.info(
             "cvc5诊断单条#%d score=%.2f signals=%s",
             idx, score, signals,
@@ -672,7 +692,7 @@ def analyze_lemma_progress(
         if lemma not in seen:
             seen.add(lemma)
             ordered.append(lemma)
-    return ordered, baseline
+    return ordered, hint_baseline
 
 
 def verify_combined_lemmas(

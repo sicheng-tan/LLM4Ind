@@ -160,6 +160,23 @@ def test_cvc_mix_hints_small_problem() -> None:
         f"skolem with sparse inst: {hints_rw}",
     )
 
+    hints_big = derive_repair_hints(CvcResult(
+        status="timeout", elapsed=3.0,
+        stats={"CONJ_TOTAL": 0, "QUANTIFIERS_SKOLEMIZE": 100, "INST_TOTAL": 900},
+    ))
+    _ok(
+        not any(h["kind"] == "need_rewrite" for h in hints_big),
+        f"skol=100 inst=900 is not sparse: {hints_big}",
+    )
+
+    hints_both = derive_repair_hints(CvcResult(
+        status="timeout", elapsed=3.0,
+        stats={"CONJ_TOTAL": 100, "QUANTIFIERS_SKOLEMIZE": 2, "INST_TOTAL": 1},
+    ))
+    kinds_both = {h["kind"] for h in hints_both}
+    _ok("need_stronger_lemma" in kinds_both and "need_rewrite" in kinds_both,
+        f"both mix hints may fire: {hints_both}")
+
 
 def test_vampire_small_vs_large() -> None:
     elapsed = 3.0
@@ -233,6 +250,14 @@ def test_vampire_explosion_and_mix() -> None:
         any(h["kind"] == "need_induction_lemma" for h in hints_ind),
         f"rewrite-dominated mix: {hints_ind}",
     )
+    hints_ind8 = vampire_hints(VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"InductionApplications": 8, "Fw demodulations": 400},
+    ))
+    _ok(
+        any(h["kind"] == "need_induction_lemma" for h in hints_ind8),
+        f"ind=8 dem=400 should still flag missing induction: {hints_ind8}",
+    )
 
     hints_int = vampire_hints(VampireResult(
         status="timeout", elapsed=elapsed,
@@ -243,6 +268,69 @@ def test_vampire_explosion_and_mix() -> None:
         any(h["kind"] == "need_arithmetic_lemma" for h in hints_int),
         f"integer-induction share: {hints_int}",
     )
+
+
+def test_correlated_counters_are_one_channel() -> None:
+    elapsed = 3.0
+    v_base = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"Fw demodulations": 20, "Fw demodulations to eq. taut.": 2,
+               "InductionApplications": 1, "Generated clauses": 80, "Final passive clauses": 40},
+    )
+    v_cand = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"Fw demodulations": 50, "Fw demodulations to eq. taut.": 8,
+               "InductionApplications": 1, "Generated clauses": 80, "Final passive clauses": 40},
+    )
+    _score, signals = vampire_score(v_base, v_cand)
+    joined = "".join(signals)
+    _ok("more_demodulations" in joined, f"rewrite family: {signals}")
+    _ok("more_eq_taut_demod" not in joined, f"taut must not be a second channel: {signals}")
+    _ok("weak_single_signal" in signals, f"one rewrite channel should be weak: {signals}")
+
+    c_base = CvcResult(
+        status="timeout", elapsed=elapsed,
+        stats={"CONJ_TOTAL": 8, "INST_TOTAL": 12, "QUANTIFIERS_SKOLEMIZE": 0, "DT_TOTAL": 0},
+    )
+    c_cand = CvcResult(
+        status="timeout", elapsed=elapsed,
+        stats={"CONJ_TOTAL": 20, "INST_TOTAL": 30, "QUANTIFIERS_SKOLEMIZE": 0, "DT_TOTAL": 0},
+    )
+    _score_c, signals_c = compute_progress_score(c_base, c_cand)
+    kinds = [s.split("(")[0] if "(" in s else s for s in signals_c]
+    matching = [k for k in kinds if k in ("more_instantiations", "more_conjecture_gen")]
+    _ok(len(matching) == 1, f"CONJ+INST is one channel: {signals_c}")
+
+
+def test_integer_induction_counts_as_progress() -> None:
+    elapsed = 3.0
+    base = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"InductionApplications": 0, "IntegerInfiniteIntervalInduction": 0,
+               "Fw demodulations": 10, "Generated clauses": 40, "Final passive clauses": 20},
+    )
+    cand = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"InductionApplications": 0, "IntegerInfiniteIntervalInduction": 12,
+               "Fw demodulations": 10, "Generated clauses": 40, "Final passive clauses": 20},
+    )
+    _score, signals = vampire_score(base, cand)
+    _ok(any(s.startswith("more_induction_activity") for s in signals), f"integer induction: {signals}")
+
+
+def test_cvc_inst_conj_flood_is_explosion() -> None:
+    elapsed = 3.0
+    base = CvcResult(
+        status="timeout", elapsed=elapsed,
+        stats={"CONJ_TOTAL": 100, "INST_TOTAL": 100, "QUANTIFIERS_SKOLEMIZE": 0, "DT_TOTAL": 0},
+    )
+    boom = CvcResult(
+        status="timeout", elapsed=elapsed,
+        stats={"CONJ_TOTAL": 400, "INST_TOTAL": 400, "QUANTIFIERS_SKOLEMIZE": 0, "DT_TOTAL": 0},
+    )
+    score, signals = compute_progress_score(base, boom)
+    _ok(any(s.startswith("search_explosion") for s in signals), f"matching flood: {signals}")
+    _ok(score <= 0, f"flood without skolem/difficulty should not look like progress: {score} {signals}")
 
 
 def test_activity_rate() -> None:
@@ -261,6 +349,9 @@ def main() -> int:
         test_cvc_mix_hints_small_problem,
         test_vampire_small_vs_large,
         test_vampire_explosion_and_mix,
+        test_correlated_counters_are_one_channel,
+        test_integer_induction_counts_as_progress,
+        test_cvc_inst_conj_flood_is_explosion,
         test_activity_rate,
     ]
     failed = 0

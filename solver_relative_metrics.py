@@ -23,15 +23,18 @@ DIFFICULTY_REL_DROP = 0.20
 # Generated/instantiation volume growth treated as explosion without product.
 EXPLOSION_LOG_GAIN = math.log(1.50)
 
-# Vampire within-run mix (induction vs rewrite).
+# Vampire within-run mix (induction vs rewrite). One inequality per hint.
 REWRITE_PER_INDUCTION_MAX = 8.0
+INDUCTION_SHARE_MAX = 0.15
+INTEGER_INDUCTION_SHARE_MIN = 0.70
+# Kept for routing docs / older call sites; mix hints no longer AND these.
 INDUCTION_SHARE_MIN = 0.08
 INDUCTION_PER_REWRITE_MAX = 0.02
 REWRITE_SHARE_MIN = 0.85
-INTEGER_INDUCTION_SHARE_MIN = 0.70
 
-# CVC5 within-run mix (conjecture-gen vs skolem vs instantiation).
+# CVC5 within-run mix. One inequality per hint.
 SKOLEM_PER_CONJ_MAX = 0.05
+INST_OF_MATCHING_MAX = 0.75
 CONJ_SHARE_MIN = 0.25
 INST_PER_SKOLEM_MAX = 10.0
 SKOLEM_SHARE_MIN = 0.01

@@ -22,11 +22,9 @@ from solver_routing import (
 )
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
-    INDUCTION_PER_REWRITE_MAX,
-    INDUCTION_SHARE_MIN,
+    INDUCTION_SHARE_MAX,
     INTEGER_INDUCTION_SHARE_MIN,
     REWRITE_PER_INDUCTION_MAX,
-    REWRITE_SHARE_MIN,
     activity_rate,
     gain_score,
     is_relative_gain,
@@ -768,25 +766,23 @@ def compute_progress_score(
     dem_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations", "Bw demodulations")
     taut_c = _vampire_stat_rate(c, cand_elapsed, "Fw demodulations to eq. taut.")
     taut_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations to eq. taut.")
+    rewrite_c = dem_c + taut_c
+    rewrite_r = dem_r + taut_r
     ind_c = _vampire_stat_rate(
         c, cand_elapsed,
         "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
+        "IntegerInfiniteIntervalInduction", "IntegerFiniteIntervalInduction",
     )
     ind_r = _vampire_stat_rate(
         ref_stats, ref_elapsed,
         "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
+        "IntegerInfiniteIntervalInduction", "IntegerFiniteIntervalInduction",
     )
 
     strong = 0
-    if is_relative_gain(dem_c, dem_r):
-        score += gain_score(dem_c, dem_r, 2.5)
-        signals.append(
-            f"more_demodulations(+{pct_label(dem_c, dem_r)}%)"
-        )
-        strong += 1
-    if is_relative_gain(taut_c, taut_r, rare=True):
-        score += min(1.25, 0.5 + gain_score(taut_c, taut_r, 0.75))
-        signals.append(f"more_eq_taut_demod(+{pct_label(taut_c, taut_r)}%)")
+    if is_relative_gain(rewrite_c, rewrite_r):
+        score += gain_score(rewrite_c, rewrite_r, 2.5)
+        signals.append(f"more_demodulations(+{pct_label(rewrite_c, rewrite_r)}%)")
         strong += 1
     if is_relative_gain(ind_c, ind_r, rare=True):
         score += gain_score(ind_c, ind_r, 2.0)
@@ -813,11 +809,11 @@ def compute_progress_score(
             signals.append("lower_passive_ratio")
             strong += 1
 
-    # Volume-up without product (eq-taut / induction / focus) ≈ explosion.
+    # Volume-up without product (rewrite family / induction / focus) ≈ explosion.
     gen_c_rate = activity_rate(gen_c, cand_elapsed)
     gen_r_rate = activity_rate(ref_stats.get("Generated clauses", 0), ref_elapsed)
     productive = any(
-        s.startswith("more_eq_taut_demod")
+        s.startswith("more_demodulations")
         or s.startswith("more_induction")
         or s == "lower_passive_ratio"
         for s in signals
@@ -827,8 +823,8 @@ def compute_progress_score(
         score -= penalty
         signals.append(f"search_explosion(+{pct_label(gen_c_rate, gen_r_rate)}%)")
 
-    # Require at least two independent signals, or one strong induction/eq-taut signal.
-    if strong < 2 and "more_eq_taut_demod" not in "".join(signals) and "more_induction" not in "".join(signals):
+    # Require two independent channels, or one induction signal.
+    if strong < 2 and "more_induction" not in "".join(signals):
         if score > 0:
             score *= 0.35
             signals.append("weak_single_signal")
@@ -876,34 +872,33 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             ],
         })
 
-    # Diagnose mix imbalance (shares), not absolute counts.
+    # One mix inequality per hint. Both may fire; rewrite first.
     if mix > 0:
         ind_share = ind / mix
-        dem_share = dem / mix
         rewrite_per_ind = dem / max(ind, 1)
-        ind_per_rewrite = ind / max(dem, 1)
-        if ind_share >= INDUCTION_SHARE_MIN and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
+        if ind > 0 and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
             hints.append({
                 "kind": "need_rewrite",
+                "priority": 1,
                 "context": context,
                 "detail": (
-                    "Induction is a large share of Vampire activity but rewriting is "
-                    "scarce relative to it. Likely missing equational lemmas that "
-                    "enable rewriting under the IH."
+                    "Rewriting is scarce relative to induction (demod/induction < 8). "
+                    "Likely missing equational lemmas that enable rewriting under the IH."
                 ),
                 "suggested_actions": [
                     "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
                     "Prefer lemmas whose LHS matches a subterm of the proof goal",
                 ],
             })
-        elif dem_share >= REWRITE_SHARE_MIN and ind_per_rewrite < INDUCTION_PER_REWRITE_MAX:
+        if ind_share < INDUCTION_SHARE_MAX:
             hints.append({
                 "kind": "need_induction_lemma",
+                "priority": 2,
                 "context": context,
                 "detail": (
-                    "Rewriting dominates search while productive induction stays a "
-                    "small share. Try a stronger inductive lemma (generalization / "
-                    "strengthen conclusion)."
+                    "Induction is a small share of Vampire activity "
+                    f"(<{int(INDUCTION_SHARE_MAX * 100)}%). Try a stronger inductive lemma "
+                    "(generalization / strengthen conclusion)."
                 ),
                 "suggested_actions": [
                     "Strengthen or generalize the goal into an inductive lemma",

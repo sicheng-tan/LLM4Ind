@@ -31,11 +31,10 @@ from solver_routing import (
     routing_enabled,
 )
 from solver_relative_metrics import (
-    CONJ_SHARE_MIN,
     EXPLOSION_LOG_GAIN,
-    INST_PER_SKOLEM_MAX,
+    INST_OF_MATCHING_MAX,
+    LOG_GAIN_MIN,
     SKOLEM_PER_CONJ_MAX,
-    SKOLEM_SHARE_MIN,
     activity_rate,
     gain_score,
     in_problem_hard_cutoff,
@@ -536,7 +535,7 @@ def run_cvc_diagnostic(
     profile: Optional[str] = None,
 ) -> CvcResult:
     """
-    Single-strategy cvc5 run with --stats (+ optional difficulty).
+    Single-strategy cvc5 run with --stats (+ optional difficulty on the same process).
     Used for progress comparison / repair hints, not as portfolio prover.
     """
     smt2_path = Path(smt2_path)
@@ -544,18 +543,34 @@ def run_cvc_diagnostic(
     name = profile if profile in specs and specs[profile]["type"] == "CVC5" else "cvc5_inductive"
     cfg = specs[name]
     ms = max(1, int(timeout * 1000))
-    cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", "--stats", str(smt2_path)]
-    result = _execute_single(cmd, timeout + 2, strategy=name)
+    tmp_path = None
     try:
-        result.goal_term = extract_proof_goal_term(smt2_path.read_text(encoding="utf-8"))
+        content = smt2_path.read_text(encoding="utf-8")
     except OSError:
-        result.goal_term = None
-    if collect_difficulty:
-        diff = run_cvc_difficulty(smt2_path, timeout=min(timeout, 3), profile=name)
-        result.difficulty = diff.difficulty
-        if not result.goal_term:
-            result.goal_term = diff.goal_term
-    return result
+        content = ""
+    goal_term = extract_proof_goal_term(content) if content else None
+    input_path = smt2_path
+    if collect_difficulty and content:
+        script = _inject_difficulty_script(content)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".smt2", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(script)
+            tmp_path = tf.name
+        input_path = Path(tmp_path)
+    cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", "--stats", str(input_path)]
+    try:
+        result = _execute_single(cmd, timeout + 2, strategy=name)
+        result.goal_term = goal_term
+        if collect_difficulty:
+            result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
+        return result
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = None) -> CvcResult:
@@ -955,19 +970,20 @@ def compute_progress_score(
     skol_r = _cvc_stat_rate(ref_stats, ref_elapsed, "QUANTIFIERS_SKOLEMIZE")
     dt_c = _cvc_stat_rate(c, cand_elapsed, "DT_TOTAL")
     dt_r = _cvc_stat_rate(ref_stats, ref_elapsed, "DT_TOTAL")
+    matching_c = conj_c + inst_c
+    matching_r = conj_r + inst_r
     strong = 0
 
-    if is_relative_gain(conj_c, conj_r):
-        score += gain_score(conj_c, conj_r, 2.5)
-        signals.append(f"more_conjecture_gen(+{pct_label(conj_c, conj_r)}%)")
+    if is_relative_gain(matching_c, matching_r):
+        score += gain_score(matching_c, matching_r, 2.5)
+        if log_gain(inst_c, inst_r) >= log_gain(conj_c, conj_r):
+            signals.append(f"more_instantiations(+{pct_label(inst_c, inst_r)}%)")
+        else:
+            signals.append(f"more_conjecture_gen(+{pct_label(conj_c, conj_r)}%)")
         strong += 1
     if is_relative_gain(skol_c, skol_r, rare=True):
         score += min(2.0, 0.4 + gain_score(skol_c, skol_r, 1.6))
         signals.append(f"more_skolemize(+{pct_label(skol_c, skol_r)}%)")
-        strong += 1
-    if is_relative_gain(inst_c, inst_r):
-        score += gain_score(inst_c, inst_r, 2.0)
-        signals.append(f"more_instantiations(+{pct_label(inst_c, inst_r)}%)")
         strong += 1
     if is_relative_gain(dt_c, dt_r, rare=True):
         score += gain_score(dt_c, dt_r, 1.5)
@@ -1014,19 +1030,23 @@ def compute_progress_score(
             signals.append(f"axiom_difficulty_drop(x{dropped})")
             strong += 1
 
-    productive = any(
+    product = any(
         s.startswith("more_skolemize")
         or s.startswith("goal_difficulty")
         or s.startswith("axiom_difficulty")
         or s.startswith("more_datatype")
-        or s.startswith("more_instantiations")
         for s in signals
     )
-    # Conjecture-gen is the enumeration-volume proxy; do not treat INST_TOTAL
-    # growth itself as explosion (that is also the matching-progress signal).
-    if log_gain(conj_c, conj_r) >= EXPLOSION_LOG_GAIN and not productive:
+    if log_gain(conj_c, conj_r) >= EXPLOSION_LOG_GAIN and not product:
         score -= min(gain_score(conj_c, conj_r, 1.5), 1.5)
         signals.append(f"search_explosion(+{pct_label(conj_c, conj_r)}%)")
+    if (
+        log_gain(inst_c, inst_r) >= EXPLOSION_LOG_GAIN
+        and log_gain(conj_c, conj_r) >= LOG_GAIN_MIN
+        and not product
+    ):
+        score -= min(gain_score(inst_c, inst_r, 1.5), 1.5)
+        signals.append(f"search_explosion(+{pct_label(inst_c, inst_r)}%)")
 
     if strong < 2 and "more_skolemize" not in "".join(signals) and "goal_difficulty" not in "".join(signals):
         if score > 0:
@@ -1081,31 +1101,31 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     q_activity = conj + skol + inst
 
     if q_activity > 0:
-        conj_share = conj / q_activity
-        skol_share = skol / q_activity
         skol_per_conj = skol / max(conj, 1)
-        inst_per_skol = inst / max(skol, 1)
-        if conj_share >= CONJ_SHARE_MIN and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
+        matching = skol + inst
+        inst_of_matching = inst / max(matching, 1)
+        if conj > 0 and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
             hints.append({
                 "kind": "need_stronger_lemma",
+                "priority": 1,
                 "context": context,
                 "detail": (
-                    "cvc5 conjecture-gen is a large share of quantifier activity "
-                    "but skolem/induction strengthening stays relatively low. "
-                    "Likely missing a stronger inductive lemma (generalization)."
+                    "Skolem/induction strengthening is low relative to conjecture-gen "
+                    "(skolem/conj ≤ 0.05). Likely missing a stronger inductive lemma."
                 ),
                 "suggested_actions": [
                     "Strengthen or generalize the goal into an inductive lemma",
                     "Try associativity/commutativity/distributivity style facts",
                 ],
             })
-        elif skol_share >= SKOLEM_SHARE_MIN and inst_per_skol < INST_PER_SKOLEM_MAX:
+        if skol > 0 and inst_of_matching < INST_OF_MATCHING_MAX:
             hints.append({
                 "kind": "need_rewrite",
+                "priority": 2,
                 "context": context,
                 "detail": (
-                    "cvc5 skolemized (induction-like) but instantiations are sparse "
-                    "relative to that skolemization. Missing rewrite-oriented lemmas "
+                    "cvc5 skolemized but instantiations are not the majority of "
+                    "skolem+matching activity. Missing rewrite-oriented lemmas "
                     "may be blocking matching."
                 ),
                 "suggested_actions": [

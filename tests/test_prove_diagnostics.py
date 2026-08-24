@@ -233,6 +233,70 @@ def test_vampire_compact_and_subgoal_cache() -> None:
         assert any(h.get("kind") == "subgoal_failed" for h in parent["repair_hints"])
 
 
+def test_empty_stats_skip_hint_and_utility() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.record_solver_attempt(
+            tmp,
+            "template",
+            prompt_strategy="prove_prompt",
+            selected_profile="cvc5_inductive",
+            result=CvcResult(status="timeout", elapsed=60.0, stats={}),
+        )
+        state = mate.load_routing_state(tmp, "template")
+        assert state.pair_history
+        last = state.pair_history[-1]
+        assert last["utility"] is None
+        assert last["signals"] == []
+
+
+def test_progress_uses_3s_short_baseline() -> None:
+    import Mate_new as mate
+
+    long = CvcResult(
+        status="timeout", elapsed=60.0,
+        stats={"CONJ_TOTAL": 8000},
+        difficulty=[("(ax)", 9)],
+    )
+    short = CvcResult(status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 8})
+    control = CvcResult(status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 7})
+    with tempfile.TemporaryDirectory() as tmp:
+        mate._store_cached_diag(tmp, "template", "baseline_diag", long)
+
+        def fake_diag(path, timeout=3, **kwargs):
+            name = str(path)
+            if "control" in name:
+                return control
+            return short
+
+        with patch("Mate_new.run_cvc_diagnostic", side_effect=fake_diag):
+            _ordered, hint_b = mate.analyze_lemma_progress(
+                [], TINY_SMT, Path(tmp), "template", tmp
+            )
+        assert hint_b.stats["CONJ_TOTAL"] == 8000
+        cached_short = mate._load_cached_diag(tmp, "template", "baseline_diag_short")
+        assert cached_short is not None
+        assert cached_short.stats["CONJ_TOTAL"] == 8
+        still_long = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert still_long is not None
+        assert still_long.stats["CONJ_TOTAL"] == 8000
+
+
+def test_cvc_diagnostic_single_process() -> None:
+    fake = CvcResult(status="timeout", stdout="unknown\n(\n)\n", stderr="")
+    with patch("cvc5_runner.run_cvc_difficulty") as second, patch(
+        "cvc5_runner._execute_single", return_value=fake
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            smt = Path(tmp) / "g.smt2"
+            smt.write_text(TINY_SMT, encoding="utf-8")
+            from cvc5_runner import run_cvc_diagnostic
+
+            run_cvc_diagnostic(smt, timeout=1, collect_difficulty=True)
+        second.assert_not_called()
+
+
 def main() -> int:
     test_inject_difficulty_script()
     test_parse_cvc_difficulty_simple()
@@ -245,6 +309,9 @@ def main() -> int:
     test_subgoal_reuses_child_cache()
     test_subgoal_falls_back_when_cache_missing()
     test_vampire_compact_and_subgoal_cache()
+    test_empty_stats_skip_hint_and_utility()
+    test_progress_uses_3s_short_baseline()
+    test_cvc_diagnostic_single_process()
     print("prove diagnostics tests passed")
     return 0
 
