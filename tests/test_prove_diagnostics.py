@@ -297,6 +297,64 @@ def test_progress_uses_3s_short_baseline() -> None:
         assert still_long.stats["CONJ_TOTAL"] == 8000
 
 
+def test_progress_cache_reused_for_same_profile() -> None:
+    import Mate_new as mate
+
+    short = CvcResult(
+        status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 8}, strategy="cvc5_inductive",
+    )
+    control = CvcResult(
+        status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 7}, strategy="cvc5_inductive",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        state = mate.load_routing_state(tmp, "template")
+        state.active_profile = "cvc5_inductive"
+        mate.save_routing_state(tmp, "template", state)
+        mate._store_cached_diag(tmp, "template", "baseline_diag_short", short)
+        mate._store_cached_diag(tmp, "template", "control_diag", control)
+        with patch("Mate_new.run_cvc_diagnostic") as diag:
+            mate.analyze_lemma_progress([], TINY_SMT, Path(tmp), "template", tmp)
+        diag.assert_not_called()
+
+
+def test_progress_cache_invalidated_on_profile_change() -> None:
+    import Mate_new as mate
+
+    old = CvcResult(
+        status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 8}, strategy="cvc5_inductive",
+    )
+    old_ctrl = CvcResult(
+        status="timeout", elapsed=3.0, stats={"CONJ_TOTAL": 7}, strategy="cvc5_inductive",
+    )
+    long = CvcResult(status="timeout", elapsed=60.0, stats={"CONJ_TOTAL": 8000})
+    with tempfile.TemporaryDirectory() as tmp:
+        state = mate.load_routing_state(tmp, "template")
+        state.active_profile = "adt_structural"
+        mate.save_routing_state(tmp, "template", state)
+        mate._store_cached_diag(tmp, "template", "baseline_diag", long)
+        mate._store_cached_diag(tmp, "template", "baseline_diag_short", old)
+        mate._store_cached_diag(tmp, "template", "control_diag", old_ctrl)
+
+        def fake_diag(path, timeout=3, profile=None, **kwargs):
+            name = profile or "adt_structural"
+            stats = {"CONJ_TOTAL": 1 if "control" in str(path) else 2}
+            return CvcResult(status="timeout", elapsed=3.0, stats=stats, strategy=name)
+
+        with patch("Mate_new.run_cvc_diagnostic", side_effect=fake_diag) as diag:
+            _ordered, hint_b = mate.analyze_lemma_progress(
+                [], TINY_SMT, Path(tmp), "template", tmp
+            )
+        assert diag.call_count >= 2
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag_short")
+        assert cached is not None
+        assert cached.strategy == "adt_structural"
+        assert cached.stats["CONJ_TOTAL"] == 2
+        assert hint_b.stats["CONJ_TOTAL"] == 8000
+        still_long = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert still_long is not None
+        assert still_long.stats["CONJ_TOTAL"] == 8000
+
+
 def test_cvc_diagnostic_single_process() -> None:
     fake = CvcResult(status="timeout", stdout="unknown\n(\n)\n", stderr="")
     with patch("cvc5_runner.run_cvc_difficulty") as second, patch(
@@ -311,7 +369,7 @@ def test_cvc_diagnostic_single_process() -> None:
         second.assert_not_called()
 
 
-def test_repair_hint_quota_keeps_structure() -> None:
+def test_repair_hints_keep_all_kinds() -> None:
     import Mate_new as mate
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -328,10 +386,27 @@ def test_repair_hint_quota_keeps_structure() -> None:
         data = mate.load_failed_lemmas(tmp, "template")
         kinds = [h["kind"] for h in data["repair_hints"]]
         assert kinds.count("timeout") == 1
+        timeout = next(h for h in data["repair_hints"] if h["kind"] == "timeout")
+        assert timeout["detail"] == "t2"
         assert "no_progress" in kinds
         assert "need_rewrite" in kinds
         assert "need_induction_lemma" in kinds
-        assert "high_difficulty_assertions" not in kinds
+        assert "high_difficulty_assertions" in kinds
+
+
+def test_subgoal_failed_keeps_latest_two() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("template_1", "template_2", "template_3"):
+            mate.add_repair_hints(tmp, "template", [{
+                "kind": "subgoal_failed",
+                "context": f"subgoal:{name}",
+                "detail": name,
+            }])
+        data = mate.load_failed_lemmas(tmp, "template")
+        failed = [h for h in data["repair_hints"] if h["kind"] == "subgoal_failed"]
+        assert [h["detail"] for h in failed] == ["template_2", "template_3"]
 
 
 def test_blocking_lemma_only_and_unmatched_skips_unproved() -> None:
@@ -436,8 +511,11 @@ def main() -> int:
     test_vampire_compact_and_subgoal_cache()
     test_empty_stats_skip_hint_and_utility()
     test_progress_uses_3s_short_baseline()
+    test_progress_cache_reused_for_same_profile()
+    test_progress_cache_invalidated_on_profile_change()
     test_cvc_diagnostic_single_process()
-    test_repair_hint_quota_keeps_structure()
+    test_repair_hints_keep_all_kinds()
+    test_subgoal_failed_keeps_latest_two()
     test_blocking_lemma_only_and_unmatched_skips_unproved()
     test_trivial_implication_and_control_shape()
     test_progress_prompt_does_not_fight_useless_group()

@@ -527,6 +527,14 @@ def _run_cvc_parallel(
                 pass
 
 
+def cvc_diagnostic_profile(profile: Optional[str]) -> str:
+    """Single CVC5 strategy used for 3s sidecar runs (not the paper portfolio)."""
+    specs = cvc_profile_specs()
+    if profile in specs and specs[profile]["type"] == "CVC5":
+        return profile
+    return "cvc5_inductive"
+
+
 def run_cvc_diagnostic(
     smt2_path,
     timeout: int = 3,
@@ -539,9 +547,8 @@ def run_cvc_diagnostic(
     Used for progress comparison / repair hints, not as portfolio prover.
     """
     smt2_path = Path(smt2_path)
-    specs = cvc_profile_specs()
-    name = profile if profile in specs and specs[profile]["type"] == "CVC5" else "cvc5_inductive"
-    cfg = specs[name]
+    name = cvc_diagnostic_profile(profile)
+    cfg = cvc_profile_specs()[name]
     ms = max(1, int(timeout * 1000))
     tmp_path = None
     try:
@@ -579,9 +586,8 @@ def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = 
     calls (get-difficulty) after check-sat.
     """
     smt2_path = Path(smt2_path)
-    specs = cvc_profile_specs()
-    name = profile if profile in specs and specs[profile]["type"] == "CVC5" else "cvc5_inductive"
-    cfg = specs[name]
+    name = cvc_diagnostic_profile(profile)
+    cfg = cvc_profile_specs()[name]
     content = smt2_path.read_text(encoding="utf-8")
     script = _inject_difficulty_script(content)
     ms = max(1, int(timeout * 1000))

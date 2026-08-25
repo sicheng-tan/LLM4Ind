@@ -17,6 +17,7 @@ from cvc5_runner import (
     run_cvc_routed,
     compute_progress_score,
     derive_repair_hints,
+    cvc_diagnostic_profile,
     CvcResult,
 )
 from solver_routing import (
@@ -50,10 +51,7 @@ config = setup_environment()
 # 初始化模型
 llm = setup_model(config)
 
-_MAX_REPAIR_HINTS = 4
-_STRUCTURE_HINT_QUOTA = 2
-_ROUND_HINT_QUOTA = 2
-_ROUND_HINT_KINDS = frozenset({"no_progress", "timeout", "partial_progress"})
+_MAX_SUBGOAL_FAILED_HINTS = 2
 _MAX_PROGRESS_LEMMAS = 6
 _PROGRESS_SCORE_THRESHOLD = 0.5
 _DIAGNOSTIC_TIMEOUT = 3
@@ -177,20 +175,21 @@ def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
     logging.info(f"记录进展引理到{goal_name}: score={score:.2f} signals={signals}")
 
 def _compact_repair_hints(hints: List[dict]) -> List[dict]:
-    """Keep the latest hint per kind; reserve structure vs round-progress slots."""
+    """Keep the latest hint per kind; keep a short window of subgoal_failed."""
     latest: Dict[str, dict] = {}
     order: List[str] = []
+    subgoal_failed: List[dict] = []
     for hint in hints:
         kind = str(hint.get("kind") or "")
+        if kind == "subgoal_failed":
+            subgoal_failed.append(hint)
+            continue
         if kind in latest:
             order = [k for k in order if k != kind]
         latest[kind] = hint
         order.append(kind)
     unique = [latest[k] for k in order]
-    structure = [h for h in unique if str(h.get("kind") or "") not in _ROUND_HINT_KINDS]
-    round_h = [h for h in unique if str(h.get("kind") or "") in _ROUND_HINT_KINDS]
-    compacted = structure[-_STRUCTURE_HINT_QUOTA:] + round_h[-_ROUND_HINT_QUOTA:]
-    return compacted[:_MAX_REPAIR_HINTS]
+    return unique + subgoal_failed[-_MAX_SUBGOAL_FAILED_HINTS:]
 
 
 def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
@@ -680,6 +679,14 @@ def _is_trivial_equational_lemma(lemma: str) -> bool:
     ))
 
 
+def _cached_diag_for_profile(cached, profile: Optional[str], *, resolver) -> Optional[object]:
+    """Reuse a 3s cache only when it was produced by the same diagnostic strategy."""
+    want = resolver(profile)
+    if cached is None or (cached.strategy or "") != want:
+        return None
+    return cached
+
+
 def analyze_lemma_progress(
     asserts: List[str],
     original_content: str,
@@ -689,9 +696,21 @@ def analyze_lemma_progress(
 ) -> Tuple[List[str], CvcResult]:
     """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove)."""
     profile = _diag_profile(base_path, goal_name)
+    want = cvc_diagnostic_profile(profile)
     hint_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
-    progress_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag_short")
+    progress_baseline = _cached_diag_for_profile(
+        _load_cached_diag(base_path, goal_name, "baseline_diag_short"),
+        profile,
+        resolver=cvc_diagnostic_profile,
+    )
     if progress_baseline is None:
+        stale = _load_cached_diag(base_path, goal_name, "baseline_diag_short")
+        if stale is not None:
+            logging.info(
+                "cvc5 3s baseline profile %s → %s，重跑 short diagnostic",
+                stale.strategy or "?",
+                want,
+            )
         baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
         baseline_path.write_text(original_content)
         progress_baseline = run_cvc_diagnostic(
@@ -711,11 +730,15 @@ def analyze_lemma_progress(
         else:
             logging.info("cvc5 progress 使用 3s short baseline；60s 结果只用于 repair hint")
     else:
-        logging.info("复用缓存的 cvc5 3s progress baseline")
+        logging.info("复用缓存的 cvc5 3s progress baseline (profile=%s)", want)
     if hint_baseline is None:
         hint_baseline = progress_baseline
 
-    control = _load_cached_diag(base_path, goal_name, "control_diag")
+    control = _cached_diag_for_profile(
+        _load_cached_diag(base_path, goal_name, "control_diag"),
+        profile,
+        resolver=cvc_diagnostic_profile,
+    )
     if control is None:
         control_lemma = _control_lemma(original_content)
         control_path = work_dir / f"{goal_name}_diag_control.smt2"

@@ -234,6 +234,12 @@ def run_vampire(
                 pass
 
 
+def vampire_diagnostic_profile(profile: Optional[str]) -> str:
+    """Single-strategy name used for 3s sidecar (portfolio names map via spec['diag'])."""
+    spec = VAMPIRE_PROFILES.get(profile or "struct_single", VAMPIRE_PROFILES["struct_single"])
+    return spec.get("diag") or "struct_single"
+
+
 def run_vampire_diagnostic(
     smt2_path,
     timeout: int = 3,
@@ -252,8 +258,7 @@ def run_vampire_diagnostic(
     if not vampire_binary:
         return VampireResult(status="error", error="VAMPIRE_BINARY not configured")
 
-    spec = VAMPIRE_PROFILES.get(profile or "struct_single", VAMPIRE_PROFILES["struct_single"])
-    diag_name = spec.get("diag") or "struct_single"
+    diag_name = vampire_diagnostic_profile(profile)
     smt2_path = Path(smt2_path)
     run_path, tmp_path = prepare_vampire_smt_input(smt2_path)
     command = _vampire_command(
