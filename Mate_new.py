@@ -14,10 +14,12 @@ from cvc5_runner import (
     run_cvc,
     run_cvc_diagnostic,
     run_cvc_probe,
+    cvc_probeable_profiles,
     run_cvc_routed,
     compute_progress_score,
     derive_repair_hints,
     cvc_diagnostic_profile,
+    hard_axioms_from_difficulty,
     CvcResult,
 )
 from solver_routing import (
@@ -356,7 +358,7 @@ def _record_subgoal_failure_feedback(
             f"({subgoal}) failed under cvc5. Generate easier lemmas, "
             f"or lemmas that help prove this subgoal directly."
         ),
-        "hard_axioms": [t for t, _s in diag.difficulty[:4]],
+        "hard_axioms": hard_axioms_from_difficulty(diag.difficulty, diag.goal_term),
         "suggested_actions": [
             "Propose a weaker/simpler variant of the failing lemma",
             "Add bridging lemmas targeting high-difficulty axioms",
@@ -856,7 +858,9 @@ def verify_combined_lemmas(
                     "(generalization / rewrite bridge) targeting high-difficulty axioms."
                 )
             ),
-            "hard_axioms": [t for t, _ in baseline.difficulty[:4]],
+            "hard_axioms": hard_axioms_from_difficulty(
+                baseline.difficulty, baseline.goal_term
+            ),
             "suggested_actions": [
                 "Build on progress lemmas if any are listed above",
                 "Target high-difficulty recursive definitions reported by cvc5",
@@ -926,18 +930,19 @@ def seed_baseline_repair_hints(
     )
 
     if routing_enabled() and probes_enabled() and not llm_selector_enabled():
-        probe_names = recommend_profiles(
+        ranked = recommend_profiles(
             "cvc5",
             features,
             hints,
             parent_profile=parent_profile,
-        )[0][:probe_profile_count()]
+        )[0]
+        probe_names = cvc_probeable_profiles(ranked)[:probe_profile_count()]
         probes = run_cvc_probe(goal_smt_file, probe_names, timeout=probe_timeout_s())
         utilities: Dict[str, float] = {}
         history = []
         reference_name = next(
             (
-                name for name in ("cvc5_inductive", "cvc5_simple", "cvc4_default")
+                name for name in ("cvc5_inductive", "cvc5_simple")
                 if name in probes
             ),
             next(iter(probes), None),

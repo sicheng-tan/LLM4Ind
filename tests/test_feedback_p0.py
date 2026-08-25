@@ -21,6 +21,7 @@ from cvc5_runner import (
     compute_progress_score,
     derive_repair_hints,
     extract_proof_goal_term,
+    hard_axioms_from_difficulty,
     parse_cvc_difficulty,
     parse_cvc_stats,
 )
@@ -96,6 +97,19 @@ def test_goal_diff_ignores_front_negated_axiom() -> None:
         not any("plus2" in ax for ax in hard),
         f"proof goal must not be listed as hard_axioms: {hard}",
     )
+    via_helper = hard_axioms_from_difficulty(base.difficulty, base.goal_term)
+    _ok(via_helper == hard, f"helper must match derive: {via_helper} vs {hard}")
+
+
+def test_hard_axioms_not_raw_score_topk() -> None:
+    """Prompt hard_axioms must skip the proof goal even if it ranks first."""
+    other_ax = "(forall ((n Nat)) (= (plus (succ n) n) (succ n)))"
+    difficulty = [(GOAL, 99), (NEGATED_AXIOM, 80), (AXIOM, 10), (other_ax, 5)]
+    hard = hard_axioms_from_difficulty(difficulty, GOAL, limit=4)
+    _ok(GOAL not in hard, f"proof goal leaked into hard_axioms: {hard}")
+    _ok(all("plus2" not in ax for ax in hard), f"goal fragment in hard_axioms: {hard}")
+    _ok(AXIOM in hard, f"real axiom missing: {hard}")
+    _ok(NEGATED_AXIOM in hard, f"negated axiom should stay an axiom: {hard}")
 
 
 def test_axiom_disappear_from_topk_is_drop() -> None:
@@ -174,6 +188,7 @@ def main() -> int:
         test_parse_named_assertion,
         test_extract_proof_goal_block,
         test_goal_diff_ignores_front_negated_axiom,
+        test_hard_axioms_not_raw_score_topk,
         test_axiom_disappear_from_topk_is_drop,
         test_vampire_user_error,
         test_relative_gain_rate_vs_count,

@@ -21,6 +21,9 @@ from cvc5_runner import (
     _cvc_prove_cmd,
     _inject_difficulty_script,
     parse_cvc_difficulty,
+    run_cvc_probe,
+    cvc_probeable_profiles,
+    cvc_profile_specs,
 )
 from vampire_runner import VampireResult, _vampire_command
 
@@ -369,6 +372,81 @@ def test_cvc_diagnostic_single_process() -> None:
         second.assert_not_called()
 
 
+def _execute_strategy(call) -> str:
+    if "strategy" in call.kwargs:
+        return call.kwargs["strategy"]
+    return call.args[2]
+
+
+def test_cvc_probe_skips_cvc4() -> None:
+    fake = CvcResult(status="timeout")
+    with patch("cvc5_runner._execute_single", return_value=fake) as exe:
+        with tempfile.TemporaryDirectory() as tmp:
+            smt = Path(tmp) / "g.smt2"
+            smt.write_text(TINY_SMT, encoding="utf-8")
+            out = run_cvc_probe(smt, ["cvc4_default", "cvc5_inductive"], timeout=1)
+    assert set(out) == {"cvc5_inductive"}
+    assert exe.call_count == 1
+    assert _execute_strategy(exe.call_args) == "cvc5_inductive"
+    cmd = exe.call_args.args[0]
+    assert "--stats" in cmd
+    assert cmd[0] == cvc_profile_specs()["cvc5_inductive"]["binary"]
+
+
+def test_cvc_probeable_fills_next_cvc5() -> None:
+    ranked = [
+        "adt_structural",
+        "cvc4_default",
+        "cvc5_inductive",
+        "cvc5_inductive_no_ematching",
+    ]
+    assert cvc_probeable_profiles(ranked)[:3] == [
+        "adt_structural",
+        "cvc5_inductive",
+        "cvc5_inductive_no_ematching",
+    ]
+
+
+def test_cvc_diagnostic_still_remaps_cvc4() -> None:
+    fake = CvcResult(status="timeout")
+    with patch("cvc5_runner._execute_single", return_value=fake) as exe:
+        with tempfile.TemporaryDirectory() as tmp:
+            smt = Path(tmp) / "g.smt2"
+            smt.write_text(TINY_SMT, encoding="utf-8")
+            from cvc5_runner import run_cvc_diagnostic
+
+            run_cvc_diagnostic(
+                smt, timeout=1, collect_difficulty=False, profile="cvc4_default"
+            )
+    assert exe.call_count == 1
+    assert _execute_strategy(exe.call_args) == "cvc5_inductive"
+    cmd = exe.call_args.args[0]
+    assert cmd[0] == cvc_profile_specs()["cvc5_inductive"]["binary"]
+
+
+def test_subgoal_hard_axioms_skip_proof_goal() -> None:
+    import Mate_new as mate
+
+    goal = "(not (forall ((x Int)) (P x)))"
+    axiom = "(forall ((x Int)) (P x))"
+    child = CvcResult(
+        status="timeout",
+        difficulty=[(goal, 20), (axiom, 10)],
+        goal_term=goal,
+        strategy="cvc5_inductive",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        mate._store_cached_diag(tmp, "template_1", "baseline_diag", child)
+        mate._record_subgoal_failure_feedback(
+            tmp, "template", "template_1", ["lemma-a"]
+        )
+        parent = mate.load_failed_lemmas(tmp, "template")
+        failed = next(h for h in parent["repair_hints"] if h.get("kind") == "subgoal_failed")
+        hard = failed.get("hard_axioms") or []
+        assert axiom in hard
+        assert goal not in hard
+
+
 def test_repair_hints_keep_all_kinds() -> None:
     import Mate_new as mate
 
@@ -514,6 +592,10 @@ def main() -> int:
     test_progress_cache_reused_for_same_profile()
     test_progress_cache_invalidated_on_profile_change()
     test_cvc_diagnostic_single_process()
+    test_cvc_probe_skips_cvc4()
+    test_cvc_probeable_fills_next_cvc5()
+    test_cvc_diagnostic_still_remaps_cvc4()
+    test_subgoal_hard_axioms_skip_proof_goal()
     test_repair_hints_keep_all_kinds()
     test_subgoal_failed_keeps_latest_two()
     test_blocking_lemma_only_and_unmatched_skips_unproved()

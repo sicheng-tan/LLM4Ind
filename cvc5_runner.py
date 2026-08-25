@@ -205,21 +205,26 @@ def run_cvc(
     )
 
 
+def cvc_probeable_profiles(names: List[str]) -> List[str]:
+    """Keep CVC5 names only. CVC4 has no --stats / produce-difficulty."""
+    specs = cvc_profile_specs()
+    return [n for n in names if specs.get(n, {}).get("type") == "CVC5"]
+
+
 def run_cvc_probe(
     smt2_path,
     profiles: List[str],
     timeout: int = 2,
 ) -> Dict[str, CvcResult]:
-    """Short sequential diagnostic probes for routing."""
+    """Short sequential diagnostic probes for routing (CVC5 only)."""
     out: Dict[str, CvcResult] = {}
-    for name in profiles:
-        if name not in cvc_profile_specs():
-            continue
-        out[name] = run_cvc_diagnostic(
+    for name in cvc_probeable_profiles(list(profiles)):
+        out[name] = _run_named_cvc_profile(
             smt2_path,
-            timeout=timeout,
+            timeout,
+            name,
+            collect_stats=True,
             collect_difficulty=False,
-            profile=name,
         )
     return out
 
@@ -295,6 +300,64 @@ def _cvc_prove_cmd(
         cmd.append(f"--tlimit-per={max(1, int(timeout * 1000))}")
     cmd.append(str(input_path))
     return cmd
+
+
+def _run_named_cvc_profile(
+    smt2_path,
+    timeout: int,
+    profile: str,
+    *,
+    collect_stats: bool = True,
+    collect_difficulty: bool = False,
+) -> CvcResult:
+    """Run one named CVC5/CVC4 profile as-is (no sidecar remapping)."""
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    if profile not in specs:
+        return CvcResult(
+            status="error",
+            strategy=profile,
+            error=f"unknown profile: {profile}",
+        )
+    cfg = specs[profile]
+    if collect_difficulty and cfg.get("type") != "CVC5":
+        collect_difficulty = False
+    tmp_path = None
+    try:
+        content = smt2_path.read_text(encoding="utf-8")
+    except OSError:
+        content = ""
+    goal_term = extract_proof_goal_term(content) if content else None
+    input_path = smt2_path
+    if collect_difficulty and content:
+        script = _inject_difficulty_script(content)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".smt2", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(script)
+            tmp_path = tf.name
+        input_path = Path(tmp_path)
+    cmd = _cvc_prove_cmd(
+        cfg,
+        input_path,
+        timeout,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
+    )
+    try:
+        result = _execute_single(cmd, timeout + 2, strategy=profile)
+        result.goal_term = goal_term
+        if collect_difficulty:
+            result.difficulty = parse_cvc_difficulty(
+                result.stdout + "\n" + result.stderr
+            )
+        return result
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _cvc_result_from_output(
@@ -528,7 +591,10 @@ def _run_cvc_parallel(
 
 
 def cvc_diagnostic_profile(profile: Optional[str]) -> str:
-    """Single CVC5 strategy used for 3s sidecar runs (not the paper portfolio)."""
+    """Sidecar 3s strategy. CVC4 cannot produce-difficulty, so it maps to cvc5_inductive.
+
+    Probes use `_run_named_cvc_profile` and do not go through this remap.
+    """
     specs = cvc_profile_specs()
     if profile in specs and specs[profile]["type"] == "CVC5":
         return profile
@@ -1064,6 +1130,28 @@ def compute_progress_score(
     return score, signals
 
 
+def hard_axioms_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+    *,
+    limit: int = 4,
+) -> List[str]:
+    """Hard axioms for LLM prompts: same goal/axiom split as derive_repair_hints."""
+    axiom_scores = [
+        s
+        for t, s in (difficulty or [])
+        if s > 0 and classify_difficulty_term(t, goal_term) == "axiom"
+    ]
+    cutoff = in_problem_hard_cutoff(axiom_scores)
+    return [
+        t
+        for t, s in (difficulty or [])
+        if s > 0
+        and classify_difficulty_term(t, goal_term) == "axiom"
+        and s >= cutoff
+    ][:limit]
+
+
 def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     """Turn cvc5 failure signals into structured repair hints for the LLM."""
     if result.proved:
@@ -1077,9 +1165,7 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
         for t, s in result.difficulty
         if s > 0
     ]
-    axiom_items = [(t, s) for t, s, role in roles if role == "axiom"]
-    cutoff = in_problem_hard_cutoff([s for _, s in axiom_items])
-    hard_axioms = [t for t, s in axiom_items if s >= cutoff][:4]
+    hard_axioms = hard_axioms_from_difficulty(result.difficulty, result.goal_term)
     goal_bits = [t for t, s, role in roles if role == "goal"][:2]
 
     if hard_axioms or goal_bits:
