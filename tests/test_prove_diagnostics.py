@@ -559,6 +559,36 @@ def test_empty_llm_does_not_retry_immediately() -> None:
         routed.assert_not_called()
 
 
+def test_prove_run_does_not_retry_after_llm_exhausted() -> None:
+    import Mate_new as mate
+    import Mate_new_vampire as mate_v
+
+    goal_smt = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(goal_smt, encoding="utf-8")
+        with patch("Mate_new.routing_enabled", return_value=False), patch(
+            "Mate_new.perform_initial_verification", return_value=False
+        ), patch(
+            "Mate_new.quick_run", return_value=(False, [], [])
+        ), patch("Mate_new.run_cvc_routed") as routed:
+            assert mate.prove_run(tmp, "template") is False
+            routed.assert_not_called()
+
+        with patch("Mate_new_vampire.routing_enabled", return_value=False), patch(
+            "Mate_new_vampire.perform_initial_verification", return_value=False
+        ), patch(
+            "Mate_new_vampire.quick_run", return_value=(False, [], [])
+        ), patch("Mate_new_vampire.run_vampire_routed") as routed_v:
+            assert mate_v.prove_run(tmp, "template") is False
+            routed_v.assert_not_called()
+
+
 def test_stats_without_reference_skip_utility() -> None:
     import Mate_new as mate
 
@@ -627,6 +657,7 @@ def main() -> int:
     test_trivial_implication_and_control_shape()
     test_progress_prompt_does_not_fight_useless_group()
     test_empty_llm_does_not_retry_immediately()
+    test_prove_run_does_not_retry_after_llm_exhausted()
     print("prove diagnostics tests passed")
     return 0
 

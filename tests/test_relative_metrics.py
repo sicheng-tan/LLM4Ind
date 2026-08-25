@@ -264,9 +264,40 @@ def test_vampire_explosion_and_mix() -> None:
         stats={"IntegerInfiniteIntervalInduction": 80, "StructuralInduction": 2,
                "Fw demodulations": 30},
     ))
+    kinds_int = [h["kind"] for h in hints_int]
     _ok(
-        any(h["kind"] == "need_arithmetic_lemma" for h in hints_int),
+        "need_arithmetic_lemma" in kinds_int,
         f"integer-induction share: {hints_int}",
+    )
+    _ok(
+        "need_induction_lemma" not in kinds_int,
+        f"arithmetic hint must replace missing-induction: {hints_int}",
+    )
+
+
+def test_integer_induction_in_mix_share() -> None:
+    """Mix uses the same induction keys as progress; integer activity is not 'no induction'."""
+    elapsed = 3.0
+    only_int = vampire_hints(VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={
+            "IntegerInfiniteIntervalInduction": 80,
+            "StructuralInduction": 0,
+            "InductionApplications": 0,
+            "Fw demodulations": 500,
+        },
+    ))
+    kinds = [h["kind"] for h in only_int]
+    _ok("need_arithmetic_lemma" in kinds, only_int)
+    _ok("need_induction_lemma" not in kinds, f"integer+demod must not say missing induction: {only_int}")
+
+    rewrite_dom = vampire_hints(VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"InductionApplications": 1, "Fw demodulations": 400},
+    ))
+    _ok(
+        any(h["kind"] == "need_induction_lemma" for h in rewrite_dom),
+        f"structural-tiny vs demod still missing induction: {rewrite_dom}",
     )
 
 
@@ -349,6 +380,7 @@ def main() -> int:
         test_cvc_mix_hints_small_problem,
         test_vampire_small_vs_large,
         test_vampire_explosion_and_mix,
+        test_integer_induction_in_mix_share,
         test_correlated_counters_are_one_channel,
         test_integer_induction_counts_as_progress,
         test_cvc_inst_conj_flood_is_explosion,

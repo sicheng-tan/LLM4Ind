@@ -186,7 +186,7 @@ hint 再提升：
 7. 子目标 `ProveRun(..., parent_goal_name=)` 可继承父 profile。
 8. 有用性与重试结果写入 `routing.pair_history`（不再有子集证明记录）。
 
-LLM 返回空列表时，当前实现仍会在该 attempt **立刻**用 `RETRY_CVC_TIMEOUT`（默认 100s）再证原目标；调用抛错则不加时。这不是论文步骤。
+LLM 返回空列表时进入下一 attempt，不加时。节点全部 LLM attempt 失败后也直接失败，不再用 `RETRY_CVC_TIMEOUT`（默认 100s）重跑原目标。该加时只存在于原代码，已注释保留；论文 Algorithm 1 没有这一步。
 
 ### 3.5.1 相对论文的求解器时间
 

@@ -1455,7 +1455,7 @@ def quick_run(
     # 步骤3: 使用LLM生成引理
     extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path)
 
-    # 如果没有生成引理，与调用失败一样进入下一 attempt；加时只在节点全部失败后做一次
+    # 如果没有生成引理，与调用失败一样进入下一 attempt，不加时。
     if not extracted_asserts:
         logging.info("大模型未返回引理，跳过本 attempt（不加时）")
         return False, [], []
@@ -1728,27 +1728,32 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")
-    return _retry_original_after_llm_exhausted(base_path, base_name)
-
-
-def _retry_original_after_llm_exhausted(base_path: str, goal_name: str) -> bool:
-    """After every LLM attempt on this node failed, retry the original goal once."""
-    goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
-    retry_timeout = config["RETRY_CVC_TIMEOUT"]
-    logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
-    retry = run_cvc_routed(
-        goal_smt_file,
-        retry_timeout,
-        state=load_routing_state(base_path, goal_name),
-    )
-    record_solver_attempt(
-        base_path,
-        goal_name,
-        prompt_strategy=None,
-        selected_profile=load_routing_state(base_path, goal_name).active_profile,
-        result=retry,
-    )
-    if retry.proved:
-        logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
-        return True
+    # Paper Algorithm 1 returns False here. The original implementation then
+    # retried the same SMT at RETRY_CVC_TIMEOUT (100s). That step is not in
+    # the paper: this node already had a 60s initialCheck on the same file.
+    # Keep the helper below (commented) in case we want to restore it.
+    # return _retry_original_after_llm_exhausted(base_path, base_name)
     return False
+
+
+# def _retry_original_after_llm_exhausted(base_path: str, goal_name: str) -> bool:
+#     """After every LLM attempt on this node failed, retry the original goal once."""
+#     goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
+#     retry_timeout = config["RETRY_CVC_TIMEOUT"]
+#     logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
+#     retry = run_cvc_routed(
+#         goal_smt_file,
+#         retry_timeout,
+#         state=load_routing_state(base_path, goal_name),
+#     )
+#     record_solver_attempt(
+#         base_path,
+#         goal_name,
+#         prompt_strategy=None,
+#         selected_profile=load_routing_state(base_path, goal_name).active_profile,
+#         result=retry,
+#     )
+#     if retry.proved:
+#         logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
+#         return True
+#     return False

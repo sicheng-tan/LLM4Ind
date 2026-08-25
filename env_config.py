@@ -21,7 +21,8 @@ def setup_environment():
     vampire_binary = os.getenv('VAMPIRE_BINARY', './vampire/vampire')  # Vampire二进制文件路径
     max_attempts_per_prompt = int(os.getenv('MAX_ATTEMPTS_PER_PROMPT', '3'))  # 每个prompt策略的最大尝试次数
     default_cvc_timeout = int(os.getenv('DEFAULT_CVC_TIMEOUT', '60'))  # 默认CVC5超时时间(初始验证检查)
-    retry_cvc_timeout = int(os.getenv('RETRY_CVC_TIMEOUT', '100'))  # 重试CVC5超时时间(原目标提高时间限制的超时)
+    # Unused while post-LLM 100s retry is commented out in Mate_new*.py.
+    retry_cvc_timeout = int(os.getenv('RETRY_CVC_TIMEOUT', '100'))  # 原实现：加时再证原目标；论文无此步
     combined_cvc_timeout = int(os.getenv('COMBINED_CVC_TIMEOUT', '60'))  # 带引理的CVC5超时时间
     max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # 最大递归深度限制
     task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # 单个任务的超时时间（秒）

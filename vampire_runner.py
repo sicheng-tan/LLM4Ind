@@ -57,6 +57,18 @@ PROGRESS_STAT_KEYS = (
     "IntegerFiniteIntervalInduction",
 )
 
+# Mix and progress share this definition of "induction activity".
+_VAMPIRE_STRUCT_INDUCTION_KEYS = (
+    "InductionApplications",
+    "StructuralInduction",
+    "GeneralizedInductionApplications",
+)
+_VAMPIRE_INTEGER_INDUCTION_KEYS = (
+    "IntegerInfiniteIntervalInduction",
+    "IntegerFiniteIntervalInduction",
+)
+_VAMPIRE_INDUCTION_KEYS = _VAMPIRE_STRUCT_INDUCTION_KEYS + _VAMPIRE_INTEGER_INDUCTION_KEYS
+
 
 @dataclass
 class VampireResult:
@@ -742,6 +754,13 @@ def _vampire_stat_rate(
     return activity_rate(total, elapsed)
 
 
+def _vampire_induction_counts(stats: Dict[str, int]) -> Tuple[int, int, int]:
+    """Return (structural-like, integer-interval, total) induction counts."""
+    struct_like = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_STRUCT_INDUCTION_KEYS)
+    int_ind = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_INTEGER_INDUCTION_KEYS)
+    return struct_like, int_ind, struct_like + int_ind
+
+
 def compute_progress_score(
     baseline: VampireResult,
     candidate: VampireResult,
@@ -773,16 +792,8 @@ def compute_progress_score(
     taut_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations to eq. taut.")
     rewrite_c = dem_c + taut_c
     rewrite_r = dem_r + taut_r
-    ind_c = _vampire_stat_rate(
-        c, cand_elapsed,
-        "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
-        "IntegerInfiniteIntervalInduction", "IntegerFiniteIntervalInduction",
-    )
-    ind_r = _vampire_stat_rate(
-        ref_stats, ref_elapsed,
-        "InductionApplications", "GeneralizedInductionApplications", "StructuralInduction",
-        "IntegerInfiniteIntervalInduction", "IntegerFiniteIntervalInduction",
-    )
+    ind_c = _vampire_stat_rate(c, cand_elapsed, *_VAMPIRE_INDUCTION_KEYS)
+    ind_r = _vampire_stat_rate(ref_stats, ref_elapsed, *_VAMPIRE_INDUCTION_KEYS)
 
     strong = 0
     if is_relative_gain(rewrite_c, rewrite_r):
@@ -848,17 +859,9 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
     stats = result.stats
 
     dem = stats.get("Fw demodulations", 0) + stats.get("Bw demodulations", 0)
-    ind = (
-        stats.get("InductionApplications", 0)
-        + stats.get("StructuralInduction", 0)
-        + stats.get("GeneralizedInductionApplications", 0)
-    )
+    _struct_like, int_ind, ind = _vampire_induction_counts(stats)
     mix = ind + dem
-    int_ind = (
-        stats.get("IntegerInfiniteIntervalInduction", 0)
-        + stats.get("IntegerFiniteIntervalInduction", 0)
-    )
-    struct_like = ind
+    arithmetic_dominant = ind > 0 and int_ind / ind >= INTEGER_INDUCTION_SHARE_MIN
 
     if result.induction_focus:
         hints.append({
@@ -895,15 +898,15 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                     "Prefer lemmas whose LHS matches a subterm of the proof goal",
                 ],
             })
-        if ind_share < INDUCTION_SHARE_MAX:
+        if ind_share < INDUCTION_SHARE_MAX and not arithmetic_dominant:
             hints.append({
                 "kind": "need_induction_lemma",
                 "priority": 2,
                 "context": context,
                 "detail": (
-                    "Induction is a small share of Vampire activity "
-                    f"(<{int(INDUCTION_SHARE_MAX * 100)}%). Try a stronger inductive lemma "
-                    "(generalization / strengthen conclusion)."
+                    "Induction (structural and integer-interval) is a small share of "
+                    f"Vampire activity (<{int(INDUCTION_SHARE_MAX * 100)}%). Try a "
+                    "stronger inductive lemma (generalization / strengthen conclusion)."
                 ),
                 "suggested_actions": [
                     "Strengthen or generalize the goal into an inductive lemma",
@@ -911,13 +914,12 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 ],
             })
 
-    ind_all = struct_like + int_ind
-    if ind_all > 0 and int_ind / ind_all >= INTEGER_INDUCTION_SHARE_MIN:
+    if arithmetic_dominant:
         hints.append({
             "kind": "need_arithmetic_lemma",
             "context": context,
             "detail": (
-                "Integer-interval induction dominates structural induction. "
+                "Integer-interval induction dominates Vampire induction activity. "
                 "Prefer arithmetic bridge / monotonicity / recurrence lemmas "
                 "rather than ADT constructor facts."
             ),
