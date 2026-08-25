@@ -16,10 +16,13 @@ sys.path.insert(0, str(ROOT))
 
 from solver_routing import (
     GoalSearchState,
+    apply_progress_routing,
     build_search_state,
+    collect_feedback_signal_kinds,
     format_routing_for_prompt,
     order_prompt_strategies,
     profile_utility_from_stats,
+    rank_profiles_for_attempt,
     record_pair_attempt,
     recommend_cvc5_profiles,
     recommend_vampire_profiles,
@@ -193,6 +196,67 @@ def test_failed_pair_has_no_winner() -> None:
     _ok(state.pair_history[0]["winner_profile"] == "", state)
 
 
+def test_progress_routing_keep_switch_next() -> None:
+    adt = analyze_smt("(set-logic UFDT)\n(declare-datatypes ((nat 0)) (((zero))))")
+    ranked, _ = recommend_cvc5_profiles(adt)
+    kept, reasons = apply_progress_routing(
+        "cvc5",
+        ranked,
+        ["goal_difficulty_drop", "partial_progress"],
+        current_profile="cvc5_inductive",
+    )
+    _ok(kept[0] == "cvc5_inductive", kept)
+    _ok("progress:keep_profile" in reasons, reasons)
+
+    rotated, reasons_n = apply_progress_routing(
+        "cvc5",
+        ranked,
+        ["no_progress", "no_measurable_progress"],
+        current_profile="adt_structural",
+    )
+    _ok(rotated[0] != "adt_structural", rotated)
+    _ok(rotated[-1] == "adt_structural", rotated)
+    _ok("progress:try_next_profile" in reasons_n, reasons_n)
+
+    exploded, reasons_e = apply_progress_routing(
+        "cvc5",
+        ranked,
+        ["search_explosion"],
+        current_profile="adt_structural",
+    )
+    _ok(exploded[0] == "controlled_conjecture", exploded)
+    _ok("progress:search_explosion" in reasons_e, reasons_e)
+
+    v_ranked, _ = recommend_vampire_profiles(adt)
+    v_keep, v_reasons = apply_progress_routing(
+        "vampire",
+        v_ranked,
+        ["more_induction_activity"],
+        current_profile="induction_portfolio",
+    )
+    _ok(v_keep[0] == "induction_portfolio", v_keep)
+    _ok("progress:keep_profile" in v_reasons, v_reasons)
+
+    kinds = collect_feedback_signal_kinds(
+        extra=["search_explosion(+80%)", "goal_difficulty_drop(8->2,75%)"]
+    )
+    _ok(kinds == ["search_explosion", "goal_difficulty_drop"], kinds)
+
+
+def test_lemma_feedback_overrides_probe_utility() -> None:
+    adt = analyze_smt("(set-logic UFDT)\n(declare-datatypes ((nat 0)) (((zero))))")
+    _ranked, candidates, reasons = rank_profiles_for_attempt(
+        "cvc5",
+        adt,
+        [{"kind": "no_progress"}],
+        current_profile="adt_structural",
+        extra_signals=["no_measurable_progress"],
+        probe_utilities={"adt_structural": 9.0, "cvc5_inductive": 0.1},
+    )
+    _ok(candidates[0] != "adt_structural", candidates)
+    _ok("progress:try_next_profile" in reasons, reasons)
+
+
 def main() -> int:
     tests = [
         test_analyze_adt_nat,
@@ -205,6 +269,8 @@ def main() -> int:
         test_search_state_prompt,
         test_pair_history_round_trip,
         test_failed_pair_has_no_winner,
+        test_progress_routing_keep_switch_next,
+        test_lemma_feedback_overrides_probe_utility,
     ]
     failed = 0
     for fn in tests:

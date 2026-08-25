@@ -313,6 +313,146 @@ def select_top_profiles(
     return scored[:k]
 
 
+def signal_kind(text: str) -> str:
+    """Strip '(+12%)' / '(8->2,75%)' suffixes from a progress signal."""
+    return str(text).split("(", 1)[0].strip()
+
+
+def collect_feedback_signal_kinds(
+    hints: Sequence[dict] = (),
+    progress_lemmas: Sequence[dict] = (),
+    extra: Sequence[str] = (),
+) -> List[str]:
+    """Unique routing tokens from repair hints, 3s lemma signals, and extras."""
+    out: List[str] = []
+    seen = set()
+
+    def _add(raw: object) -> None:
+        kind = signal_kind(raw) if raw else ""
+        if kind and kind not in seen:
+            seen.add(kind)
+            out.append(kind)
+
+    for hint in hints:
+        _add(hint.get("kind", ""))
+        for item in hint.get("progress_signals") or []:
+            _add(item)
+    for record in progress_lemmas:
+        for item in record.get("signals") or []:
+            _add(item)
+    for item in extra or []:
+        _add(item)
+    return out
+
+
+_KEEP_SIGNAL_PREFIXES = (
+    "goal_difficulty_drop",
+    "axiom_difficulty_drop",
+    "more_skolemize",
+    "more_datatype_inference",
+    "more_induction_activity",
+    "more_demodulations",
+    "lower_passive_ratio",
+)
+_LEMMA_FEEDBACK_HINTS = {"no_progress", "partial_progress"}
+
+
+def _has_prefix(kinds: Sequence[str], prefixes: Sequence[str]) -> bool:
+    return any(any(kind == p or kind.startswith(p) for p in prefixes) for kind in kinds)
+
+
+def apply_progress_routing(
+    backend: str,
+    ranked: Sequence[str],
+    signal_kinds: Sequence[str],
+    current_profile: Optional[str] = None,
+) -> Tuple[List[str], List[str]]:
+    """Reorder profiles from matched 3s progress / explosion / no-signal.
+
+    Does not compute a numeric utility. Keep / switch / try-next are discrete.
+    """
+    out = list(ranked)
+    reasons: List[str] = []
+    kinds = list(signal_kinds)
+    if not kinds:
+        return out, reasons
+
+    strong_keep = _has_prefix(kinds, _KEEP_SIGNAL_PREFIXES) or "partial_progress" in kinds
+    explosion = _has_prefix(kinds, ("search_explosion",))
+    no_signal = (
+        "no_progress" in kinds or "no_measurable_progress" in kinds
+    ) and not strong_keep
+
+    if explosion and not _has_prefix(
+        kinds,
+        (
+            "goal_difficulty_drop",
+            "axiom_difficulty_drop",
+            "more_skolemize",
+            "more_induction_activity",
+        ),
+    ):
+        if backend == "vampire":
+            _boost(out, ["struct_induction", "struct_single"])
+        else:
+            _boost(out, ["controlled_conjecture", "cvc5_inductive_no_ematching"])
+        reasons.append("progress:search_explosion")
+        return _dedup_keep(out), reasons
+
+    if strong_keep:
+        if _has_prefix(kinds, ("more_datatype_inference",)):
+            if backend == "vampire":
+                _boost(out, ["struct_induction"])
+            else:
+                _boost(out, ["adt_structural"])
+            reasons.append("progress:more_datatype")
+        if current_profile:
+            _boost(out, [current_profile])
+            reasons.append("progress:keep_profile")
+        return _dedup_keep(out), reasons
+
+    if no_signal and current_profile and current_profile in out:
+        out = [name for name in out if name != current_profile] + [current_profile]
+        reasons.append("progress:try_next_profile")
+        return _dedup_keep(out), reasons
+
+    return _dedup_keep(out), reasons
+
+
+def rank_profiles_for_attempt(
+    backend: str,
+    features: TheoryFeatures,
+    hints: Sequence[dict] = (),
+    *,
+    parent_profile: Optional[str] = None,
+    current_profile: Optional[str] = None,
+    progress_lemmas: Sequence[dict] = (),
+    extra_signals: Sequence[str] = (),
+    probe_utilities: Optional[Dict[str, float]] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Static + hint rank, then 3s progress rerank, then top-k.
+
+    Probe scores apply only before any lemma-failure sidecar exists; after that
+    they must not override keep / switch / try-next.
+    """
+    ranked, reasons = recommend_profiles(
+        backend, features, hints, parent_profile=parent_profile
+    )
+    signals = collect_feedback_signal_kinds(hints, progress_lemmas, extra_signals)
+    ranked, extra = apply_progress_routing(
+        backend, ranked, signals, current_profile=current_profile
+    )
+    reasons = list(reasons) + extra
+    lemma_feedback = bool(
+        set(hint_kinds(hints)) & _LEMMA_FEEDBACK_HINTS
+        or extra_signals
+        or progress_lemmas
+    )
+    utilities = None if lemma_feedback else probe_utilities
+    candidates = select_top_profiles(ranked, utilities)
+    return ranked, candidates, reasons
+
+
 def profile_utility_from_stats(
     *,
     backend: str,

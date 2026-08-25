@@ -30,17 +30,17 @@ from solver_routing import (
     probe_timeout_s,
     probes_enabled,
     profile_utility_from_stats,
+    rank_profiles_for_attempt,
     recommend_profiles,
     record_pair_attempt,
     record_profile_history,
-    select_top_profiles,
+    collect_feedback_signal_kinds,
     set_routing_candidates,
     routing_enabled,
 )
 from profile_selector import (
     choose_joint_action,
     llm_selector_enabled,
-    routing_decider_mode,
 )
 from theory_features import analyze_smt
 
@@ -77,6 +77,7 @@ def _empty_failed_data() -> dict:
         "invalid_lemmas": [],
         "useless_lemma_groups": [],
         "progress_lemmas": [],
+        "progress_routing_signals": [],
         "repair_hints": [],
         "unproved_lemmas": [],
         "routing": {},
@@ -96,6 +97,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("invalid_lemmas", [])
             data.setdefault("useless_lemma_groups", [])
             data.setdefault("progress_lemmas", [])
+            data.setdefault("progress_routing_signals", [])
             data.setdefault("repair_hints", [])
             data.setdefault("unproved_lemmas", [])
             data.setdefault("routing", {})
@@ -413,15 +415,6 @@ def record_solver_attempt(
         and result.strategy in state.fallback_profiles
         and result.strategy not in state.candidate_profiles
     )
-    utility = None
-    if routing_decider_mode() != "llm" and result.proved:
-        utility, _ = profile_utility_from_stats(
-            backend="vampire",
-            proved=result.proved,
-            status=result.status,
-            stats=result.stats,
-            elapsed=result.elapsed,
-        )
     state = record_pair_attempt(
         state,
         prompt_strategy=prompt_strategy,
@@ -429,7 +422,7 @@ def record_solver_attempt(
         status=result.status,
         proved=result.proved,
         elapsed=result.elapsed,
-        utility=utility,
+        utility=None,
         signals=hint_kinds,
         fallback_used=fallback_used,
         winner_profile=result.strategy if result.proved else None,
@@ -754,6 +747,7 @@ def analyze_lemma_progress(
         _store_cached_diag(base_path, goal_name, "control_diag", control)
 
     progressive: List[Tuple[float, str, List[str]]] = []
+    observed_signals: List[str] = []
     for idx, lemma in enumerate(_progress_singleton_lemmas(asserts), 1):
         cand_path = work_dir / f"{goal_name}_diag_lemma_{idx}.smt2"
         _write_combined_smt(original_assert, [lemma], original_content, cand_path, named=False)
@@ -761,6 +755,7 @@ def analyze_lemma_progress(
             cand_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
         )
         score, signals = compute_progress_score(progress_baseline, cand, control=control)
+        observed_signals.extend(signals)
         logging.info(
             "诊断单条#%d score=%.2f signals=%s",
             idx, score, signals,
@@ -770,6 +765,12 @@ def analyze_lemma_progress(
             add_progress_lemma(
                 base_path, goal_name, lemma, score, signals, profile=diag
             )
+
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["progress_routing_signals"] = collect_feedback_signal_kinds(
+        extra=observed_signals
+    )
+    save_failed_lemmas(base_path, goal_name, failed_data)
 
     seen = set()
     ordered: List[str] = []
@@ -881,6 +882,9 @@ def verify_combined_lemmas(
                 )
             ),
             "induction_focus": baseline.induction_focus[:6],
+            "progress_signals": load_failed_lemmas(
+                base_path, goal_name
+            ).get("progress_routing_signals") or [],
             "suggested_actions": [
                 "Build on progress lemmas if any are listed above",
                 "Target induction focus terms reported by Vampire",
@@ -1066,11 +1070,21 @@ def select_attempt_action(
     state.parent_profile = parent_profile
     if not state.fallback_profiles:
         state.fallback_profiles = fallback_profiles_for("vampire")
-    ranked, reasons = recommend_profiles(
+    hints = failed_data.get("repair_hints") or []
+    utilities = {
+        item.get("profile"): float(item.get("utility"))
+        for item in state.profile_history
+        if item.get("profile") and item.get("utility") is not None
+    }
+    ranked, candidates, reasons = rank_profiles_for_attempt(
         "vampire",
         features,
-        failed_data.get("repair_hints") or [],
+        hints,
         parent_profile=parent_profile,
+        current_profile=state.active_profile,
+        progress_lemmas=failed_data.get("progress_lemmas") or [],
+        extra_signals=failed_data.get("progress_routing_signals") or [],
+        probe_utilities=utilities or None,
     )
     if llm_selector_enabled():
         decision = choose_joint_action(
@@ -1079,7 +1093,7 @@ def select_attempt_action(
             features=features,
             candidate_profiles=ranked,
             prompt_strategies=prompt_strategies,
-            hints=failed_data.get("repair_hints") or [],
+            hints=hints,
             history=state.pair_history,
             current_profile=state.active_profile,
             current_prompt=preferred_prompt or state.active_prompt,
@@ -1092,19 +1106,13 @@ def select_attempt_action(
         )
         state.decision_mode = "llm"
     else:
-        utilities = {
-            item.get("profile"): float(item.get("utility"))
-            for item in state.profile_history
-            if item.get("profile") and item.get("utility") is not None
-        }
-        candidates = select_top_profiles(ranked, utilities or None)
         decision = choose_joint_action(
             llm=None,
             backend="vampire",
             features=features,
             candidate_profiles=candidates,
             prompt_strategies=prompt_strategies,
-            hints=failed_data.get("repair_hints") or [],
+            hints=hints,
             history=state.pair_history,
             current_profile=state.active_profile,
             current_prompt=preferred_prompt or state.active_prompt,

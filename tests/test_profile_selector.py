@@ -201,7 +201,7 @@ def test_relative_pair_history_changes_pair() -> None:
                     "profile": "struct_induction",
                     "status": "timeout",
                     "proved": False,
-                    "utility": -1.0,
+                    "utility": None,
                 }
             ],
             current_profile="struct_induction",

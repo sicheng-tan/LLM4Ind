@@ -96,9 +96,11 @@ def choose_joint_action(
 ) -> RoutingDecision:
     """Choose a whitelisted prompt/profile pair.
 
-    In ``relative`` mode no LLM call is made.  In ``llm`` mode the model sees
-    backend-specific profile cards and returns JSON.  Any malformed or
-    out-of-set response falls back to the deterministic choice.
+    In ``relative`` mode no LLM call is made: profile order is already the
+    routing decision, and pair history only avoids repeating a failed combo.
+    In ``llm`` mode the model sees backend-specific profile cards and returns
+    JSON.  Any malformed or out-of-set response falls back to the deterministic
+    choice.
     """
     profiles = [p for p in candidate_profiles if p]
     prompts = [p for p in prompt_strategies if p]
@@ -270,45 +272,43 @@ def _select_relative_pair(
     current_profile: Optional[str],
     current_prompt: Optional[str],
 ) -> tuple[str, str]:
-    """Select a pair using static priors plus observed pair outcomes."""
+    """Pick a pair from already-ranked profiles. History only avoids repeats.
+
+    Profile order is the routing decision (static + probe + 3s progress).
+    Pair history is not scored; a failed combo is skipped once, errors more so.
+    """
+    del current_profile, current_prompt
     ordered_prompts = order_prompt_strategies(prompts, hints)
-    prompt_rank = {name: len(ordered_prompts) - idx for idx, name in enumerate(ordered_prompts)}
-    profile_rank = {name: len(profiles) - idx for idx, name in enumerate(profiles)}
-    observations: Dict[tuple[str, str], dict] = {}
-    for item in history:
-        key = (item.get("prompt_strategy", ""), item.get("profile", ""))
-        if key[0] and key[1]:
-            observations[key] = item
+    last_failed: Optional[tuple[str, str]] = None
+    for item in reversed(list(history)):
+        prompt = item.get("prompt_strategy") or ""
+        profile = item.get("profile") or ""
+        if item.get("proved") or not prompt or not profile:
+            continue
+        last_failed = (str(prompt), str(profile))
+        break
+    error_pairs = {
+        (str(item.get("prompt_strategy") or ""), str(item.get("profile") or ""))
+        for item in history
+        if item.get("status") in {"error", "invalid_lemma"}
+        and item.get("prompt_strategy")
+        and item.get("profile")
+    }
 
     best_key = (ordered_prompts[0], profiles[0])
     best_score = float("-inf")
-    for prompt in ordered_prompts:
-        for profile in profiles:
-            score = 0.25 * prompt_rank[prompt] + 0.25 * profile_rank[profile]
-            if prompt == current_prompt:
-                score += 0.1
-            if profile == current_profile:
-                score += 0.1
-            observation = observations.get((prompt, profile))
-            if observation is None:
-                score += 0.05
-            else:
-                if observation.get("proved"):
-                    score += 100.0
-                elif observation.get("status") in {"error", "invalid_lemma"}:
-                    score -= 2.0
-                elif observation.get("status") in {"timeout", "unknown", "incomplete"}:
-                    score -= 0.15
-                if observation.get("fallback_used"):
-                    score -= 0.05
-                utility = observation.get("utility")
-                if utility is not None:
-                    try:
-                        score += max(-2.0, min(3.0, float(utility)))
-                    except (TypeError, ValueError):
-                        pass
+    n_profiles = len(profiles)
+    n_prompts = len(ordered_prompts)
+    for prompt_i, prompt in enumerate(ordered_prompts):
+        for profile_i, profile in enumerate(profiles):
+            score = 10.0 * (n_profiles - profile_i) + 3.0 * (n_prompts - prompt_i)
+            key = (prompt, profile)
+            if key in error_pairs:
+                score -= 20.0
+            if last_failed is not None and key == last_failed:
+                score -= 5.0
             if score > best_score:
-                best_key = (prompt, profile)
+                best_key = key
                 best_score = score
     return best_key[1], best_key[0]
 

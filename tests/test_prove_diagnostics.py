@@ -574,6 +574,29 @@ def test_stats_without_reference_skip_utility() -> None:
         assert last["utility"] is None
 
 
+def test_proved_attempt_still_has_no_pair_utility() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.record_solver_attempt(
+            tmp,
+            "template",
+            prompt_strategy="prove_prompt",
+            selected_profile="cvc5_inductive",
+            result=CvcResult(
+                status="unsat",
+                proved=True,
+                elapsed=0.2,
+                strategy="cvc5_inductive",
+                stats={"CONJ_TOTAL": 3},
+            ),
+        )
+        last = mate.load_routing_state(tmp, "template").pair_history[-1]
+        assert last["utility"] is None
+        assert last["proved"] is True
+        assert last["winner_profile"] == "cvc5_inductive"
+
+
 def main() -> int:
     test_inject_difficulty_script()
     test_inject_difficulty_without_set_logic()
@@ -588,6 +611,8 @@ def main() -> int:
     test_subgoal_falls_back_when_cache_missing()
     test_vampire_compact_and_subgoal_cache()
     test_empty_stats_skip_hint_and_utility()
+    test_stats_without_reference_skip_utility()
+    test_proved_attempt_still_has_no_pair_utility()
     test_progress_uses_3s_short_baseline()
     test_progress_cache_reused_for_same_profile()
     test_progress_cache_invalidated_on_profile_change()
@@ -602,7 +627,6 @@ def main() -> int:
     test_trivial_implication_and_control_shape()
     test_progress_prompt_does_not_fight_useless_group()
     test_empty_llm_does_not_retry_immediately()
-    test_stats_without_reference_skip_utility()
     print("prove diagnostics tests passed")
     return 0
 
