@@ -25,6 +25,7 @@ from solver_relative_metrics import (
     INDUCTION_SHARE_MAX,
     INTEGER_INDUCTION_SHARE_MIN,
     REWRITE_PER_INDUCTION_MAX,
+    gate_overshoot,
     activity_rate,
     gain_score,
     is_relative_gain,
@@ -873,6 +874,8 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 "step (often commutativity/associativity or rewrite bridges)."
             ),
             "induction_focus": result.induction_focus[:6],
+            # Binary signal: moderate vote so it does not drown mix overshoot.
+            "strength": 0.5,
             "suggested_actions": [
                 "Generate equational lemmas about constructors appearing in the focus terms",
                 "If a recursive function appears on both sides, try a generalized form",
@@ -893,6 +896,9 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                     "Rewriting is scarce relative to induction (demod/induction < 8). "
                     "Likely missing equational lemmas that enable rewriting under the IH."
                 ),
+                "strength": round(
+                    gate_overshoot(rewrite_per_ind, REWRITE_PER_INDUCTION_MAX), 4
+                ),
                 "suggested_actions": [
                     "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
                     "Prefer lemmas whose LHS matches a subterm of the proof goal",
@@ -908,6 +914,7 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                     f"Vampire activity (<{int(INDUCTION_SHARE_MAX * 100)}%). Try a "
                     "stronger inductive lemma (generalization / strengthen conclusion)."
                 ),
+                "strength": round(gate_overshoot(ind_share, INDUCTION_SHARE_MAX), 4),
                 "suggested_actions": [
                     "Strengthen or generalize the goal into an inductive lemma",
                     "Introduce an accumulator / helper-function identity if applicable",
@@ -915,6 +922,7 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             })
 
     if arithmetic_dominant:
+        int_share = int_ind / ind
         hints.append({
             "kind": "need_arithmetic_lemma",
             "context": context,
@@ -922,6 +930,9 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 "Integer-interval induction dominates Vampire induction activity. "
                 "Prefer arithmetic bridge / monotonicity / recurrence lemmas "
                 "rather than ADT constructor facts."
+            ),
+            "strength": round(
+                gate_overshoot(int_share, INTEGER_INDUCTION_SHARE_MIN, higher=True), 4
             ),
             "suggested_actions": [
                 "Generate arithmetic bridge or monotonicity lemmas",

@@ -8,6 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import ExitStack
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -589,6 +590,254 @@ def test_prove_run_does_not_retry_after_llm_exhausted() -> None:
             routed_v.assert_not_called()
 
 
+def test_two_no_help_switches_generation_prompt() -> None:
+    import Mate_new as mate
+
+    goal_smt = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+    calls: list[str] = []
+
+    def fake_quick_run(_base, _name, prompt_strategy, *_args, **_kwargs):
+        n = len(calls)
+        calls.append(prompt_strategy)
+        if n == 0:
+            return False, [], []
+        if n == 1:
+            return False, [], ["(forall ((x Int)) (P x))"]
+        return False, [], []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(goal_smt, encoding="utf-8")
+        with patch("Mate_new.routing_enabled", return_value=False), patch(
+            "Mate_new.perform_initial_verification", return_value=False
+        ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
+            mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
+        ):
+            assert mate.prove_run(tmp, "template") is False
+
+    assert len(calls) == 6, calls
+    assert calls[:2] == [
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_equational_reasoning",
+    ], calls
+    assert calls[2:4] == [
+        "prove_prompt_term_rewrite",
+        "prove_prompt_term_rewrite",
+    ], calls
+    assert calls[4:] == [
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_equational_reasoning",
+    ], calls
+
+    calls.clear()
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(goal_smt, encoding="utf-8")
+        mate.add_repair_hints(
+            tmp,
+            "template",
+            [{"kind": "need_stronger_lemma", "detail": "strengthen", "context": "goal"}],
+        )
+        with patch("Mate_new.routing_enabled", return_value=False), patch(
+            "Mate_new.perform_initial_verification", return_value=False
+        ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
+            mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
+        ):
+            assert mate.prove_run(tmp, "template") is False
+    assert calls[0] == "prove_prompt_term_rewrite", calls
+    assert calls[2] == "prove_prompt_equational_reasoning", calls
+
+
+class _FixedRng:
+    def __init__(self, x: float) -> None:
+        self.x = x
+
+    def random(self) -> float:
+        return self.x
+
+
+_PROMPT_GOAL_SMT = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+
+
+def _collect_prove_prompts(
+    module_name: str,
+    quick_fn,
+    *,
+    hints=None,
+    routing: bool = False,
+    decision=None,
+    select_rng=None,
+    extra_patches=(),
+) -> list[str]:
+    import importlib
+    from types import SimpleNamespace
+
+    from solver_routing import select_generation_prompt as real_select
+
+    mate = importlib.import_module(module_name)
+    calls: list[str] = []
+
+    def wrapped_quick(base_path, base_name, prompt_strategy, *args, **kwargs):
+        calls.append(prompt_strategy)
+        return quick_fn(
+            len(calls) - 1, prompt_strategy, base_path=base_path, mate=mate
+        )
+
+    def wrapped_select(strategies, hint_list, *, rng=None):
+        return real_select(strategies, hint_list, rng=select_rng)
+
+    decision = decision or SimpleNamespace(
+        prompt_strategy="prove_prompt_term_rewrite",
+        profile="cvc5_inductive",
+        source="relative",
+    )
+    patches = [
+        patch(f"{module_name}.routing_enabled", return_value=routing),
+        patch(f"{module_name}.perform_initial_verification", return_value=False),
+        patch(f"{module_name}.seed_baseline_repair_hints"),
+        patch(f"{module_name}.quick_run", side_effect=wrapped_quick),
+        patch.dict(mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}),
+    ]
+    if routing:
+        patches.append(
+            patch(
+                f"{module_name}.select_attempt_action",
+                return_value=(SimpleNamespace(), decision),
+            )
+        )
+    if select_rng is not None:
+        patches.append(patch(f"{module_name}.select_generation_prompt", wrapped_select))
+    patches.extend(extra_patches)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_PROMPT_GOAL_SMT, encoding="utf-8")
+        if hints:
+            mate.add_repair_hints(tmp, "template", hints)
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            mate.prove_run(tmp, "template")
+    return calls
+
+
+def test_two_no_help_switches_on_vampire_loop() -> None:
+    def quick(n, _prompt, **_kwargs):
+        return False, [], []
+
+    for module_name in ("Mate_new", "Mate_new_vampire"):
+        calls = _collect_prove_prompts(module_name, quick)
+        assert calls[:2] == [
+            "prove_prompt_equational_reasoning",
+            "prove_prompt_equational_reasoning",
+        ], (module_name, calls)
+        assert calls[2:4] == [
+            "prove_prompt_term_rewrite",
+            "prove_prompt_term_rewrite",
+        ], (module_name, calls)
+
+
+def test_routing_does_not_override_generation_prompt() -> None:
+    from types import SimpleNamespace
+
+    def quick(_n, _prompt, **_kwargs):
+        return False, [], []
+
+    hijack = SimpleNamespace(
+        prompt_strategy="prove_prompt_term_rewrite",
+        profile="cvc5_inductive",
+        source="relative",
+    )
+    calls = _collect_prove_prompts(
+        "Mate_new", quick, routing=True, decision=hijack
+    )
+    assert calls[0] == "prove_prompt_equational_reasoning", calls
+    assert "prove_prompt_term_rewrite" not in calls[:2], calls
+
+
+def test_prove_run_samples_when_both_kind_families() -> None:
+    def quick(_n, _prompt, **_kwargs):
+        return False, [], []
+
+    hints = [
+        {"kind": "need_stronger_lemma", "strength": 0.9, "detail": "g", "context": "goal"},
+        {"kind": "need_rewrite", "strength": 0.1, "detail": "r", "context": "goal"},
+    ]
+    rewrite = _collect_prove_prompts(
+        "Mate_new",
+        quick,
+        hints=hints,
+        select_rng=_FixedRng(0.05),
+    )
+    assert rewrite[0] == "prove_prompt_term_rewrite", rewrite
+    assert rewrite[1] == "prove_prompt_term_rewrite", rewrite
+    equational = _collect_prove_prompts(
+        "Mate_new",
+        quick,
+        hints=hints,
+        select_rng=_FixedRng(0.95),
+    )
+    assert equational[0] == "prove_prompt_equational_reasoning", equational
+
+
+def test_useful_subgoal_failure_resets_no_help_streak() -> None:
+    def quick(n, _prompt, **_kwargs):
+        if n == 0:
+            return True, ["template_1"], ["(forall ((x Int)) (P x))"]
+        return False, [], []
+
+    calls = _collect_prove_prompts(
+        "Mate_new",
+        quick,
+        extra_patches=(
+            patch("Mate_new.prove_subgoals_parallel", return_value=False),
+        ),
+    )
+    assert calls[0] == "prove_prompt_equational_reasoning", calls
+    assert calls[1] == "prove_prompt_equational_reasoning", calls
+    assert calls[2] == "prove_prompt_equational_reasoning", calls
+    assert calls[3] == "prove_prompt_term_rewrite", calls
+
+
+def test_timeout_breaks_no_help_streak() -> None:
+    def quick(n, _prompt, **_kwargs):
+        if n == 1:
+            raise TimeoutError("attempt timeout")
+        return False, [], []
+
+    calls = _collect_prove_prompts("Mate_new", quick)
+    assert calls[:4] == [
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_equational_reasoning",
+    ], calls
+    assert calls[4] == "prove_prompt_term_rewrite", calls
+
+
+def test_kind_feedback_switches_after_one_no_help() -> None:
+    def quick(n, _prompt, **kwargs):
+        if n == 0:
+            kwargs["mate"].add_repair_hints(
+                kwargs["base_path"],
+                "template",
+                [{"kind": "need_stronger_lemma", "detail": "g", "context": "goal"}],
+            )
+        return False, [], []
+
+    calls = _collect_prove_prompts("Mate_new", quick)
+    assert calls[0] == "prove_prompt_equational_reasoning", calls
+    assert calls[1] == "prove_prompt_term_rewrite", calls
+
+
 def test_stats_without_reference_skip_utility() -> None:
     import Mate_new as mate
 
@@ -658,6 +907,13 @@ def main() -> int:
     test_progress_prompt_does_not_fight_useless_group()
     test_empty_llm_does_not_retry_immediately()
     test_prove_run_does_not_retry_after_llm_exhausted()
+    test_two_no_help_switches_generation_prompt()
+    test_two_no_help_switches_on_vampire_loop()
+    test_routing_does_not_override_generation_prompt()
+    test_prove_run_samples_when_both_kind_families()
+    test_useful_subgoal_failure_resets_no_help_streak()
+    test_timeout_breaks_no_help_streak()
+    test_kind_feedback_switches_after_one_no_help()
     print("prove diagnostics tests passed")
     return 0
 

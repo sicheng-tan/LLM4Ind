@@ -11,7 +11,9 @@ Mate persists the routing state in failed_lemmas.json.
 
 from __future__ import annotations
 
+import logging
 import os
+import random
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -101,6 +103,9 @@ _GENERALIZE_HINTS = {
     "need_arithmetic_lemma",
 }
 _EXPLOSION_HINTS = {"search_explosion", "timeout"}
+
+EQUATIONAL_PROMPT = "prove_prompt_equational_reasoning"
+TERM_REWRITE_PROMPT = "prove_prompt_term_rewrite"
 
 
 @dataclass
@@ -575,16 +580,198 @@ def order_prompt_strategies(
     strategies: Sequence[str],
     hints: Sequence[dict],
 ) -> List[str]:
-    """Reorder the paper prompt pool; never drop a strategy."""
+    """Reorder the paper prompt pool; never drop a strategy.
+
+    One hint family: that family goes first. Both families: keep the given
+    order — ``select_generation_prompt`` samples instead of preferring
+    generalize.
+    """
     kinds = set(hint_kinds(hints))
+    has_generalize = bool(kinds & _GENERALIZE_HINTS)
+    has_rewrite = bool(kinds & _REWRITE_HINTS)
+    if has_generalize and has_rewrite:
+        return list(strategies)
     prefer: Optional[str] = None
-    if kinds & _GENERALIZE_HINTS:
-        prefer = "prove_prompt_term_rewrite"
-    elif kinds & _REWRITE_HINTS:
-        prefer = "prove_prompt_equational_reasoning"
+    if has_generalize:
+        prefer = TERM_REWRITE_PROMPT
+    elif has_rewrite:
+        prefer = EQUATIONAL_PROMPT
     if not prefer:
         return list(strategies)
-    return sorted(strategies, key=lambda s: 0 if prefer in s else 1)
+    return sorted(strategies, key=lambda s: 0 if s == prefer else 1)
+
+
+# Consecutive empty / invalid / useless attempts before switching generation mode.
+NO_HELP_PROMPT_SWITCH = 2
+# Present-but-zero overshoot still votes, so a kind on the gate is not dropped.
+_FAMILY_STRENGTH_FLOOR = 0.05
+_prompt_mode_rng: Optional[random.Random] = None
+
+
+def _hint_strength(hint: dict) -> float:
+    raw = hint.get("strength")
+    if raw is None:
+        return 1.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def prompt_family_scores(hints: Sequence[dict]) -> Tuple[float, float]:
+    """Return (rewrite_family, generalize_family) weights. 0 means the family is absent."""
+    rewrite = 0.0
+    generalize = 0.0
+    rewrite_seen = False
+    generalize_seen = False
+    for hint in hints:
+        kind = str(hint.get("kind") or "")
+        if kind in _REWRITE_HINTS:
+            rewrite_seen = True
+            rewrite += _hint_strength(hint)
+        elif kind in _GENERALIZE_HINTS:
+            generalize_seen = True
+            generalize += _hint_strength(hint)
+    if rewrite_seen:
+        rewrite = max(rewrite, _FAMILY_STRENGTH_FLOOR)
+    if generalize_seen:
+        generalize = max(generalize, _FAMILY_STRENGTH_FLOOR)
+    return rewrite, generalize
+
+
+def term_rewrite_sample_prob(hints: Sequence[dict]) -> Optional[float]:
+    """P(term-rewrite template) when both families fire; otherwise None."""
+    rewrite, generalize = prompt_family_scores(hints)
+    if rewrite <= 0 or generalize <= 0:
+        return None
+    return generalize / (generalize + rewrite)
+
+
+def prompt_kind_signature(hints: Sequence[dict]) -> str:
+    """Coarse family set: none / rewrite / generalize / both."""
+    rewrite, generalize = prompt_family_scores(hints)
+    if rewrite > 0 and generalize > 0:
+        return "both"
+    if generalize > 0:
+        return "generalize"
+    if rewrite > 0:
+        return "rewrite"
+    return "none"
+
+
+def _prompt_mode_rng_instance() -> random.Random:
+    global _prompt_mode_rng
+    if _prompt_mode_rng is None:
+        seed = os.getenv("PROMPT_MODE_SEED", "").strip()
+        if not seed:
+            _prompt_mode_rng = random.Random()
+        else:
+            try:
+                _prompt_mode_rng = random.Random(int(seed))
+            except ValueError:
+                _prompt_mode_rng = random.Random(seed)
+    return _prompt_mode_rng
+
+
+def reset_prompt_mode_rng() -> None:
+    """Drop the process RNG so the next call re-reads ``PROMPT_MODE_SEED``."""
+    global _prompt_mode_rng
+    _prompt_mode_rng = None
+
+
+def select_generation_prompt(
+    strategies: Sequence[str],
+    hints: Sequence[dict],
+    *,
+    rng: Optional[random.Random] = None,
+) -> str:
+    """Starting LLM template from existing repair-hint kinds.
+
+    One family: deterministic (hint order). Both families: sample with
+    P(term_rewrite) = generalize_strength / (generalize + rewrite), using
+    mix-gate overshoot stored on each hint. Does not drop a strategy from the pool.
+    """
+    pool = [s for s in strategies if s]
+    if not pool:
+        return ""
+    p_rewrite = term_rewrite_sample_prob(hints)
+    if p_rewrite is None:
+        return order_prompt_strategies(pool, hints)[0]
+    if TERM_REWRITE_PROMPT not in pool or EQUATIONAL_PROMPT not in pool:
+        return order_prompt_strategies(pool, hints)[0]
+    sampler = rng if rng is not None else _prompt_mode_rng_instance()
+    pick = TERM_REWRITE_PROMPT if sampler.random() < p_rewrite else EQUATIONAL_PROMPT
+    rewrite_score, generalize_score = prompt_family_scores(hints)
+    logging.info(
+        "两类 prompt-kind 同时存在，P(term_rewrite)=%.3f (generalize=%.3f rewrite=%.3f) → %s",
+        p_rewrite,
+        generalize_score,
+        rewrite_score,
+        pick,
+    )
+    return pick
+
+
+def advance_generation_prompt(
+    strategies: Sequence[str],
+    current: str,
+    consecutive_no_help: int,
+    *,
+    switch_after: int = NO_HELP_PROMPT_SWITCH,
+) -> Tuple[str, int, bool]:
+    """Toggle the other paper prompt after consecutive empty/invalid/useless attempts.
+
+    Hint kinds only pick the starting template. This helper does not read or
+    rewrite repair hints; it only changes which generation template is used next.
+    """
+    pool = [s for s in strategies if s]
+    if not pool:
+        return current or "", consecutive_no_help, False
+    if current not in pool:
+        return pool[0], 0, bool(current) and current != pool[0]
+    if consecutive_no_help < switch_after or len(pool) < 2:
+        return current, consecutive_no_help, False
+    nxt = pool[(pool.index(current) + 1) % len(pool)]
+    return nxt, 0, True
+
+
+def retarget_generation_prompt(
+    strategies: Sequence[str],
+    hints: Sequence[dict],
+    current: str,
+    consecutive_no_help: int,
+    last_signature: str,
+    *,
+    rng: Optional[random.Random] = None,
+    switch_after: int = NO_HELP_PROMPT_SWITCH,
+) -> Tuple[str, int, str, str]:
+    """After a no-help attempt, maybe change the generation template.
+
+    - Kind family set changed: re-run one-family kind pick or both-family sample.
+    - Same family set: only consecutive empty/invalid/useless can toggle.
+
+    Returns (prompt, consecutive_no_help, signature, reason)
+    with reason in ``kind`` / ``consecutive`` / ``keep``.
+    """
+    signature = prompt_kind_signature(hints)
+    if signature != last_signature:
+        nxt = select_generation_prompt(strategies, hints, rng=rng)
+        if nxt != current:
+            logging.info(
+                "失败反馈 kind %s → %s，切换 prompt %s → %s",
+                last_signature,
+                signature,
+                current,
+                nxt,
+            )
+            return nxt, 0, signature, "kind"
+        return current, consecutive_no_help, signature, "keep"
+    nxt, consecutive_no_help, switched = advance_generation_prompt(
+        strategies, current, consecutive_no_help, switch_after=switch_after
+    )
+    if switched:
+        return nxt, consecutive_no_help, signature, "consecutive"
+    return current, consecutive_no_help, signature, "keep"
 
 
 def prompt_guidance_for(backend: str, profile: Optional[str]) -> str:

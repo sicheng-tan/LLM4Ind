@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from solver_relative_metrics import (
+    INDUCTION_SHARE_MAX,
+    REWRITE_PER_INDUCTION_MAX,
     activity_rate,
+    gate_overshoot,
     in_problem_hard_cutoff,
     is_relative_drop,
     is_relative_gain,
@@ -176,6 +179,54 @@ def test_cvc_mix_hints_small_problem() -> None:
     kinds_both = {h["kind"] for h in hints_both}
     _ok("need_stronger_lemma" in kinds_both and "need_rewrite" in kinds_both,
         f"both mix hints may fire: {hints_both}")
+    by_kind = {h["kind"]: h for h in hints_both}
+    stronger = by_kind["need_stronger_lemma"]["strength"]
+    rewrite = by_kind["need_rewrite"]["strength"]
+    _ok(abs(stronger - gate_overshoot(2 / 100, 0.05)) < 1e-4, stronger)
+    _ok(abs(rewrite - gate_overshoot(1 / 3, 0.75)) < 1e-4, rewrite)
+    _ok(stronger > 0 and rewrite > 0, (stronger, rewrite))
+
+
+def test_gate_overshoot_bounds() -> None:
+    _ok(abs(gate_overshoot(0.0, 0.05) - 1.0) < 1e-9, "at zero")
+    _ok(abs(gate_overshoot(0.05, 0.05)) < 1e-9, "on the lower gate")
+    _ok(abs(gate_overshoot(0.70, 0.70, higher=True)) < 1e-9, "on the higher gate")
+    _ok(abs(gate_overshoot(1.0, 0.70, higher=True) - 1.0) < 1e-9, "share=1")
+
+
+def test_vampire_mix_strength_and_both_families() -> None:
+    elapsed = 3.0
+    rewrite_only = vampire_hints(VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={"InductionApplications": 4, "StructuralInduction": 2, "Fw demodulations": 8},
+    ))
+    by_kind = {h["kind"]: h for h in rewrite_only}
+    _ok("need_rewrite" in by_kind, rewrite_only)
+    ind = 4 + 2
+    rewrite_per_ind = 8 / ind
+    _ok(
+        abs(by_kind["need_rewrite"]["strength"] - gate_overshoot(
+            rewrite_per_ind, REWRITE_PER_INDUCTION_MAX
+        )) < 1e-4,
+        by_kind["need_rewrite"],
+    )
+
+    both = vampire_hints(VampireResult(
+        status="timeout", elapsed=elapsed,
+        induction_focus=["(P x)"],
+        stats={"InductionApplications": 1, "Fw demodulations": 6},
+    ))
+    kinds = {h["kind"]: h for h in both}
+    _ok("need_rewrite" in kinds and "need_induction_lemma" in kinds, both)
+    _ok(kinds["induction_stuck"]["strength"] == 0.5, kinds["induction_stuck"])
+    _ok(
+        abs(kinds["need_rewrite"]["strength"] - gate_overshoot(6 / 1, REWRITE_PER_INDUCTION_MAX)) < 1e-4,
+        kinds["need_rewrite"],
+    )
+    _ok(
+        abs(kinds["need_induction_lemma"]["strength"] - gate_overshoot(1 / 7, INDUCTION_SHARE_MAX)) < 1e-4,
+        kinds["need_induction_lemma"],
+    )
 
 
 def test_vampire_small_vs_large() -> None:
@@ -378,6 +429,8 @@ def main() -> int:
         test_cvc_small_vs_large_progress,
         test_cvc_difficulty_relative,
         test_cvc_mix_hints_small_problem,
+        test_gate_overshoot_bounds,
+        test_vampire_mix_strength_and_both_families,
         test_vampire_small_vs_large,
         test_vampire_explosion_and_mix,
         test_integer_induction_in_mix_share,

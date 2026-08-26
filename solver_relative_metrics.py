@@ -48,6 +48,28 @@ def log_gain(candidate: float, reference: float) -> float:
     return math.log1p(max(float(candidate), 0.0)) - math.log1p(max(float(reference), 0.0))
 
 
+def gate_overshoot(
+    value: float,
+    threshold: float,
+    *,
+    higher: bool = False,
+) -> float:
+    """How far ``value`` is past a mix gate, scaled into ``[0, 1]``.
+
+    Lower-than-threshold gates (the usual mix hints): 0 on the line, 1 at 0.
+    Higher-than-threshold gates (e.g. integer-induction share): 0 on the line,
+    1 at 1.0. Used as a sampling weight when both prompt-mode families fire.
+    """
+    v = float(value)
+    t = float(threshold)
+    if higher:
+        denom = max(1.0 - t, 1e-9)
+        return min(1.0, max(0.0, (v - t) / denom))
+    if t <= 0:
+        return 1.0 if v <= 0 else 0.0
+    return min(1.0, max(0.0, (t - v) / t))
+
+
 def relative_increase(
     candidate: float,
     reference: float,

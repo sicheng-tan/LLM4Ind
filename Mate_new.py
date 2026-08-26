@@ -27,7 +27,10 @@ from solver_routing import (
     build_search_state,
     fallback_profiles_for,
     format_routing_for_prompt,
-    order_prompt_strategies,
+    select_generation_prompt,
+    retarget_generation_prompt,
+    prompt_kind_signature,
+    NO_HELP_PROMPT_SWITCH,
     probe_profile_count,
     probe_timeout_s,
     probes_enabled,
@@ -1651,80 +1654,98 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
     
     select_use_prompt_strategies = ours_prompt_strategies
 
+    strategies = select_use_prompt_strategies["strategies"]
     max_attempts_per_prompt = select_use_prompt_strategies["max_attempts"]
+    total_attempts = max_attempts_per_prompt * max(1, len(strategies))
     hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
-    prompt_order = order_prompt_strategies(
-        select_use_prompt_strategies["strategies"], hint_list
-    )
+    current_prompt = select_generation_prompt(strategies, hint_list)
+    kind_signature = prompt_kind_signature(hint_list)
+    consecutive_no_help = 0
 
-    # Keep the paper's bounded prompt loop. In routing mode, each attempt
-    # chooses a fresh prompt/profile pair from the latest feedback.
-    for prompt_idx, default_prompt in enumerate(prompt_order):
-        logging.info(f"[策略{prompt_idx+1}] 处理 {base_name} - 默认提示 {default_prompt}")
-        for attempt in range(max_attempts_per_prompt):
-            prompt_strategy = default_prompt
-            solver_profile = None
-            decision_source = None
-            if routing_enabled():
-                state, decision = select_attempt_action(
-                    base_path,
-                    base_name,
-                    select_use_prompt_strategies["strategies"],
-                    parent_goal_name=parent_goal_name,
-                    preferred_prompt=default_prompt,
-                )
-                prompt_strategy = decision.prompt_strategy
-                solver_profile = decision.profile
-                decision_source = decision.source
-            logging.info(
-                "[主阶段] 处理 %s - 第%d/%d次尝试(prompt=%s, profile=%s)",
+    # Shared 2×3 budget. One kind family picks the template; both families
+    # sample once. A later change in that family set can switch immediately.
+    # If kinds stay the same, two consecutive empty/invalid/useless attempts
+    # toggle the other template. Repair hints still go into the chosen template.
+    for attempt in range(total_attempts):
+        prompt_strategy = current_prompt
+        solver_profile = None
+        decision_source = None
+        if routing_enabled():
+            state, decision = select_attempt_action(
+                base_path,
                 base_name,
-                attempt + 1,
-                max_attempts_per_prompt,
-                prompt_strategy,
-                solver_profile or "paper_portfolio",
+                [current_prompt] if current_prompt else strategies,
+                parent_goal_name=parent_goal_name,
+                preferred_prompt=current_prompt,
             )
-            try:
-                ret, new_subgoals, extracted_asserts = quick_run(
-                    base_path,
-                    base_name,
-                    prompt_strategy,
-                    select_use_prompt_strategies["folder_path"],
-                    baseline_only=False,
-                    solver_profile=solver_profile,
-                    decision_source=decision_source,
+            solver_profile = decision.profile
+            decision_source = decision.source
+        logging.info(
+            "[主阶段] 处理 %s - 第%d/%d次尝试(prompt=%s, profile=%s)",
+            base_name,
+            attempt + 1,
+            total_attempts,
+            prompt_strategy,
+            solver_profile or "paper_portfolio",
+        )
+        try:
+            ret, new_subgoals, extracted_asserts = quick_run(
+                base_path,
+                base_name,
+                prompt_strategy,
+                select_use_prompt_strategies["folder_path"],
+                baseline_only=False,
+                solver_profile=solver_profile,
+                decision_source=decision_source,
+            )
+            # ret为True代表发现了可能会有用的子目标 不代表证明成功
+            # lemma 被quick filtering了
+            # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
+            if ret:
+                consecutive_no_help = 0
+                logging.info(f"🎯 策略 {prompt_strategy} 第{attempt+1}次尝试搜寻可能有用的引理成功！")
+
+                # 成功证明的情况，没有subgoal了
+                if not new_subgoals:
+                    logging.info(f"🏆 子目标 {base_name} 完成证明！")
+                    return True
+
+                # 处理子目标 - 使用并行执行
+                logging.info(f"🔍 发现子目标: {new_subgoals}")
+                # 传递当前生成的引理和目标名称
+                current_lemmas = extracted_asserts
+                if prove_subgoals_parallel(base_path, new_subgoals, depth, strategy_mode, baseline_only, current_lemmas, base_name):
+                    logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
+                    return True
+                logging.warning(f"💥 子目标验证失败，继续尝试下一次生成")
+                continue
+
+            consecutive_no_help += 1
+            hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+            nxt, consecutive_no_help, kind_signature, why = retarget_generation_prompt(
+                strategies,
+                hint_list,
+                current_prompt,
+                consecutive_no_help,
+                kind_signature,
+            )
+            if why == "consecutive":
+                logging.info(
+                    "连续空/无效/无用达到%d次，切换 prompt %s → %s",
+                    NO_HELP_PROMPT_SWITCH,
+                    current_prompt,
+                    nxt,
                 )
-                # ret为True代表发现了可能会有用的子目标 不代表证明成功
-                # lemma 被quick filtering了 
-                # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
-                if ret:
-                    logging.info(f"🎯 策略 {prompt_strategy} 第{attempt+1}次尝试搜寻可能有用的引理成功！")
-                    
-                    # 成功证明的情况，没有subgoal了
-                    if not new_subgoals:
-                        logging.info(f"🏆 子目标 {base_name} 完成证明！")
-                        return True
+            current_prompt = nxt
 
-                    # 处理子目标 - 使用并行执行
-                    logging.info(f"🔍 发现子目标: {new_subgoals}")
-                    # 传递当前生成的引理和目标名称
-                    current_lemmas = extracted_asserts
-                    if prove_subgoals_parallel(base_path, new_subgoals, depth, strategy_mode, baseline_only, current_lemmas, base_name):
-                        logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
-                        return True
-                    else:
-                        logging.warning(f"💥 子目标验证失败，继续尝试下一次生成")
-                        # 不直接返回False，而是继续下一次尝试
-                        continue
-                    
-            except TimeoutError:
-                logging.warning(f"策略 {prompt_strategy} 第{attempt+1}次尝试超时")
-                continue
-            except Exception as e:
-                logging.error(f"策略 {prompt_strategy} 第{attempt+1}次尝试出错: {e}")
-                continue
-
-        logging.error(f"策略 {default_prompt} 所有尝试均失败，切换到下一个策略")
+        except TimeoutError:
+            logging.warning(f"策略 {prompt_strategy} 第{attempt+1}次尝试超时")
+            consecutive_no_help = 0
+            continue
+        except Exception as e:
+            logging.error(f"策略 {prompt_strategy} 第{attempt+1}次尝试出错: {e}")
+            consecutive_no_help = 0
+            continue
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")

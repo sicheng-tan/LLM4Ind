@@ -35,6 +35,7 @@ from solver_relative_metrics import (
     INST_OF_MATCHING_MAX,
     LOG_GAIN_MIN,
     SKOLEM_PER_CONJ_MAX,
+    gate_overshoot,
     activity_rate,
     gain_score,
     in_problem_hard_cutoff,
@@ -1205,6 +1206,7 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                     "Skolem/induction strengthening is low relative to conjecture-gen "
                     "(skolem/conj ≤ 0.05). Likely missing a stronger inductive lemma."
                 ),
+                "strength": round(gate_overshoot(skol_per_conj, SKOLEM_PER_CONJ_MAX), 4),
                 "suggested_actions": [
                     "Strengthen or generalize the goal into an inductive lemma",
                     "Try associativity/commutativity/distributivity style facts",
@@ -1220,6 +1222,7 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                     "skolem+matching activity. Missing rewrite-oriented lemmas "
                     "may be blocking matching."
                 ),
+                "strength": round(gate_overshoot(inst_of_matching, INST_OF_MATCHING_MAX), 4),
                 "suggested_actions": [
                     "Propose rewrite lemmas whose LHS matches a subterm of the goal",
                     "Unfold recursive definitions one step in a lemma",
