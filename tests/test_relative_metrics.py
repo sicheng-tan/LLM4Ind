@@ -26,7 +26,13 @@ from solver_relative_metrics import (
     log_gain,
     percentile,
 )
-from cvc5_runner import CvcResult, compute_progress_score, derive_repair_hints
+from cvc5_runner import (
+    CvcResult,
+    compute_progress_score,
+    derive_repair_hints,
+    parse_cvc_instantiations,
+    rarely_instantiated_axioms,
+)
 from vampire_runner import VampireResult, compute_progress_score as vampire_score
 from vampire_runner import derive_repair_hints as vampire_hints
 
@@ -420,6 +426,138 @@ def test_activity_rate() -> None:
     _ok(activity_rate(10, 0.0) > 0, "zero elapsed uses min window")
 
 
+def test_vampire_directed_rewrite_and_depth() -> None:
+    directed = vampire_hints(VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        stats={
+            "Forward superposition": 80,
+            "Backward superposition": 0,
+            "Fw demodulations": 0,
+            "Fw demodulations to eq. taut.": 0,
+        },
+    ))
+    kinds = [h["kind"] for h in directed]
+    _ok("need_directed_rewrite" in kinds, f"sup ≫ rewrite product: {directed}")
+
+    quiet = vampire_hints(VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        stats={
+            "Forward superposition": 4,
+            "Fw demodulations": 10,
+            "Fw demodulations to eq. taut.": 2,
+        },
+    ))
+    _ok(
+        not any(h["kind"] == "need_directed_rewrite" for h in quiet),
+        f"modest superposition should not fire: {quiet}",
+    )
+
+    deep = vampire_hints(VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        stats={"MaxInductionDepth": 2, "InductionApplications": 4, "Fw demodulations": 10},
+    ))
+    _ok(
+        any(h["kind"] == "induction_depth_limit" for h in deep),
+        f"depth>=2 with induction: {deep}",
+    )
+    shallow = vampire_hints(VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        stats={"MaxInductionDepth": 1, "InductionApplications": 4, "Fw demodulations": 10},
+    ))
+    _ok(
+        not any(h["kind"] == "induction_depth_limit" for h in shallow),
+        f"depth=1 must not fire: {shallow}",
+    )
+
+    schema = vampire_hints(VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        induction_focus=["plus"],
+        induction_formulas=[
+            "![X]: (plus(zero,X) = X => plus(succ(zero),X) = succ(X)) [structural]"
+        ],
+        stats={"InductionApplications": 2},
+    ))
+    stuck = next(h for h in schema if h["kind"] == "induction_stuck")
+    _ok(stuck.get("induction_formulas"), f"schemas on stuck hint: {stuck}")
+    _ok(
+        all("[structural]" not in s for s in stuck["induction_formulas"]),
+        stuck["induction_formulas"],
+    )
+
+
+def test_vampire_superposition_explosion_without_rewrite() -> None:
+    elapsed = 3.0
+    base = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={
+            "Generated clauses": 100,
+            "Final passive clauses": 40,
+            "Fw demodulations": 20,
+            "InductionApplications": 1,
+            "Forward superposition": 10,
+        },
+    )
+    boom = VampireResult(
+        status="timeout", elapsed=elapsed,
+        stats={
+            "Generated clauses": 100,
+            "Final passive clauses": 40,
+            "Fw demodulations": 20,
+            "InductionApplications": 1,
+            "Forward superposition": 2000,
+        },
+    )
+    score, signals = vampire_score(base, boom, control=base)
+    _ok(any(s.startswith("search_explosion") for s in signals), f"sup flood: {signals}")
+    _ok(score <= 0, f"sup flood without rewrite product: {score} {signals}")
+
+
+def test_cvc_instantiation_parse_and_rare_axioms() -> None:
+    axiom = "(forall ((n Nat)) (= (plus zero n) n))"
+    unmatched = "(forall ((n Nat)) (= (plus n zero) n))"
+    goal = "(not (forall ((x Nat)) (= (plus x x) x)))"
+    text = (
+        f"(num-instantiations plus.zero 12)\n"
+        f"(num-instantiations {axiom} 4)\n"
+    )
+    items = parse_cvc_instantiations(text)
+    by_term = {t: n for t, n in items}
+    _ok(by_term.get("plus.zero") == 12, f"qid count: {items}")
+    _ok(any(t.startswith("(") and "plus" in t and n == 4 for t, n in items), items)
+
+    rare = rarely_instantiated_axioms(
+        [unmatched, axiom],
+        [(axiom, 4)],
+    )
+    _ok(unmatched in rare, f"unmatched formula-shaped: {rare}")
+    _ok(axiom not in rare, f"matched axiom is not rare: {rare}")
+
+    qid_only = rarely_instantiated_axioms(
+        [unmatched, axiom],
+        [("plus.zero", 12)],
+    )
+    _ok(qid_only == [], f"qid-only dump must not mark axioms rare: {qid_only}")
+
+    hints = derive_repair_hints(CvcResult(
+        status="timeout",
+        elapsed=3.0,
+        difficulty=[(unmatched, 20), (axiom, 10), (goal, 3)],
+        instantiations=[(axiom, 4)],
+        goal_term=goal,
+    ))
+    hard = next(h for h in hints if h["kind"] == "high_difficulty_assertions")
+    _ok(unmatched in (hard.get("rarely_instantiated") or []), hard)
+    _ok(
+        any("rarely instantiated" in a.lower() or "LHS" in a for a in hard.get("suggested_actions") or []),
+        hard.get("suggested_actions"),
+    )
+
+
 def main() -> int:
     tests = [
         test_log_gain_scale_free,
@@ -438,6 +576,9 @@ def main() -> int:
         test_integer_induction_counts_as_progress,
         test_cvc_inst_conj_flood_is_explosion,
         test_activity_rate,
+        test_vampire_directed_rewrite_and_depth,
+        test_vampire_superposition_explosion_without_rewrite,
+        test_cvc_instantiation_parse_and_rare_axioms,
     ]
     failed = 0
     for fn in tests:

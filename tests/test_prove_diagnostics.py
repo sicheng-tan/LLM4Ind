@@ -74,6 +74,7 @@ def test_cvc_prove_cmd_adds_stats_and_tlimit() -> None:
         collect_difficulty=True,
     )
     assert "--stats" in cmd
+    assert "-o" in cmd and "inst" in cmd
     assert "--tlimit-per=60000" in cmd
     assert cmd[-1] == "goal.smt2"
 
@@ -82,6 +83,7 @@ def test_cvc_prove_cmd_adds_stats_and_tlimit() -> None:
         cvc4, Path("goal.smt2"), 60, collect_stats=True, collect_difficulty=True
     )
     assert "--stats" not in cmd4
+    assert "inst" not in cmd4
 
 
 def test_vampire_command_show_induction() -> None:
@@ -118,12 +120,14 @@ def test_cvc_compact_roundtrip() -> None:
         strategy="cvc5_inductive",
         stats={"CONJ_TOTAL": 8, "INST_TOTAL": 3},
         difficulty=[("(forall ((x Int)) (P x))", 11)],
+        instantiations=[("(forall ((x Int)) (P x))", 3)],
     )
     restored = mate._cvc_diag_from_compact(mate._compact_cvc_diag(original))
     assert restored is not None
     assert restored.status == "timeout"
     assert restored.stats["CONJ_TOTAL"] == 8
     assert restored.difficulty[0][1] == 11
+    assert restored.instantiations == [("(forall ((x Int)) (P x))", 3)]
 
 
 def test_initial_verify_caches_baseline_without_diagnostic() -> None:
@@ -233,11 +237,13 @@ def test_vampire_compact_and_subgoal_cache() -> None:
         status="timeout",
         stats={"InductionApplications": 6},
         induction_focus=["(P (succ x))"],
+        induction_formulas=["![X]: (P(X) => P(succ(X)))"],
         strategy="induction_portfolio",
     )
     restored = mv._vampire_diag_from_compact(mv._compact_vampire_diag(original))
     assert restored is not None
     assert restored.induction_focus == ["(P (succ x))"]
+    assert restored.induction_formulas == ["![X]: (P(X) => P(succ(X)))"]
 
     with tempfile.TemporaryDirectory() as tmp:
         mv._store_cached_diag(tmp, "template_1", "baseline_diag", original)
@@ -538,6 +544,57 @@ def test_progress_prompt_does_not_fight_useless_group() -> None:
     assert "GROUPS (combinations)" in txt
     assert "in_failed_group" in txt
     assert "NOT proof of usefulness" in txt
+
+
+def test_vampire_prompt_includes_induction_schema() -> None:
+    import Mate_new_vampire as mate_v
+    from vampire_runner import derive_repair_hints as vampire_hints
+
+    result = VampireResult(
+        status="timeout",
+        elapsed=3.0,
+        induction_focus=["plus"],
+        induction_formulas=[
+            "![X]: (plus(zero,X) = X => plus(succ(zero),X) = succ(X)) [structural]"
+        ],
+        stats={"InductionApplications": 2, "Fw demodulations": 4},
+    )
+    txt = mate_v.format_solver_feedback_for_prompt({
+        "repair_hints": vampire_hints(result),
+        "invalid_lemmas": [],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "unproved_lemmas": [],
+        "routing": {},
+    })
+    assert "Induction schema:" in txt
+    assert "plus" in txt
+    assert "[structural]" not in txt
+
+
+def test_cvc_prompt_labels_rarely_instantiated() -> None:
+    import Mate_new as mate
+
+    axiom = "(forall ((n Nat)) (= (plus n zero) n))"
+    txt = mate.format_solver_feedback_for_prompt({
+        "repair_hints": [{
+            "kind": "high_difficulty_assertions",
+            "detail": "hard axioms",
+            "hard_axioms": [axiom],
+            "rarely_instantiated": [axiom],
+            "goal_fragments": [],
+            "suggested_actions": [
+                "Add a rewrite lemma whose LHS matches a rarely instantiated hard axiom or the goal",
+            ],
+        }],
+        "invalid_lemmas": [],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "unproved_lemmas": [],
+        "routing": {},
+    })
+    assert "Hard axiom (rarely instantiated):" in txt
+    assert "Hard axiom:" not in txt.replace("Hard axiom (rarely instantiated):", "")
 
 
 def test_empty_llm_does_not_retry_immediately() -> None:
@@ -905,6 +962,8 @@ def main() -> int:
     test_blocking_lemma_only_and_unmatched_skips_unproved()
     test_trivial_implication_and_control_shape()
     test_progress_prompt_does_not_fight_useless_group()
+    test_vampire_prompt_includes_induction_schema()
+    test_cvc_prompt_labels_rarely_instantiated()
     test_empty_llm_does_not_retry_immediately()
     test_prove_run_does_not_retry_after_llm_exhausted()
     test_two_no_help_switches_generation_prompt()

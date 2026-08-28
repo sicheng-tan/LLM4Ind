@@ -27,6 +27,10 @@ EXPLOSION_LOG_GAIN = math.log(1.50)
 REWRITE_PER_INDUCTION_MAX = 8.0
 INDUCTION_SHARE_MAX = 0.15
 INTEGER_INDUCTION_SHARE_MIN = 0.70
+# Superposition volume vs productive rewrite (demod + eq-taut).
+SUPERPOSITION_PER_REWRITE_MIN = 8.0
+# Vampire induction-depth wall (small integer, not a log-gain).
+MAX_INDUCTION_DEPTH_HINT = 2
 # Kept for routing docs / older call sites; mix hints no longer AND these.
 INDUCTION_SHARE_MIN = 0.08
 INDUCTION_PER_REWRITE_MAX = 0.02

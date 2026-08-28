@@ -83,6 +83,8 @@ class CvcResult:
     portfolio_results: Dict[str, dict] = field(default_factory=dict)
     # Proof-goal assertion body from the SMT script, when known.
     goal_term: Optional[str] = None
+    # (-o inst) per-quantifier instantiation counts: (term_or_qid, count).
+    instantiations: List[Tuple[str, int]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -298,6 +300,8 @@ def _cvc_prove_cmd(
     cmd = [cfg["binary"]] + list(cfg["options"])
     if cfg.get("type") == "CVC5" and (collect_stats or collect_difficulty):
         cmd.append("--stats")
+        cmd.append("-o")
+        cmd.append("inst")
         cmd.append(f"--tlimit-per={max(1, int(timeout * 1000))}")
     cmd.append(str(input_path))
     return cmd
@@ -397,6 +401,7 @@ def _cvc_result_from_output(
     )
     if collect_stats:
         result.stats = parse_cvc_stats(text)
+        result.instantiations = parse_cvc_instantiations(text)
     if collect_difficulty:
         result.difficulty = parse_cvc_difficulty(text)
     if goal_term:
@@ -409,7 +414,12 @@ def _richest_cvc(results: List[CvcResult]) -> Optional[CvcResult]:
         return None
     return max(
         results,
-        key=lambda r: (len(r.stats or {}), len(r.difficulty or []), len(r.stdout or "")),
+        key=lambda r: (
+            len(r.stats or {}),
+            len(r.difficulty or []),
+            len(r.instantiations or []),
+            len(r.stdout or ""),
+        ),
     )
 
 
@@ -632,7 +642,9 @@ def run_cvc_diagnostic(
             tf.write(script)
             tmp_path = tf.name
         input_path = Path(tmp_path)
-    cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", "--stats", str(input_path)]
+    cmd = [cfg["binary"]] + list(cfg["options"]) + [
+        f"--tlimit-per={ms}", "--stats", "-o", "inst", str(input_path),
+    ]
     try:
         result = _execute_single(cmd, timeout + 2, strategy=name)
         result.goal_term = goal_term
@@ -720,6 +732,48 @@ def parse_cvc_stats(text: str) -> Dict[str, int]:
     if m:
         stats["TOTAL_TIME_MS"] = int(m.group(1))
     return stats
+
+
+def parse_cvc_instantiations(text: str) -> List[Tuple[str, int]]:
+    """Parse `-o inst` lines: (num-instantiations <qid-or-formula> N)."""
+    items: List[Tuple[str, int]] = []
+    i = 0
+    needle = "(num-instantiations"
+    while True:
+        j = (text or "").find(needle, i)
+        if j < 0:
+            break
+        expr, nxt = _read_sexpr(text, j)
+        if not expr:
+            i = j + len(needle)
+            continue
+        kids = _sexpr_children(expr)
+        if len(kids) >= 3 and kids[0] == "num-instantiations":
+            term = kids[1]
+            try:
+                count = int(kids[-1])
+            except ValueError:
+                i = nxt
+                continue
+            if term.startswith("("):
+                term = normalize_smt_term(term)
+            if count >= 0 and term:
+                items.append((term, count))
+        i = nxt if nxt > j else j + len(needle)
+
+    best: Dict[str, int] = {}
+    out: List[Tuple[str, int]] = []
+    seen = set()
+    for term, count in items:
+        key = canonical_smt_term(term) if str(term).startswith("(") else term
+        best[key] = max(best.get(key, 0), count)
+    for term, count in sorted(items, key=lambda x: -x[1]):
+        key = canonical_smt_term(term) if str(term).startswith("(") else term
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((term, best[key]))
+    return out[:12]
 
 
 
@@ -1131,6 +1185,46 @@ def compute_progress_score(
     return score, signals
 
 
+def rarely_instantiated_axioms(
+    hard_axioms: List[str],
+    instantiations: Optional[List[Tuple[str, int]]],
+    *,
+    limit: int = 3,
+) -> List[str]:
+    """Hard axioms with formula-shaped inst traces but zero matching counts.
+
+    If `-o inst` only printed qids (no formulas), return empty — we cannot tell.
+    """
+    if not hard_axioms or not instantiations:
+        return []
+    formula_shaped = [t for t, _ in instantiations if str(t).startswith("(")]
+    if not formula_shaped:
+        return []
+    rare: List[str] = []
+    for axiom in hard_axioms:
+        count = _inst_count_for_axiom(axiom, instantiations)
+        if count == 0:
+            rare.append(axiom)
+        if len(rare) >= limit:
+            break
+    return rare
+
+
+def _inst_count_for_axiom(
+    axiom: str,
+    instantiations: List[Tuple[str, int]],
+) -> Optional[int]:
+    """Attributed inst count, or 0 if formulas were dumped but this axiom never matched."""
+    can = canonical_smt_term(axiom)
+    best: Optional[int] = None
+    for term, n in instantiations:
+        if not str(term).startswith("("):
+            continue
+        if canonical_smt_term(term) == can:
+            best = n if best is None else max(best, n)
+    return 0 if best is None else best
+
+
 def hard_axioms_from_difficulty(
     difficulty: Optional[List[Tuple[str, int]]],
     goal_term: Optional[str] = None,
@@ -1168,6 +1262,7 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     ]
     hard_axioms = hard_axioms_from_difficulty(result.difficulty, result.goal_term)
     goal_bits = [t for t, s, role in roles if role == "goal"][:2]
+    rare = rarely_instantiated_axioms(hard_axioms, result.instantiations)
 
     if hard_axioms or goal_bits:
         hints.append({
@@ -1179,6 +1274,7 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                 "high-difficulty recursive definitions to the goal."
             ),
             "hard_axioms": hard_axioms,
+            "rarely_instantiated": rare,
             "goal_fragments": goal_bits,
             "suggested_actions": [
                 "Generate equational lemmas about functions appearing in hard axioms",
@@ -1187,6 +1283,14 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                 "Avoid repeating lemmas already marked invalid or useless",
             ],
         })
+        if rare:
+            hints[-1]["detail"] += (
+                " Some hard axioms had no matching instantiations; "
+                "the solver may not be triggering them."
+            )
+            hints[-1]["suggested_actions"] = [
+                "Add a rewrite lemma whose LHS matches a rarely instantiated hard axiom or the goal",
+            ] + hints[-1]["suggested_actions"][:2]
 
     conj = stats.get("CONJ_TOTAL", 0)
     skol = stats.get("QUANTIFIERS_SKOLEMIZE", 0)
@@ -1326,6 +1430,7 @@ def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:
         result.stderr = stderr or ""
         text = result.stdout + "\n" + result.stderr
         result.stats = parse_cvc_stats(text)
+        result.instantiations = parse_cvc_instantiations(text)
 
         if timed_out:
             result.status = "timeout"

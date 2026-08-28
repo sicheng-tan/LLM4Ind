@@ -269,6 +269,7 @@ def _compact_cvc_diag(result: CvcResult) -> dict:
         "strategy": result.strategy,
         "stats": dict(result.stats or {}),
         "difficulty": [[t, s] for t, s in (result.difficulty or [])],
+        "instantiations": [[t, n] for t, n in (result.instantiations or [])],
         "goal_term": result.goal_term,
     }
 
@@ -280,6 +281,10 @@ def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
     for item in data.get("difficulty") or []:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             difficulty.append((str(item[0]), int(item[1])))
+    instantiations: List[Tuple[str, int]] = []
+    for item in data.get("instantiations") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            instantiations.append((str(item[0]), int(item[1])))
     return CvcResult(
         proved=bool(data.get("proved", False)),
         status=str(data.get("status", "unknown")),
@@ -287,6 +292,7 @@ def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
         strategy=str(data.get("strategy", "")),
         stats=dict(data.get("stats") or {}),
         difficulty=difficulty,
+        instantiations=instantiations,
         goal_term=data.get("goal_term") or None,
     )
 
@@ -513,8 +519,14 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
             parts.append(
                 f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
             )
+            rare = set(hint.get("rarely_instantiated") or [])
             for ax in (hint.get("hard_axioms") or [])[:3]:
-                parts.append(f";   Hard axiom: {ax[:160]}")
+                label = (
+                    "Hard axiom (rarely instantiated)"
+                    if ax in rare
+                    else "Hard axiom"
+                )
+                parts.append(f";   {label}: {ax[:160]}")
             for g in (hint.get("goal_fragments") or [])[:2]:
                 parts.append(f";   Goal fragment: {g[:160]}")
             for action in hint.get("suggested_actions", [])[:3]:

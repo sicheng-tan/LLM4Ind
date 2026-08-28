@@ -96,11 +96,12 @@ CVC5_PROMPT_GUIDANCE = {
     ),
 }
 
-_REWRITE_HINTS = {"need_rewrite", "induction_stuck"}
+_REWRITE_HINTS = {"need_rewrite", "induction_stuck", "need_directed_rewrite"}
 _GENERALIZE_HINTS = {
     "need_induction_lemma",
     "need_stronger_lemma",
     "need_arithmetic_lemma",
+    "induction_depth_limit",
 }
 _EXPLOSION_HINTS = {"search_explosion", "timeout"}
 
@@ -225,9 +226,12 @@ def recommend_vampire_profiles(
     if kinds & _REWRITE_HINTS:
         _boost(ranked, ["struct_induction", "induction_portfolio"])
         reasons.append("hint:need_rewrite_or_induction_stuck")
-    if "need_induction_lemma" in kinds:
+    if "need_induction_lemma" in kinds or "induction_depth_limit" in kinds:
         _boost(ranked, ["induction_portfolio", "struct_induction"])
-        reasons.append("hint:need_induction_lemma")
+        if "need_induction_lemma" in kinds:
+            reasons.append("hint:need_induction_lemma")
+        if "induction_depth_limit" in kinds:
+            reasons.append("hint:induction_depth_limit")
 
     if parent_profile:
         _boost(ranked, [parent_profile])

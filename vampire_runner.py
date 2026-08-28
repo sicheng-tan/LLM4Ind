@@ -24,7 +24,9 @@ from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
     INDUCTION_SHARE_MAX,
     INTEGER_INDUCTION_SHARE_MIN,
+    MAX_INDUCTION_DEPTH_HINT,
     REWRITE_PER_INDUCTION_MAX,
+    SUPERPOSITION_PER_REWRITE_MIN,
     gate_overshoot,
     activity_rate,
     gain_score,
@@ -69,6 +71,12 @@ _VAMPIRE_INTEGER_INDUCTION_KEYS = (
     "IntegerFiniteIntervalInduction",
 )
 _VAMPIRE_INDUCTION_KEYS = _VAMPIRE_STRUCT_INDUCTION_KEYS + _VAMPIRE_INTEGER_INDUCTION_KEYS
+_VAMPIRE_SUPERPOSITION_KEYS = (
+    "Forward superposition",
+    "Backward superposition",
+)
+_INDUCTION_SCHEMA_MAX = 2
+_INDUCTION_SCHEMA_CHARS = 180
 
 
 @dataclass
@@ -762,6 +770,50 @@ def _vampire_induction_counts(stats: Dict[str, int]) -> Tuple[int, int, int]:
     return struct_like, int_ind, struct_like + int_ind
 
 
+def compress_induction_formula(formula: str, limit: int = _INDUCTION_SCHEMA_CHARS) -> str:
+    """Shorten Vampire TPTP-like induction formulas for LLM prompts."""
+    s = re.sub(r"\s+", " ", formula or "").strip()
+    s = re.sub(r"'([A-Za-z][A-Za-z0-9_]*)\(\)'", r"\1", s)
+    s = re.sub(r"\s*\[(?:structural|integer)[^\]]*\]\s*$", "", s, flags=re.I)
+    if len(s) > limit:
+        s = s[: max(0, limit - 3)].rstrip() + "..."
+    return s
+
+
+def select_induction_schemas(
+    formulas: List[str],
+    focus: Optional[List[str]] = None,
+    *,
+    limit: int = _INDUCTION_SCHEMA_MAX,
+) -> List[str]:
+    """Pick a few induction formulas; prefer those overlapping focus or containing =>."""
+    cleaned = []
+    seen = set()
+    for raw in formulas or []:
+        text = compress_induction_formula(raw)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    if not cleaned:
+        return []
+
+    focus_blob = " ".join(focus or []).lower()
+    tokens = {
+        tok for tok in re.findall(r"[A-Za-z][A-Za-z0-9_]*", focus_blob)
+        if len(tok) > 1 and tok not in {"sk", "sk0", "sk1"}
+    }
+
+    def rank(text: str) -> Tuple[int, int]:
+        low = text.lower()
+        overlap = sum(1 for tok in tokens if tok in low)
+        has_step = 1 if "=>" in text or "->" in text else 0
+        return (overlap, has_step)
+
+    cleaned.sort(key=rank, reverse=True)
+    return cleaned[:limit]
+
+
 def compute_progress_score(
     baseline: VampireResult,
     candidate: VampireResult,
@@ -829,16 +881,20 @@ def compute_progress_score(
     # Volume-up without product (rewrite family / induction / focus) ≈ explosion.
     gen_c_rate = activity_rate(gen_c, cand_elapsed)
     gen_r_rate = activity_rate(ref_stats.get("Generated clauses", 0), ref_elapsed)
+    sup_c = _vampire_stat_rate(c, cand_elapsed, *_VAMPIRE_SUPERPOSITION_KEYS)
+    sup_r = _vampire_stat_rate(ref_stats, ref_elapsed, *_VAMPIRE_SUPERPOSITION_KEYS)
+    volume_c = max(gen_c_rate, sup_c)
+    volume_r = max(gen_r_rate, sup_r)
     productive = any(
         s.startswith("more_demodulations")
         or s.startswith("more_induction")
         or s == "lower_passive_ratio"
         for s in signals
     )
-    if log_gain(gen_c_rate, gen_r_rate) >= EXPLOSION_LOG_GAIN and not productive:
-        penalty = min(gain_score(gen_c_rate, gen_r_rate, 1.5), 1.5)
+    if log_gain(volume_c, volume_r) >= EXPLOSION_LOG_GAIN and not productive:
+        penalty = min(gain_score(volume_c, volume_r, 1.5), 1.5)
         score -= penalty
-        signals.append(f"search_explosion(+{pct_label(gen_c_rate, gen_r_rate)}%)")
+        signals.append(f"search_explosion(+{pct_label(volume_c, volume_r)}%)")
 
     # Require two independent channels, or one induction signal.
     if strong < 2 and "more_induction" not in "".join(signals):
@@ -860,12 +916,18 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
     stats = result.stats
 
     dem = stats.get("Fw demodulations", 0) + stats.get("Bw demodulations", 0)
+    taut = stats.get("Fw demodulations to eq. taut.", 0)
+    sup = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_SUPERPOSITION_KEYS)
     _struct_like, int_ind, ind = _vampire_induction_counts(stats)
     mix = ind + dem
     arithmetic_dominant = ind > 0 and int_ind / ind >= INTEGER_INDUCTION_SHARE_MIN
+    schemas = select_induction_schemas(
+        list(result.induction_formulas or []),
+        list(result.induction_focus or []),
+    )
 
-    if result.induction_focus:
-        hints.append({
+    if result.induction_focus or schemas:
+        hint = {
             "kind": "induction_stuck",
             "context": context,
             "detail": (
@@ -874,6 +936,7 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 "step (often commutativity/associativity or rewrite bridges)."
             ),
             "induction_focus": result.induction_focus[:6],
+            "induction_formulas": schemas,
             # Binary signal: moderate vote so it does not drown mix overshoot.
             "strength": 0.5,
             "suggested_actions": [
@@ -881,7 +944,13 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 "If a recursive function appears on both sides, try a generalized form",
                 "Avoid repeating lemmas already marked invalid or useless",
             ],
-        })
+        }
+        if schemas:
+            hint["suggested_actions"] = [
+                "Prefer a lemma that discharges the inductive step in the schema (RHS after unfolding)",
+                "If the schema IH does not match the conclusion, generalize the inductive lemma",
+            ] + hint["suggested_actions"][:1]
+        hints.append(hint)
 
     # One mix inequality per hint. Both may fire; rewrite first.
     if mix > 0:
@@ -937,6 +1006,47 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             "suggested_actions": [
                 "Generate arithmetic bridge or monotonicity lemmas",
                 "Strengthen recurrences rather than adding constructor equalities",
+            ],
+        })
+
+    rewrite_product = dem + taut
+    if sup > 0 and sup / max(rewrite_product, 1) >= SUPERPOSITION_PER_REWRITE_MIN:
+        ratio = sup / max(rewrite_product, 1)
+        hints.append({
+            "kind": "need_directed_rewrite",
+            "context": context,
+            "detail": (
+                "Vampire superposition is high relative to productive rewriting "
+                "(demodulation / equality tautologies). Equality is combining "
+                "without simplifying; prefer LHS-directed rewrite lemmas."
+            ),
+            "strength": round(
+                min(1.0, max(0.0, (ratio / SUPERPOSITION_PER_REWRITE_MIN) - 1.0)),
+                4,
+            ),
+            "suggested_actions": [
+                "Propose rewrite lemmas whose LHS matches a goal subterm",
+                "Avoid overly general quantified equalities that explode superposition",
+            ],
+        })
+
+    depth = int(stats.get("MaxInductionDepth", 0) or 0)
+    if (
+        depth >= MAX_INDUCTION_DEPTH_HINT
+        and result.status in ("timeout", "incomplete", "unknown")
+        and ind > 0
+    ):
+        hints.append({
+            "kind": "induction_depth_limit",
+            "context": context,
+            "detail": (
+                f"Vampire repeatedly reached induction depth {depth} without finishing. "
+                "Strengthen or generalize the inductive lemma rather than searching deeper."
+            ),
+            "strength": round(min(1.0, depth / 4.0), 4),
+            "suggested_actions": [
+                "Generate a stronger generalized lemma or an auxiliary invariant",
+                "Introduce an accumulator / helper-function identity if applicable",
             ],
         })
 

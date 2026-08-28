@@ -214,6 +214,12 @@ def test_family_scores_floor_legacy_and_sum() -> None:
     ])
     _ok(p is not None and abs(p - 0.2 / 1.1) < 1e-9, p)
 
+    rewrite, generalize = prompt_family_scores([
+        {"kind": "need_directed_rewrite", "strength": 0.3},
+        {"kind": "induction_depth_limit", "strength": 0.5},
+    ])
+    _ok(abs(rewrite - 0.3) < 1e-9 and abs(generalize - 0.5) < 1e-9, (rewrite, generalize))
+
 
 def test_kind_signature_change_retargets_before_streak() -> None:
     strats = [EQUATIONAL_PROMPT, TERM_REWRITE_PROMPT]

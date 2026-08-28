@@ -508,6 +508,8 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
             focus = hint.get("induction_focus") or []
             if focus:
                 parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+            for schema in (hint.get("induction_formulas") or [])[:2]:
+                parts.append(f";   Induction schema: {schema}")
             for action in hint.get("suggested_actions", [])[:3]:
                 parts.append(f";   -> {action}")
 

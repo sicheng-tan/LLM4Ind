@@ -23,7 +23,9 @@ from cvc5_runner import (
     extract_proof_goal_term,
     hard_axioms_from_difficulty,
     parse_cvc_difficulty,
+    parse_cvc_instantiations,
     parse_cvc_stats,
+    rarely_instantiated_axioms,
 )
 from solver_relative_metrics import is_relative_gain, pct_label
 from vampire_runner import classify_status
@@ -182,6 +184,19 @@ def test_stat_keys_not_double_counted() -> None:
     _ok(stats["QUANTIFIERS_SKOLEMIZE"] == 2, stats)
 
 
+def test_parse_cvc_instantiations_qid_and_formula() -> None:
+    axiom = "(forall ((n Nat)) (= (plus zero n) n))"
+    text = f"(num-instantiations plus.zero 7)\n(num-instantiations {axiom} 2)\n"
+    items = parse_cvc_instantiations(text)
+    by_term = {t: n for t, n in items}
+    _ok(by_term.get("plus.zero") == 7, items)
+    _ok(any(t.startswith("(") and n == 2 for t, n in items), items)
+    _ok(
+        rarely_instantiated_axioms([axiom], [("plus.zero", 7)]) == [],
+        "qid-only must not mark the axiom rare",
+    )
+
+
 def main() -> int:
     tests = [
         test_parse_nested_difficulty,
@@ -193,6 +208,7 @@ def main() -> int:
         test_vampire_user_error,
         test_relative_gain_rate_vs_count,
         test_stat_keys_not_double_counted,
+        test_parse_cvc_instantiations_qid_and_formula,
     ]
     failed = 0
     for fn in tests:
