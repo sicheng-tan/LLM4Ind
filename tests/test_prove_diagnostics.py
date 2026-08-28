@@ -572,6 +572,63 @@ def test_vampire_prompt_includes_induction_schema() -> None:
     assert "[structural]" not in txt
 
 
+def test_prompt_includes_compressed_obligation_tree() -> None:
+    import Mate_new as mate
+    from obligation_tree import (
+        add_proved_lemma,
+        append_attempt,
+        make_child_node,
+        make_goal_tree,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"LEMMA_LIBRARY": "on", "OBLIGATION_TREE": "on"}):
+            add_proved_lemma(
+                tmp,
+                "(forall ((x Nat)) (= (plus x zero) x))",
+                origin="template_1",
+                attempt=1,
+                depth=1,
+            )
+            tree = make_goal_tree(
+                "template",
+                [
+                    make_child_node(
+                        node_id="template_1",
+                        formula="(forall ((x Nat)) (= (plus x zero) x))",
+                        status="proved",
+                        lib="lib_1",
+                    ),
+                    make_child_node(
+                        node_id="template_2",
+                        formula="(forall ((x Nat) (y Nat)) (= (plus x y) (plus y x)))",
+                        status="failed",
+                        atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
+                    ),
+                ],
+                proved=False,
+            )
+            txt = mate.format_solver_feedback_for_prompt(
+                {
+                    "repair_hints": [],
+                    "invalid_lemmas": [],
+                    "useless_lemma_groups": [],
+                    "progress_lemmas": [],
+                    "unproved_lemmas": [],
+                    "routing": {},
+                    "obligation": append_attempt({}, "obligation_tree", tree),
+                },
+                base_path=tmp,
+            )
+    assert "Library (already proved, in axioms):" in txt
+    assert "lib_1:" in txt
+    assert "Last obligation tree" in txt
+    assert "G  open" in txt
+    assert "L2  failed [need_rewrite; focus: (plus x y)]" in txt
+    assert "CURRENT goal" in txt
+    assert "├─" in txt
+
+
 def test_cvc_prompt_labels_rarely_instantiated() -> None:
     import Mate_new as mate
 
@@ -855,7 +912,7 @@ def test_useful_subgoal_failure_resets_no_help_streak() -> None:
         "Mate_new",
         quick,
         extra_patches=(
-            patch("Mate_new.prove_subgoals_parallel", return_value=False),
+            patch("Mate_new.prove_subgoals_parallel", return_value=(False, [])),
         ),
     )
     assert calls[0] == "prove_prompt_equational_reasoning", calls
@@ -963,6 +1020,7 @@ def main() -> int:
     test_trivial_implication_and_control_shape()
     test_progress_prompt_does_not_fight_useless_group()
     test_vampire_prompt_includes_induction_schema()
+    test_prompt_includes_compressed_obligation_tree()
     test_cvc_prompt_labels_rarely_instantiated()
     test_empty_llm_does_not_retry_immediately()
     test_prove_run_does_not_retry_after_llm_exhausted()

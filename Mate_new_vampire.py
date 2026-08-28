@@ -46,6 +46,21 @@ from profile_selector import (
     llm_selector_enabled,
 )
 from theory_features import analyze_smt
+from obligation_tree import (
+    add_proved_lemma,
+    append_attempt,
+    classify_failed_attempt,
+    compact_atp_from_failed_data,
+    format_obligation_prompt,
+    last_normal_tree,
+    lemma_library_enabled,
+    load_lemma_library,
+    make_child_node,
+    make_goal_tree,
+    materialize_smt_with_library,
+    obligation_tree_enabled,
+    solver_smt_content,
+)
 
 # 配置彩色日志
 logger = setup_colored_logger()
@@ -87,6 +102,7 @@ def _empty_failed_data() -> dict:
         "baseline_diag": {},
         "baseline_diag_short": {},
         "control_diag": {},
+        "obligation": {"attempts": [], "last_normal_tree_id": None},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -107,6 +123,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("baseline_diag", {})
             data.setdefault("baseline_diag_short", {})
             data.setdefault("control_diag", {})
+            data.setdefault("obligation", {"attempts": [], "last_normal_tree_id": None})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -251,6 +268,57 @@ def _lemma_for_blocking_subgoal(
     if 1 <= idx <= len(parent_lemmas):
         return parent_lemmas[idx - 1]
     return None
+
+
+def _record_obligation_attempt(
+    base_path: str,
+    goal_name: str,
+    kind: str,
+    tree: Optional[dict] = None,
+) -> None:
+    if not obligation_tree_enabled():
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["obligation"] = append_attempt(
+        failed_data.get("obligation"), kind, tree
+    )
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _child_obligation_node(
+    base_path: str,
+    subgoal: str,
+    formula: Optional[str],
+    status: str,
+    *,
+    depth: int = 0,
+    attempt: int = 0,
+) -> dict:
+    children: List[dict] = []
+    lib_id = None
+    atp = None
+    if status == "proved" and formula:
+        lib_id = add_proved_lemma(
+            base_path, formula, origin=subgoal, attempt=attempt, depth=depth
+        )
+        nested = last_normal_tree(load_failed_lemmas(base_path, subgoal).get("obligation"))
+        if nested:
+            children = list(nested.get("children") or [])
+    elif status == "failed":
+        child_data = load_failed_lemmas(base_path, subgoal)
+        nested = last_normal_tree(child_data.get("obligation"))
+        if nested:
+            children = list(nested.get("children") or [])
+        atp = compact_atp_from_failed_data(child_data)
+    return make_child_node(
+        node_id=subgoal,
+        formula=formula,
+        status=status,
+        lib=lib_id,
+        atp=atp,
+        children=children,
+    )
+
 
 def load_routing_state(base_path: str, goal_name: str) -> GoalSearchState:
     return GoalSearchState.from_dict(load_failed_lemmas(base_path, goal_name).get("routing"))
@@ -432,7 +500,7 @@ def record_solver_attempt(
     )
     save_routing_state(base_path, goal_name, state)
 
-def format_solver_feedback_for_prompt(failed_data: dict) -> str:
+def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) -> str:
     """把 Vampire 失败/进展信号格式化进下一轮 LLM prompt。"""
     parts: List[str] = []
 
@@ -513,6 +581,14 @@ def format_solver_feedback_for_prompt(failed_data: dict) -> str:
             for action in hint.get("suggested_actions", [])[:3]:
                 parts.append(f";   -> {action}")
 
+    if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
+        obligation_txt = format_obligation_prompt(
+            load_lemma_library(base_path),
+            failed_data.get("obligation"),
+        )
+        if obligation_txt:
+            parts.append(obligation_txt)
+
     return "\n".join(parts)
 
 def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None) -> list:
@@ -528,7 +604,7 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
     failed_info = ""
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
-        failed_info = format_solver_feedback_for_prompt(failed_data)
+        failed_info = format_solver_feedback_for_prompt(failed_data, base_path=base_path)
     
     # 构建结构化消息列表
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
@@ -910,8 +986,11 @@ def perform_initial_verification(
     default_timeout = config['DEFAULT_CVC_TIMEOUT']
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
     routing_state = load_routing_state(str(goal_smt_file.parent), goal_smt_file.stem)
+    smt_path = goal_smt_file
+    if base_path and lemma_library_enabled():
+        smt_path = materialize_smt_with_library(goal_smt_file, base_path)
     result = run_vampire_routed(
-        goal_smt_file,
+        smt_path,
         default_timeout,
         collect_stats=True,
         show_induction=True,
@@ -1455,6 +1534,7 @@ def quick_run(
     smt_file_path = Path(base_path)
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
     smt_content = goal_smt_file.read_text()
+    solver_content = solver_smt_content(smt_content, base_path)
 
     # 步骤1: 初始验证检查
     if baseline_only:
@@ -1469,7 +1549,7 @@ def quick_run(
         return result.proved, [], []
     
     # 步骤2: 提取原始目标
-    original_assert, original_forall = extract_original_goal(smt_content)
+    original_assert, original_forall = extract_original_goal(solver_content)
 
     # 步骤2.5: 首次求助 LLM 前写入 Vampire 诊断反馈 / 理论分流
     failed_data = load_failed_lemmas(base_path, goal_smt_name)
@@ -1513,7 +1593,7 @@ def quick_run(
         return False, [], extracted_asserts
 
     # 步骤5: 创建验证文件并并行验证引理有效性
-    valid_check_paths = create_validation_files(extracted_asserts, smt_content, smt_file_path, goal_smt_name)
+    valid_check_paths = create_validation_files(extracted_asserts, solver_content, smt_file_path, goal_smt_name)
     
     if not validate_lemmas_parallel(valid_check_paths, base_path, goal_smt_name):
         record_solver_attempt(
@@ -1536,7 +1616,7 @@ def quick_run(
     useful, selected_lemmas, _vres = verify_combined_lemmas(
         original_assert,
         extracted_asserts,
-        smt_content,
+        solver_content,
         combined_path,
         base_path=base_path,
         goal_name=goal_smt_name,
@@ -1560,46 +1640,77 @@ def quick_run(
     
     return True, generated_files, selected_lemmas
 
-def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_lemmas: List[str] = None, parent_goal_name: str = None) -> bool:
-    """并行执行多个子目标的验证，如果任何一个失败就立即终止所有进程"""
+def prove_subgoals_parallel(
+    base_path: str,
+    subgoals: List[str],
+    depth: int = 0,
+    strategy_mode: str = "default",
+    baseline_only: bool = False,
+    parent_lemmas: List[str] = None,
+    parent_goal_name: str = None,
+    attempt: int = 0,
+) -> Tuple[bool, List[dict]]:
+    """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
     if not subgoals:
-        return True
-    
+        return True, []
+
     logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
-    
-    # 使用ThreadPoolExecutor进行并行执行
+    parent_lemmas = parent_lemmas or []
+    snapshots: Dict[str, dict] = {}
+
+    def _formula(sg: str) -> Optional[str]:
+        if parent_goal_name:
+            return _lemma_for_blocking_subgoal(parent_goal_name, sg, parent_lemmas)
+        return None
+
+    def _snap(sg: str, status: str) -> dict:
+        return _child_obligation_node(
+            base_path, sg, _formula(sg), status,
+            depth=depth + 1, attempt=attempt,
+        )
+
+    def _ordered(status_for_missing: str = "cancelled") -> List[dict]:
+        return [
+            snapshots.get(sg, _snap(sg, status_for_missing))
+            for sg in subgoals
+        ]
+
     with ThreadPoolExecutor(max_workers=min(len(subgoals), 4)) as executor:
-        # 提交所有任务，传递递增的深度参数
         future_to_subgoal = {
             executor.submit(
                 prove_run, base_path, subgoal, depth + 1, strategy_mode, baseline_only, parent_goal_name
             ): subgoal
             for subgoal in subgoals
         }
-        
+
         try:
-            # 等待任务完成，一旦有任何失败就立即返回
             for future in as_completed(future_to_subgoal):
                 subgoal = future_to_subgoal[future]
                 try:
                     result = future.result()
                     if not result:
                         logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
-                        # 记录导致子目标失败的引理 + Vampire 诊断到父目标
                         if parent_lemmas and parent_goal_name:
                             _record_subgoal_failure_feedback(
                                 base_path, parent_goal_name, subgoal, parent_lemmas
                             )
-                        # 取消所有未完成的任务
-                        for f in future_to_subgoal:
+                        snapshots[subgoal] = _snap(subgoal, "failed")
+                        for f, sg in future_to_subgoal.items():
+                            if sg in snapshots:
+                                continue
                             if not f.done():
                                 f.cancel()
-                        return False
-                    else:
-                        logging.info(f"✅ 子目标 {subgoal} 验证成功")
+                                snapshots[sg] = _snap(sg, "cancelled")
+                                continue
+                            try:
+                                snapshots[sg] = _snap(sg, "proved" if f.result() else "failed")
+                            except Exception:
+                                snapshots[sg] = _snap(sg, "cancelled")
+                        return False, _ordered()
+                    snapshots[subgoal] = _snap(subgoal, "proved")
+                    logging.info(f"✅ 子目标 {subgoal} 验证成功")
                 except Exception as e:
                     logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
-                    # 记录导致异常的引理到父目标的失败记录中
                     if parent_lemmas and parent_goal_name:
                         blocking = _lemma_for_blocking_subgoal(
                             parent_goal_name, subgoal, parent_lemmas
@@ -1609,21 +1720,24 @@ def prove_subgoals_parallel(base_path: str, subgoals: List[str], depth: int = 0,
                                 base_path, parent_goal_name, blocking,
                                 {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
                             )
-                    # 取消所有未完成的任务
-                    for f in future_to_subgoal:
+                    snapshots[subgoal] = _snap(subgoal, "failed")
+                    for f, sg in future_to_subgoal.items():
+                        if sg in snapshots:
+                            continue
                         if not f.done():
                             f.cancel()
-                    return False
-            
+                            snapshots[sg] = _snap(sg, "cancelled")
+                    return False, _ordered()
+
             logging.info(f"🌟 所有 {len(subgoals)} 个子目标并行验证通过")
-            return True
-            
+            return True, _ordered("proved")
+
         except KeyboardInterrupt:
             logging.warning("收到中断信号，取消所有并行任务")
             for f in future_to_subgoal:
                 if not f.done():
                     f.cancel()
-            return False
+            return False, _ordered("cancelled")
 
 
 def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None) -> bool:
@@ -1750,12 +1864,33 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
                 logging.info(f"🔍 发现子目标: {new_subgoals}")
                 # 传递当前生成的引理和目标名称
                 current_lemmas = extracted_asserts
-                if prove_subgoals_parallel(base_path, new_subgoals, depth, strategy_mode, baseline_only, current_lemmas, base_name):
+                subgoal_result = prove_subgoals_parallel(
+                    base_path, new_subgoals, depth, strategy_mode, baseline_only,
+                    current_lemmas, base_name, attempt=attempt + 1,
+                )
+                if isinstance(subgoal_result, tuple):
+                    ok, child_nodes = subgoal_result
+                else:
+                    ok, child_nodes = bool(subgoal_result), []
+                _record_obligation_attempt(
+                    base_path,
+                    base_name,
+                    "obligation_tree",
+                    tree=make_goal_tree(base_name, child_nodes, proved=ok),
+                )
+                if ok:
                     logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
                     return True
                 logging.warning(f"💥 子目标验证失败，继续尝试下一次生成")
                 continue
 
+            _record_obligation_attempt(
+                base_path,
+                base_name,
+                classify_failed_attempt(
+                    extracted_asserts, load_failed_lemmas(base_path, base_name)
+                ),
+            )
             consecutive_no_help += 1
             hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
             nxt, consecutive_no_help, kind_signature, why = retarget_generation_prompt(

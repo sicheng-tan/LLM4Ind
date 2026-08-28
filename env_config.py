@@ -33,6 +33,8 @@ def setup_environment():
     solver_routing_llm_min_confidence = float(
         os.getenv('SOLVER_ROUTING_LLM_MIN_CONFIDENCE', '0.55')
     )
+    lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
+    obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
 
     # 代理配置
     if http_proxy and https_proxy:
@@ -73,6 +75,8 @@ def setup_environment():
         'SOLVER_ROUTING_DECIDER': solver_routing_decider,
         'SOLVER_ROUTING_PROBES': solver_routing_probes,
         'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
+        'LEMMA_LIBRARY': lemma_library,
+        'OBLIGATION_TREE': obligation_tree,
     }
 
 def setup_model(config):
