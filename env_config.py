@@ -35,6 +35,10 @@ def setup_environment():
     )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
+    feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
+    feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'on')
+    prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
+    unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
 
     # 代理配置
     if http_proxy and https_proxy:
@@ -77,6 +81,10 @@ def setup_environment():
         'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
         'LEMMA_LIBRARY': lemma_library,
         'OBLIGATION_TREE': obligation_tree,
+        'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
+        'FEEDBACK_PROGRESS': feedback_progress,
+        'PROMPT_RETARGET': prompt_retarget,
+        'UNPROVED_NOT_INVALID': unproved_not_invalid,
     }
 
 def setup_model(config):

@@ -61,6 +61,13 @@ from obligation_tree import (
     obligation_tree_enabled,
     solver_smt_content,
 )
+from exp_flags import (
+    paper_schedule_prompt,
+    progress_feedback_enabled,
+    prompt_retarget_enabled,
+    repair_hints_enabled,
+    unproved_not_invalid_enabled,
+)
 
 # 配置彩色日志
 logger = setup_colored_logger()
@@ -187,6 +194,8 @@ def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
                        *, profile: Optional[str] = None,
                        profile_scores: Optional[dict] = None):
     """记录对卡住目标有“进展”但尚未证出的引理（供下一轮优先复用/强化）"""
+    if not progress_feedback_enabled():
+        return
     failed_data = load_failed_lemmas(base_path, goal_name)
     record = {"lemma": lemma, "score": score, "signals": signals}
     if profile:
@@ -224,7 +233,7 @@ def _compact_repair_hints(hints: List[dict]) -> List[dict]:
 
 def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
     """追加 solver-guided repair hints（去重、截断）"""
-    if not hints:
+    if not repair_hints_enabled() or not hints:
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
     failed_data["repair_hints"] = _compact_repair_hints(
@@ -242,6 +251,19 @@ def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optiona
             return
     failed_data["unproved_lemmas"].append(record)
     save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _record_blocking_lemma(
+    base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None
+) -> None:
+    """Useful-but-failed subgoal: unproved by default, invalid when the flag is off."""
+    if unproved_not_invalid_enabled():
+        add_unproved_lemma(base_path, goal_name, lemma, meta)
+        return
+    status = (meta or {}).get("status") or "useful_but_unproved"
+    blocking = (meta or {}).get("blocking_subgoal") or ""
+    reason = f"Subgoal proof failed ({blocking or status})"
+    add_invalid_lemma(base_path, goal_name, lemma, reason)
 
 
 def _lemmas_in_useless_groups(failed_data: dict) -> set:
@@ -395,7 +417,7 @@ def _record_subgoal_failure_feedback(
     child_profile = load_routing_state(base_path, subgoal).active_profile
     blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
     if blocking is not None:
-        add_unproved_lemma(
+        _record_blocking_lemma(
             base_path, parent_goal_name, blocking,
             {
                 "status": "useful_but_unproved",
@@ -403,36 +425,36 @@ def _record_subgoal_failure_feedback(
                 "profile": child_profile,
             },
         )
-    diag = _load_cached_diag(base_path, subgoal, "baseline_diag")
-    if diag is None:
-        subgoal_file = Path(base_path) / f"{subgoal}.smt2"
-        if subgoal_file.exists():
-            logging.info("子目标 %s 无缓存诊断，回退短诊断", subgoal)
-            diag = run_vampire_diagnostic(
-                subgoal_file,
-                timeout=_DIAGNOSTIC_TIMEOUT,
-                show_induction=True,
-                profile=child_profile,
-            )
-            _store_cached_diag(base_path, subgoal, "baseline_diag", diag)
-    if diag is None:
-        return
-    hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
-    hints.append({
-        "kind": "subgoal_failed",
-        "context": f"subgoal:{subgoal}",
-        "detail": (
-            f"Lemma was useful for the parent goal but its own proof "
-            f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
-            f"help prove this subgoal directly."
-        ),
-        "induction_focus": diag.induction_focus[:6],
-        "suggested_actions": [
-            "Propose a weaker/simpler variant of the failing lemma",
-            "Add bridging lemmas targeting the subgoal induction focus",
-        ],
-    })
-    add_repair_hints(base_path, parent_goal_name, hints)
+    if repair_hints_enabled():
+        diag = _load_cached_diag(base_path, subgoal, "baseline_diag")
+        if diag is None:
+            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
+            if subgoal_file.exists():
+                logging.info("子目标 %s 无缓存诊断，回退短诊断", subgoal)
+                diag = run_vampire_diagnostic(
+                    subgoal_file,
+                    timeout=_DIAGNOSTIC_TIMEOUT,
+                    show_induction=True,
+                    profile=child_profile,
+                )
+                _store_cached_diag(base_path, subgoal, "baseline_diag", diag)
+        if diag is not None:
+            hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
+            hints.append({
+                "kind": "subgoal_failed",
+                "context": f"subgoal:{subgoal}",
+                "detail": (
+                    f"Lemma was useful for the parent goal but its own proof "
+                    f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
+                    f"help prove this subgoal directly."
+                ),
+                "induction_focus": diag.induction_focus[:6],
+                "suggested_actions": [
+                    "Propose a weaker/simpler variant of the failing lemma",
+                    "Add bridging lemmas targeting the subgoal induction focus",
+                ],
+            })
+            add_repair_hints(base_path, parent_goal_name, hints)
     parent_state = load_routing_state(base_path, parent_goal_name)
     child_state = load_routing_state(base_path, subgoal)
     if child_state.active_profile:
@@ -530,7 +552,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
             for j, lemma in enumerate(lemmas, 1):
                 parts.append(f";   {j}. {lemma}")
 
-    if failed_data.get("progress_lemmas"):
+    if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
         parts.append(
             "\n; SOLVER PROGRESS SIGNALS: singleton search changes vs control. "
             "This is NOT proof of usefulness; a lemma here can still belong to a "
@@ -549,7 +571,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
                 f"{record['lemma']}"
             )
 
-    if failed_data.get("unproved_lemmas"):
+    if unproved_not_invalid_enabled() and failed_data.get("unproved_lemmas"):
         parts.append(
             "\n; USEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
             "own proofs timed out. Do not discard them; generate weaker variants or "
@@ -560,13 +582,14 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
                 f"; Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
             )
 
-    routing_txt = format_routing_for_prompt(
-        GoalSearchState.from_dict(failed_data.get("routing"))
-    )
-    if routing_txt:
-        parts.append(routing_txt)
+    if routing_enabled():
+        routing_txt = format_routing_for_prompt(
+            GoalSearchState.from_dict(failed_data.get("routing"))
+        )
+        if routing_txt:
+            parts.append(routing_txt)
 
-    if failed_data.get("repair_hints"):
+    if repair_hints_enabled() and failed_data.get("repair_hints"):
         parts.append(
             "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
             "Use these hints to choose the NEXT lemmas:"
@@ -775,6 +798,8 @@ def analyze_lemma_progress(
     base_path: str,
 ) -> Tuple[List[str], VampireResult]:
     """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove)."""
+    if not progress_feedback_enabled():
+        return [], VampireResult(status="unknown")
     diag = _diag_profile(base_path, goal_name)
     want = vampire_diagnostic_profile(diag)
     hint_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
@@ -932,46 +957,45 @@ def verify_combined_lemmas(
     progressive: List[str] = []
     baseline = VampireResult(status="unknown")
     if base_path and goal_name:
-        progressive, baseline = analyze_lemma_progress(
-            original_assert, asserts, original_content, work_dir, gname, base_path
-        )
-        hint_kind = "no_progress"
-        if progressive:
-            hint_kind = "partial_progress"
+        meta = {"status": ucore_result.status}
+        if progress_feedback_enabled():
+            progressive, baseline = analyze_lemma_progress(
+                original_assert, asserts, original_content, work_dir, gname, base_path
+            )
+            hint_kind = "no_progress"
+            if progressive:
+                hint_kind = "partial_progress"
+            meta["hint_kind"] = hint_kind
+            meta["progressive_count"] = len(progressive)
+            add_repair_hints(base_path, goal_name, [{
+                "kind": hint_kind,
+                "context": "usefulness_check",
+                "detail": (
+                    "The full lemma group did not help Vampire prove the goal. "
+                    + (
+                        f"{len(progressive)} lemma(s) showed partial rewrite/induction progress; "
+                        "refine them or add bridging lemmas."
+                        if progressive else
+                        "No lemma showed measurable progress; try a different lemma shape "
+                        "(generalization / rewrite bridge)."
+                    )
+                ),
+                "induction_focus": baseline.induction_focus[:6],
+                "progress_signals": load_failed_lemmas(
+                    base_path, goal_name
+                ).get("progress_routing_signals") or [],
+                "suggested_actions": [
+                    "Build on progress lemmas if any are listed above",
+                    "Target induction focus terms reported by Vampire",
+                    "Do not repeat the same useless lemma group",
+                ],
+            }])
         add_useless_lemma_group(
             base_path,
             goal_name,
             asserts,
-            meta={
-                "status": ucore_result.status,
-                "hint_kind": hint_kind,
-                "progressive_count": len(progressive),
-            },
+            meta=meta,
         )
-        # Extra repair hint summarizing this failed usefulness check
-        add_repair_hints(base_path, goal_name, [{
-            "kind": hint_kind,
-            "context": "usefulness_check",
-            "detail": (
-                "The full lemma group did not help Vampire prove the goal. "
-                + (
-                    f"{len(progressive)} lemma(s) showed partial rewrite/induction progress; "
-                    "refine them or add bridging lemmas."
-                    if progressive else
-                    "No lemma showed measurable progress; try a different lemma shape "
-                    "(generalization / rewrite bridge)."
-                )
-            ),
-            "induction_focus": baseline.induction_focus[:6],
-            "progress_signals": load_failed_lemmas(
-                base_path, goal_name
-            ).get("progress_routing_signals") or [],
-            "suggested_actions": [
-                "Build on progress lemmas if any are listed above",
-                "Target induction focus terms reported by Vampire",
-                "Do not repeat the same useless lemma group",
-            ],
-        }])
 
     return False, progressive, ucore_result
 
@@ -1807,16 +1831,25 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
     strategies = select_use_prompt_strategies["strategies"]
     max_attempts_per_prompt = select_use_prompt_strategies["max_attempts"]
     total_attempts = max_attempts_per_prompt * max(1, len(strategies))
-    hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
-    current_prompt = select_generation_prompt(strategies, hint_list)
-    kind_signature = prompt_kind_signature(hint_list)
+    retarget = prompt_retarget_enabled()
+    if retarget:
+        hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+        current_prompt = select_generation_prompt(strategies, hint_list)
+        kind_signature = prompt_kind_signature(hint_list)
+    else:
+        current_prompt = paper_schedule_prompt(strategies, 0, max_attempts_per_prompt)
+        kind_signature = "none"
     consecutive_no_help = 0
 
-    # Shared 2×3 budget. One kind family picks the template; both families
-    # sample once. A later change in that family set can switch immediately.
-    # If kinds stay the same, two consecutive empty/invalid/useless attempts
-    # toggle the other template. Repair hints still go into the chosen template.
+    # Shared 2×3 budget. With PROMPT_RETARGET=on: hint family picks the
+    # template; both families sample once; kind-set changes can switch
+    # immediately; two consecutive empty/invalid/useless attempts toggle.
+    # With PROMPT_RETARGET=off: paper order, N attempts per template.
     for attempt in range(total_attempts):
+        if not retarget:
+            current_prompt = paper_schedule_prompt(
+                strategies, attempt, max_attempts_per_prompt
+            )
         prompt_strategy = current_prompt
         solver_profile = None
         decision_source = None
@@ -1892,22 +1925,23 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
                 ),
             )
             consecutive_no_help += 1
-            hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
-            nxt, consecutive_no_help, kind_signature, why = retarget_generation_prompt(
-                strategies,
-                hint_list,
-                current_prompt,
-                consecutive_no_help,
-                kind_signature,
-            )
-            if why == "consecutive":
-                logging.info(
-                    "连续空/无效/无用达到%d次，切换 prompt %s → %s",
-                    NO_HELP_PROMPT_SWITCH,
+            if retarget:
+                hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+                nxt, consecutive_no_help, kind_signature, why = retarget_generation_prompt(
+                    strategies,
+                    hint_list,
                     current_prompt,
-                    nxt,
+                    consecutive_no_help,
+                    kind_signature,
                 )
-            current_prompt = nxt
+                if why == "consecutive":
+                    logging.info(
+                        "连续空/无效/无用达到%d次，切换 prompt %s → %s",
+                        NO_HELP_PROMPT_SWITCH,
+                        current_prompt,
+                        nxt,
+                    )
+                current_prompt = nxt
 
         except TimeoutError:
             logging.warning(f"策略 {prompt_strategy} 第{attempt+1}次尝试超时")
