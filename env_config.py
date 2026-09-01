@@ -1,12 +1,34 @@
 import os
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+_ROOT = Path(__file__).resolve().parent
+DEFAULT_EXPERIMENT_ENV = _ROOT / "experiments" / "configs" / "case.env"
+DEFAULT_OPENAI_API_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_OPENAI_MODEL = "openai/gpt-5"
+
+
+def load_runtime_env():
+    """Load project .env, then optional experiment env.
+
+    Existing OS environment variables win, except when ``DOTENV_PATH`` is set
+    (that file overrides). ``case.env`` is used only when no API key is present
+    yet, so unit tests that inject ``OPENAI_API_KEY`` are not affected.
+    """
+    load_dotenv()
+    dotenv_path = os.getenv("DOTENV_PATH")
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=True)
+        return
+    if not os.getenv("OPENAI_API_KEY") and DEFAULT_EXPERIMENT_ENV.exists():
+        load_dotenv(DEFAULT_EXPERIMENT_ENV, override=False)
+
+
 def setup_environment():
     """环境变量和代理配置函数"""
-    # 加载.env文件
-    load_dotenv()
+    load_runtime_env()
     
     # 统一加载所有需要的环境变量
     openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -16,6 +38,13 @@ def setup_environment():
     http_proxy = os.getenv('HTTP_PROXY')
     https_proxy = os.getenv('HTTPS_PROXY')
     model_type = os.getenv('MODEL_TYPE', 'gpt-4o')  # 默认为 gpt-4o
+    openai_api_base = os.getenv('OPENAI_API_BASE', DEFAULT_OPENAI_API_BASE)
+    openai_model = os.getenv('OPENAI_MODEL')
+    if not openai_model:
+        if model_type in ('gpt-5.5', 'gpt-5'):
+            openai_model = model_type
+        else:
+            openai_model = DEFAULT_OPENAI_MODEL
     cvc5_binary = os.getenv('CVC5_BINARY', './cvc/cvc5-Linux-x86_64-static/bin/cvc5')  # CVC5二进制文件路径
     cvc4_binary = os.getenv('CVC4_BINARY', './cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt')  # CVC4二进制文件路径
     vampire_binary = os.getenv('VAMPIRE_BINARY', './vampire/vampire')  # Vampire二进制文件路径
@@ -65,6 +94,8 @@ def setup_environment():
         'QWEN_API_KEY': qwen_api_key,
         'GEMINI_API_KEY': gemini_api_key,
         'MODEL_TYPE': model_type,
+        'OPENAI_API_BASE': openai_api_base,
+        'OPENAI_MODEL': openai_model,
         'CVC5_BINARY': cvc5_binary,
         'CVC4_BINARY': cvc4_binary,
         'VAMPIRE_BINARY': vampire_binary,
@@ -118,14 +149,16 @@ def setup_model(config):
         )
         logging.info("使用 Gemini 模型进行推理")
     else:
+        model_name = config.get('OPENAI_MODEL') or DEFAULT_OPENAI_MODEL
+        api_base = config.get('OPENAI_API_BASE') or DEFAULT_OPENAI_API_BASE
         llm = ChatOpenAI(
-            model='openai/gpt-5', # 'openai/gpt-4o-2024-11-20', 
-            openai_api_key=config['OPENAI_API_KEY'], 
-            openai_api_base='https://openrouter.ai/api/v1',
+            model=model_name,
+            openai_api_key=config['OPENAI_API_KEY'],
+            openai_api_base=api_base,
             temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
             top_p=0.9  # 设置 top_p 为 0.9，增加创意
             # temperature=0.7
         )
-        logging.info("使用 GPT-5 模型进行推理.")
+        logging.info("使用 %s 模型进行推理 (base=%s).", model_name, api_base)
     
     return llm

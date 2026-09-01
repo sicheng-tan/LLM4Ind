@@ -146,6 +146,7 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "LEMMA_LIBRARY=" in compact
     assert "PROMPT_RETARGET=" in compact
     assert "MODEL_TYPE=" in compact
+    assert "OPENAI_MODEL=" in compact
 
 
 def test_timeout_summary_from_artifacts(tmp_path: Path) -> None:

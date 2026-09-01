@@ -1,0 +1,2 @@
+p1_rev_rev: benchmarks/preprocessed/ind-ben/list/crafted_reverse_expressions/1  (rev (rev x) = x)
+p2_len_rev: benchmarks/preprocessed/vmcai15-dt/clam/nosg/goal5  (len (rev x) = len x)

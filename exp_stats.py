@@ -92,6 +92,7 @@ _FLAG_ENV = (
     "PROMPT_RETARGET",
     "UNPROVED_NOT_INVALID",
     "MODEL_TYPE",
+    "OPENAI_MODEL",
 )
 
 _FAILED_LEMMAS_RE = re.compile(r"^failed_lemmas((?:_\d+)*)\.json$")
@@ -252,6 +253,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "PROMPT_RETARGET": "on",
         "UNPROVED_NOT_INVALID": "on",
         "MODEL_TYPE": "gpt-4o",
+        "OPENAI_MODEL": "openai/gpt-5",
     }
     return {name: os.getenv(name, defaults[name]).strip() for name in _FLAG_ENV}
 

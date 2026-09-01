@@ -2,6 +2,11 @@
 运行说明.md
 .DS_Store
 
+# 个例实验：配置含密钥，结果目录内容不入库
+experiments/configs/*.env
+experiments/results/**
+!experiments/results/.gitkeep
+
 # 本地 AI / IDE 元数据
 .codex/
 .cursor/
