@@ -9,6 +9,7 @@ recursed), not empty / invalid / useless attempts.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -153,6 +154,10 @@ def add_proved_lemma(
             "depth": depth,
         })
         save_lemma_library(base_path, lemmas)
+        logging.info(
+            "lemma library +%s origin=%s attempt=%s depth=%s",
+            lib_id, origin, attempt, depth,
+        )
         return lib_id
 
 

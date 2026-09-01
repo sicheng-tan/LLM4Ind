@@ -3,7 +3,6 @@ import os
 import sys
 import logging
 import time
-import csv
 import signal
 import multiprocessing
 import shutil
@@ -17,6 +16,12 @@ import io
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import Mate_new_vampire as mate_solver
 from env_config import setup_environment
+from exp_stats import (
+    ensure_task_summary,
+    log_run_config,
+    print_batch_stats,
+    write_results_csv,
+)
 prove_run = mate_solver.prove_run
 
 # 加载配置
@@ -109,6 +114,13 @@ def run_task_with_timeout(folder, template_name, task_timeout, result_queue, str
             logging.info(f"🎯 Baseline模式: 开始执行任务: {os.path.basename(folder)}, 超时时间: {task_timeout}秒")
         else:
             logging.info(f"开始执行任务: {os.path.basename(folder)}, 策略模式: {strategy_mode}, 超时时间: {task_timeout}秒")
+        log_run_config(
+            backend="vampire",
+            strategy_mode=strategy_mode,
+            baseline=actual_baseline_mode,
+            task_timeout=task_timeout,
+            extra={"task": os.path.basename(folder)},
+        )
         final_status = prove_run(folder, template_name, 0, strategy_mode=strategy_mode, baseline_only=actual_baseline_mode)
         end_time = time.time()
         
@@ -219,31 +231,6 @@ def copy_folder_for_experiment(original_path):
     
     return new_folder_path
 
-def save_results_to_csv(results, output_path, original_root_path):
-    """将结果保存到CSV文件"""
-    # 按照文件夹名称的字母顺序排序
-    sorted_results = sorted(results, key=lambda x: os.path.basename(x[0]))
-    
-    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)        
-        for folder, status, duration in sorted_results:
-            result_str = "unsat" if status else ""
-            # 获取最后两层文件夹名称作为任务名称
-            path_parts = folder.rstrip(os.sep).split(os.sep)
-            if len(path_parts) >= 2:
-                folder_name = os.path.join(path_parts[-2], path_parts[-1])
-            else:
-                folder_name = os.path.basename(folder)  # 如果路径层级不够，回退到原来的方式
-            
-            # 计算从原始根目录开始的相对路径
-            try:
-                relative_path = os.path.relpath(folder, original_root_path)
-            except ValueError:
-                # 如果无法计算相对路径（比如在不同的驱动器上），使用绝对路径
-                relative_path = folder
-            
-            writer.writerow([folder_name, result_str, f"{duration:.2f}", relative_path])
-
 if __name__ == "__main__":
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='ProofMate实验运行器')
@@ -321,11 +308,10 @@ if __name__ == "__main__":
                     
                     if error:
                         print(f"\n任务执行出错: {os.path.basename(folder)} - 错误: {error}")
-                        # 使用实际的执行时间，而不是硬编码为0.0
-                        results.append((folder, False, duration))
+                        ensure_task_summary(folder, proved=False, error=str(error))
+                        results.append((folder, False, duration, error))
                     else:
-                        # 记录结果
-                        results.append((folder, final_status, duration))
+                        results.append((folder, final_status, duration, None))
                         
                         # 如果是unsat结果，更新计数器
                         if final_status:
@@ -337,8 +323,11 @@ if __name__ == "__main__":
                         
                 except Exception as e:
                     print(f"\n任务执行出错: {os.path.basename(folder_path)} - 错误: {str(e)}")
-                    # 对于无法获取结果的异常情况，时间记录为-1
-                    results.append((folder_path, False, -1))
+                    try:
+                        ensure_task_summary(folder_path, proved=False, error=str(e))
+                    except Exception:
+                        pass
+                    results.append((folder_path, False, -1, str(e)))
                 
                 # 更新进度条描述和进度
                 pbar.set_description(f"处理任务 (unsat: {unsat_count}/{total_tasks})")
@@ -361,16 +350,8 @@ if __name__ == "__main__":
     os.makedirs(result_csv_dir, exist_ok=True)
     
     csv_filepath = os.path.join(result_csv_dir, csv_filename)
-    save_results_to_csv(results, csv_filepath, original_root_path)
+    jsonl_filepath = write_results_csv(results, csv_filepath, original_root_path)
     
-    # 统计结果
-    successful_count = sum(1 for _, status, _ in results if status)
-    total_count = len(results)
-    
-    print(f"\n=== 执行完成 ===")
-    print(f"总任务数: {total_count}")
-    print(f"成功求解: {successful_count}")
-    print(f"失败任务: {total_count - successful_count}")
-    print(f"总执行时间: {total_duration:.2f}秒")
-    print(f"平均每任务时间: {total_duration/total_count:.2f}秒")
+    print_batch_stats(results, total_duration)
     print(f"结果已保存到: {csv_filepath}")
+    print(f"详细摘要已保存到: {jsonl_filepath}")
