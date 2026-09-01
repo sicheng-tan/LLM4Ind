@@ -18,8 +18,10 @@ os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 from exp_flags import (
     paper_schedule_prompt,
     progress_feedback_enabled,
+    prompt_retarget_active,
     prompt_retarget_enabled,
     repair_hints_enabled,
+    resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
 
@@ -84,6 +86,53 @@ def test_flags_default_on() -> None:
             assert prompt_retarget_enabled() is False
         with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": val}):
             assert unproved_not_invalid_enabled() is False
+
+
+def test_resolve_prompt_pack() -> None:
+    ours = resolve_prompt_pack("default", 3)
+    assert ours["folder_path"] == "./prompts_ours"
+    assert ours["strategies"] == [
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_term_rewrite",
+    ]
+    assert ours["total_attempts"] == 6
+    naive = resolve_prompt_pack("naive", 3)
+    assert naive["folder_path"] == "./prompts_naive"
+    assert naive["strategies"] == ["prompt_naive"]
+    assert naive["total_attempts"] == 6
+    assert prompt_retarget_active(len(naive["strategies"])) is False
+    zero = resolve_prompt_pack("zero_shot", 3)
+    assert zero["folder_path"] == "./prompts_ours"
+    assert zero["total_attempts"] == 6
+
+
+def test_naive_strategy_repeats_prompt_naive() -> None:
+    import Mate_new as mate
+
+    calls: list[str] = []
+
+    def fake_quick_run(_base, _name, prompt_strategy, folder_path, *_args, **_kwargs):
+        calls.append((prompt_strategy, folder_path))
+        return False, [], []
+
+    saved = _clear_flags()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
+            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
+                "Mate_new.routing_enabled", return_value=False
+            ), patch(
+                "Mate_new.perform_initial_verification", return_value=False
+            ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
+                mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
+            ):
+                assert mate.prove_run(tmp, "template", strategy_mode="naive") is False
+    finally:
+        _restore_flags(saved)
+
+    assert len(calls) == 6, calls
+    assert all(name == "prompt_naive" for name, _folder in calls)
+    assert all(folder == "./prompts_naive" for _name, folder in calls)
 
 
 def test_paper_schedule_prompt() -> None:
@@ -261,6 +310,7 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
 
 def main() -> int:
     test_flags_default_on()
+    test_resolve_prompt_pack()
     test_paper_schedule_prompt()
     test_prompt_hides_disabled_feedback_sections()
     test_add_repair_and_progress_respect_flags()
@@ -268,6 +318,7 @@ def main() -> int:
     test_unproved_flag_writes_invalid()
     test_repair_hints_off_skips_subgoal_diagnostic()
     test_prompt_retarget_off_uses_paper_order()
+    test_naive_strategy_repeats_prompt_naive()
     test_vampire_prompt_and_paper_order_respect_flags()
     print("exp flag tests passed")
     return 0

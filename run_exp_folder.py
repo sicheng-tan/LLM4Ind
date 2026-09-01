@@ -242,7 +242,8 @@ if __name__ == "__main__":
     parser.add_argument('--strategy-mode', type=str, 
                        choices=['default', 'zero_shot', 'naive'],
                        default='default',
-                       help='选择提示词策略模式: default(默认), zero_shot(零样本), naive(朴素)')
+                       help='提示词包: default/zero_shot 用 prompts_ours（等式+重写各 N 次）; '
+                            'naive 只用 prompt_naive 重复 2N 次，并关闭 prompt 模板选择')
     args = parser.parse_args()
     
     # 设置多进程启动方法（在某些系统上需要）
@@ -276,6 +277,8 @@ if __name__ == "__main__":
     else:
         print(f"🚀 运行模式: 完整模式 (包含LLM引理生成)")
         print(f"📝 策略模式: {args.strategy_mode}")
+        if args.strategy_mode == "naive":
+            print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
     
     # 存储所有结果
     results = []

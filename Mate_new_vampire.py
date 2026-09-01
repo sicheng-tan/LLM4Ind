@@ -65,8 +65,9 @@ from obligation_tree import (
 from exp_flags import (
     paper_schedule_prompt,
     progress_feedback_enabled,
-    prompt_retarget_enabled,
+    prompt_retarget_active,
     repair_hints_enabled,
+    resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
 from exp_stats import (
@@ -1934,7 +1935,12 @@ def _prove_run_body(
             strategy_mode=strategy_mode,
             baseline=baseline_only,
             task_timeout=config.get("TASK_TIMEOUT"),
-            extra={"goal": base_name, "prompt_pack": "ours"},
+            extra={
+                "goal": base_name,
+                "prompt_pack": resolve_prompt_pack(
+                    strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"]
+                )["mode"],
+            },
         )
 
     # 如果是baseline模式，直接调用quick_run进行初始验证
@@ -1958,46 +1964,11 @@ def _prove_run_body(
     ):
         return _done(True, "direct_prove")
 
-    # 定义prompt策略
-    prompt_default_strategies = [
-        "prove_prompt_equational_reasoning",
-        "prove_prompt_term_rewrite"
-    ]
-
-    # 作为ours
-    prompts_ours_strategies = [
-        "prove_prompt_equational_reasoning",
-        "prove_prompt_term_rewrite"
-    ]
-
-    prompts_naive_strategies = [
-        "prompt_naive" # 这个跑的时候应该是2x3=6次
-    ]
-
-    default_prompt_strategies = {
-        "folder_path": "./prompts_ours",
-        "strategies": prompt_default_strategies,
-        "max_attempts": config['MAX_ATTEMPTS_PER_PROMPT']
-    }
-
-    ours_prompt_strategies = {
-        "folder_path": "./prompts_ours",
-        "strategies": prompts_ours_strategies,
-        "max_attempts": config['MAX_ATTEMPTS_PER_PROMPT']
-    }
-
-    naive_prompt_strategies = {
-        "folder_path": "./prompts_naive",
-        "strategies": prompts_naive_strategies,
-        "max_attempts": config['MAX_ATTEMPTS_PER_PROMPT'] * 2
-    }
-    
-    select_use_prompt_strategies = ours_prompt_strategies
-
-    strategies = select_use_prompt_strategies["strategies"]
-    max_attempts_per_prompt = select_use_prompt_strategies["max_attempts"]
-    total_attempts = max_attempts_per_prompt * max(1, len(strategies))
-    retarget = prompt_retarget_enabled()
+    pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
+    strategies = pack["strategies"]
+    max_attempts_per_prompt = pack["max_attempts_per_prompt"]
+    total_attempts = pack["total_attempts"]
+    retarget = prompt_retarget_active(len(strategies))
     if retarget:
         hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
         current_prompt = select_generation_prompt(strategies, hint_list)
@@ -2012,14 +1983,15 @@ def _prove_run_body(
         retarget=retarget,
         start_prompt=current_prompt,
         total_attempts=total_attempts,
-        strategy_mode=strategy_mode,
+        strategy_mode=pack["mode"],
+        prompt_folder=pack["folder_path"],
         hint_signature=kind_signature,
     )
 
-    # Shared 2×3 budget. With PROMPT_RETARGET=on: hint family picks the
-    # template; both families sample once; kind-set changes can switch
-    # immediately; two consecutive empty/invalid/useless attempts toggle.
-    # With PROMPT_RETARGET=off: paper order, N attempts per template.
+    # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
+    # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
+    # (ours only): hint family picks the template. With retarget off: paper
+    # order, N attempts per template.
     for attempt in range(total_attempts):
         if not retarget:
             current_prompt = paper_schedule_prompt(
@@ -2060,7 +2032,7 @@ def _prove_run_body(
                 base_path,
                 base_name,
                 prompt_strategy,
-                select_use_prompt_strategies["folder_path"],
+                pack["folder_path"],
                 baseline_only=False,
                 solver_profile=solver_profile,
                 decision_source=decision_source,

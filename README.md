@@ -101,8 +101,14 @@ python3 run_exp_folder.py --root-path ./benchmarks/preprocessed/autoproof
 | 参数 | 说明 |
 |------|------|
 | `--root-path` | 预处理后的数据集路径 |
-| `--baseline` | 启用 baseline 模式（仅运行求解器初始验证，不使用 LLM） |
-| `--strategy-mode` | 提示词策略：`default`（默认）/ `zero_shot` / `naive` |
+| `--baseline` | 仅运行求解器初始验证，不使用 LLM |
+| `--strategy-mode` | 提示词包：`default` / `zero_shot` 用 `prompts_ours`（等式+重写各 N 次）；`naive` 只用 `prompt_naive` 重复 2N 次并关闭模板选择。N=`MAX_ATTEMPTS_PER_PROMPT`（默认 3） |
+
+朴素 prompt 对照：
+
+```bash
+python3 run_exp_folder.py --strategy-mode naive --root-path ./benchmarks/preprocessed/autoproof
+```
 
 **运行单个任务：**
 
