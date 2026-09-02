@@ -68,6 +68,10 @@ def setup_environment():
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'on')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
+    raw_llm_timeout = os.getenv('LLM_TIMEOUT')
+    llm_timeout = float(raw_llm_timeout) if raw_llm_timeout else None
+    raw_llm_retries = os.getenv('LLM_MAX_RETRIES')
+    llm_max_retries = int(raw_llm_retries) if raw_llm_retries not in (None, '') else None
 
     # 代理配置
     if http_proxy and https_proxy:
@@ -116,18 +120,33 @@ def setup_environment():
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROMPT_RETARGET': prompt_retarget,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,
+        'LLM_TIMEOUT': llm_timeout,
+        'LLM_MAX_RETRIES': llm_max_retries,
     }
+
+
+def _llm_call_kwargs(config):
+    """Optional per-request timeout / retry cap for ChatOpenAI."""
+    kwargs = {}
+    timeout = config.get('LLM_TIMEOUT')
+    if timeout:
+        kwargs['timeout'] = timeout
+    retries = config.get('LLM_MAX_RETRIES')
+    if retries is not None:
+        kwargs['max_retries'] = retries
+    return kwargs
 
 def setup_model(config):
     """根据配置初始化模型"""
+    call_kwargs = _llm_call_kwargs(config)
     if config['MODEL_TYPE'] == 'deepseek':
         llm = ChatOpenAI(
             model='deepseek-chat',
             openai_api_key=config['DEEPSEEK_API_KEY'],
             openai_api_base='https://api.deepseek.com',
             temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9  # 设置 top_p 为 0.9，增加创意
-            # max_tokens=1024
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
         )
         logging.info("使用 DeepSeek-chat 模型进行推理")
     elif config['MODEL_TYPE'] == 'qwen':
@@ -136,7 +155,8 @@ def setup_model(config):
             openai_api_key=config['QWEN_API_KEY'],
             openai_api_base='https://openrouter.ai/api/v1',
             temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9  # 设置 top_p 为 0.9，增加创意
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
         )
         logging.info("使用 Qwen 模型进行推理")
     elif config['MODEL_TYPE'] == 'gemini':
@@ -145,7 +165,8 @@ def setup_model(config):
             openai_api_key=config['GEMINI_API_KEY'],
             openai_api_base='https://openrouter.ai/api/v1',
             temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9  # 设置 top_p 为 0.9，增加创意
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
         )
         logging.info("使用 Gemini 模型进行推理")
     else:
@@ -156,8 +177,8 @@ def setup_model(config):
             openai_api_key=config['OPENAI_API_KEY'],
             openai_api_base=api_base,
             temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9  # 设置 top_p 为 0.9，增加创意
-            # temperature=0.7
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
         )
         logging.info("使用 %s 模型进行推理 (base=%s).", model_name, api_base)
     

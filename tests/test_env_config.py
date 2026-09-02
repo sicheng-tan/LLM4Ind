@@ -21,6 +21,8 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
                 "OPENAI_API_BASE=https://example.test/v1",
                 "OPENAI_MODEL=gpt-5.5",
                 "MODEL_TYPE=gpt-5.5",
+                "LLM_TIMEOUT=30",
+                "LLM_MAX_RETRIES=0",
             ]
         )
         + "\n",
@@ -32,6 +34,8 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
         "OPENAI_MODEL",
         "MODEL_TYPE",
         "DOTENV_PATH",
+        "LLM_TIMEOUT",
+        "LLM_MAX_RETRIES",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DOTENV_PATH", str(env_file))
@@ -41,3 +45,5 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
     assert config["OPENAI_API_BASE"] == "https://example.test/v1"
     assert config["OPENAI_MODEL"] == "gpt-5.5"
     assert config["MODEL_TYPE"] == "gpt-5.5"
+    assert config["LLM_TIMEOUT"] == 30.0
+    assert config["LLM_MAX_RETRIES"] == 0

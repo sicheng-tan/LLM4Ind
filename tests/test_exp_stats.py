@@ -202,6 +202,51 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
     assert summary["n_prompt_with_hints"] == 1
 
 
+def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
+    from exp_stats import LLM_PROMPTS_FILENAME, record_llm_generation
+
+    folder = str(tmp_path)
+    system = "* Task Environment\nYou are an expert."
+    user = "Input: SMTFile:\n(set-logic ALL)\n; SOLVER-GUIDED REPAIR\nneed_rewrite"
+    record = record_llm_generation(
+        folder,
+        goal="template",
+        strategy="prove_prompt_equational_reasoning",
+        prompt_folder="./prompts_ours",
+        smt_file=str(tmp_path / "template.smt2"),
+        system_text=system,
+        user_text=user,
+        lemmas=[
+            "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))",
+            "(forall ((n Nat)) (= (plus n zero) n))",
+        ],
+        elapsed=1.25,
+    )
+    assert record["n"] == 2
+    assert record["call"] == 1
+    text = (tmp_path / LLM_PROMPTS_FILENAME).read_text(encoding="utf-8")
+    assert "===== LLM CALL 1 =====" in text
+    assert "* Task Environment" in text
+    assert "(set-logic ALL)" in text
+    assert "need_rewrite" in text
+    assert "(forall ((n Nat)) (= (plus n zero) n))" in text
+
+    record_llm_generation(
+        folder,
+        goal="template_1",
+        strategy="prove_prompt_term_rewrite",
+        system_text="sys2",
+        user_text="user2 full prompt",
+        lemmas=[],
+        elapsed=0.4,
+        parse_error="响应格式错误，缺少输出标记",
+    )
+    text = (tmp_path / LLM_PROMPTS_FILENAME).read_text(encoding="utf-8")
+    assert "===== LLM CALL 2 =====" in text
+    assert "user2 full prompt" in text
+    assert "parse_error: 响应格式错误，缺少输出标记" in text
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         test_summarize_artifacts_counts_attempts_and_library(Path(tmp))
@@ -212,4 +257,6 @@ if __name__ == "__main__":
         test_timeout_summary_from_artifacts(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_prompt_blocks_and_timing_counters(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_record_llm_generation_writes_plain_prompt_dump(Path(tmp))
     print("exp_stats tests passed")

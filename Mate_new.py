@@ -81,6 +81,7 @@ from exp_stats import (
     log_prompt_blocks,
     log_run_config,
     log_subgoal_split,
+    record_llm_generation,
 )
 
 # 配置彩色日志
@@ -685,8 +686,8 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
 
     return "\n".join(parts)
 
-def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None) -> list:
-    """创建用于 LLM 的结构化消息列表"""
+def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None) -> Tuple[list, str]:
+    """创建用于 LLM 的结构化消息列表。返回 (messages, 本轮追加的反馈文本)。"""
     if folder_path is None:
         raise ValueError("folder path of prompts must be provided")
 
@@ -707,7 +708,7 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
         {"role": "user", "content": user_content}
     ]
     
-    return messages
+    return messages, failed_info
 
 def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
     """提取平衡的 forall 表达式"""
@@ -1353,16 +1354,37 @@ def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
 def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_file: Path, base_path: str, goal_name: str, folder_path: str) -> List[str]:
     """使用LLM生成引理"""
     logging.info(f"即将使用LLM生成引理, 目标文件: {goal_smt_file}, 提示策略: {prompt_strategy}")
-    messages = create_prompt(smt_content, prompt_strategy, base_path, goal_name, folder_path)
+    messages, feedback = create_prompt(smt_content, prompt_strategy, base_path, goal_name, folder_path)
+    system_text = (messages[0].get("content") if messages else "") or ""
+    user_text = (messages[1].get("content") if len(messages) > 1 else "") or ""
     started = time.time()
-    response = llm.invoke(messages)
-    add_llm_time(base_path, time.time() - started)
-    extracted_asserts = parse_llm_response(response.content)
-    
-    # logging.info(f"LLM response: {response.content}")
-    logging.info("从大模型返回中提取引理: %s", extracted_asserts)
-    log_exp("llm_lemmas", goal=goal_name, strategy=prompt_strategy, n=len(extracted_asserts))
-    
+    raw = ""
+    extracted_asserts: List[str] = []
+    parse_error = None
+    try:
+        response = llm.invoke(messages)
+        raw = getattr(response, "content", "") or ""
+        extracted_asserts = parse_llm_response(raw)
+    except Exception as exc:
+        parse_error = str(exc)
+        raise
+    finally:
+        elapsed = time.time() - started
+        add_llm_time(base_path, elapsed)
+        record_llm_generation(
+            base_path,
+            goal=goal_name,
+            strategy=prompt_strategy,
+            prompt_folder=folder_path,
+            smt_file=str(goal_smt_file),
+            system_text=system_text,
+            user_text=user_text,
+            feedback=feedback,
+            lemmas=extracted_asserts,
+            elapsed=elapsed,
+            parse_error=parse_error,
+            raw=raw,
+        )
     return extracted_asserts
 
 def normalize_formula(formula: str) -> str:

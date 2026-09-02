@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 EXP_SUMMARY_FILENAME = "exp_summary.json"
 LIBRARY_FILENAME = "lemma_library.json"
 COUNTERS_FILENAME = "exp_counters.json"
+LLM_PROMPTS_FILENAME = "llm_prompts.txt"
+_LEMMA_LOG_CHARS = 4000
 
 CSV_COLUMNS = [
     "task",
@@ -168,6 +170,144 @@ def bump_counters(folder: Optional[str], **delta: Any) -> Dict[str, Any]:
 def add_llm_time(folder: Optional[str], seconds: float) -> None:
     if folder and seconds and seconds > 0:
         bump_counters(folder, llm_s=round(float(seconds), 3), n_llm=1)
+
+
+def _compact_formula(formula: str, limit: int = _LEMMA_LOG_CHARS) -> str:
+    text = re.sub(r"\s+", " ", (formula or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _llm_prompts_path(folder: str) -> Path:
+    return Path(folder) / LLM_PROMPTS_FILENAME
+
+
+def _next_llm_call_index(folder: str) -> int:
+    """1-based index of the next LLM prompt dump. Caller must hold ``_COUNTER_LOCK``."""
+    path = _llm_prompts_path(folder)
+    if not path.exists():
+        return 1
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 1
+    return text.count("\n===== LLM CALL ") + 1
+
+
+def _format_llm_prompt_dump(
+    *,
+    call_index: int,
+    goal: str,
+    strategy: str,
+    prompt_folder: str,
+    smt_file: str,
+    elapsed: float,
+    system_text: str,
+    user_text: str,
+    lemmas: Sequence[str],
+    parse_error: Optional[str],
+) -> str:
+    header = [
+        "",
+        f"===== LLM CALL {call_index} =====",
+        f"goal: {goal}",
+        f"strategy: {strategy}",
+        f"prompt_folder: {prompt_folder or ''}",
+        f"smt_file: {Path(smt_file).name if smt_file else ''}",
+        f"elapsed_s: {round(float(elapsed or 0), 3)}",
+    ]
+    if parse_error:
+        header.append(f"parse_error: {parse_error}")
+    header.extend(
+        [
+            "",
+            "----- SYSTEM -----",
+            system_text or "",
+            "",
+            "----- USER -----",
+            user_text or "",
+            "",
+            f"----- EXTRACTED LEMMAS (n={len(lemmas)}) -----",
+        ]
+    )
+    if lemmas:
+        header.extend(str(item) for item in lemmas)
+    elif not parse_error:
+        header.append("(none)")
+    header.append("")
+    return "\n".join(header)
+
+
+def record_llm_generation(
+    folder: Optional[str],
+    *,
+    goal: str,
+    strategy: str,
+    prompt_folder: str = "",
+    smt_file: str = "",
+    system_text: str = "",
+    user_text: str = "",
+    feedback: str = "",
+    lemmas: Optional[Sequence[str]] = None,
+    elapsed: float = 0.0,
+    parse_error: Optional[str] = None,
+    raw: str = "",
+) -> Dict[str, Any]:
+    """Dump the full LLM input (system + user) as plaintext, plus extracted lemmas.
+
+    Does not store the raw model transcript. ``feedback`` is already inside
+    ``user_text``; it is accepted for callers but not written separately.
+    """
+    del feedback, raw
+    lemmas = [str(item) for item in (lemmas or []) if item]
+    call_index = 0
+    if folder:
+        try:
+            with _COUNTER_LOCK:
+                call_index = _next_llm_call_index(folder)
+                dump = _format_llm_prompt_dump(
+                    call_index=call_index,
+                    goal=goal,
+                    strategy=strategy,
+                    prompt_folder=prompt_folder,
+                    smt_file=smt_file,
+                    elapsed=elapsed,
+                    system_text=system_text,
+                    user_text=user_text,
+                    lemmas=lemmas,
+                    parse_error=parse_error,
+                )
+                with _llm_prompts_path(folder).open("a", encoding="utf-8") as handle:
+                    handle.write(dump)
+        except OSError:
+            call_index = 0
+    log_exp(
+        "llm_call",
+        goal=goal,
+        strategy=strategy,
+        call=call_index or None,
+        n=len(lemmas),
+        elapsed=round(float(elapsed or 0), 3),
+        prompt_file=LLM_PROMPTS_FILENAME if folder else None,
+        parse_error=parse_error,
+    )
+    for index, lemma in enumerate(lemmas, 1):
+        logging.info(
+            "[exp] llm_lemma goal=%s i=%s n=%s formula=%s",
+            goal,
+            index,
+            len(lemmas),
+            _compact_formula(lemma),
+        )
+    return {
+        "call": call_index,
+        "goal": goal,
+        "strategy": strategy,
+        "n": len(lemmas),
+        "lemmas": lemmas,
+        "parse_error": parse_error or None,
+    }
 
 
 def add_solver_time(folder: Optional[str], seconds: float, *, fallback: bool = False) -> None:
