@@ -52,6 +52,7 @@ from obligation_tree import (
     append_attempt,
     classify_failed_attempt,
     format_obligation_prompt,
+    format_diagnosis_tree_prompt,
     last_normal_tree,
     lemma_library_enabled,
     load_lemma_library,
@@ -71,12 +72,17 @@ from exp_flags import (
 )
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
+    FINAL_DIAGNOSIS_PROMPT_SUFFIX,
     defined_symbols_enabled,
+    is_invalid_diagnosis_reason,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
     node_attempt_plan,
     parse_llm_reason,
+    parse_final_diagnosis,
+    repair_hint_for_prompt,
     should_append_diagnosis_suffix,
+    should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
 )
@@ -321,9 +327,8 @@ def _store_last_llm_reason(base_path: str, goal_name: str, reason: Optional[str]
 def _record_blocking_lemma(
     base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None
 ) -> None:
-    """Useful-but-failed subgoal: unproved by default, invalid when the flag is off."""
+    """Situation A is tree-only when the flag is on; otherwise mark the lemma invalid."""
     if unproved_not_invalid_enabled():
-        add_unproved_lemma(base_path, goal_name, lemma, meta)
         return
     status = (meta or {}).get("status") or "useful_but_unproved"
     blocking = (meta or {}).get("blocking_subgoal") or ""
@@ -400,12 +405,16 @@ def _child_obligation_node(
         nested = last_normal_tree(load_failed_lemmas(base_path, subgoal).get("obligation"))
         if nested:
             children = list(nested.get("children") or [])
-    elif status == "failed":
+    elif status in ("failed", "cancelled"):
         child_data = load_failed_lemmas(base_path, subgoal)
         nested = last_normal_tree(child_data.get("obligation"))
         if nested:
             children = list(nested.get("children") or [])
-        tree_status, tree_reason = tree_status_from_child_data(child_data)
+        remapped, remapped_reason = tree_status_from_child_data(child_data)
+        if remapped == "invalid":
+            tree_status, tree_reason = remapped, remapped_reason
+        elif status == "failed":
+            tree_status, tree_reason = remapped, remapped_reason
     return make_child_node(
         node_id=subgoal,
         formula=formula,
@@ -487,7 +496,7 @@ def _record_subgoal_failure_feedback(
     subgoal: str,
     parent_lemmas: List[str],
 ) -> None:
-    """Reuse the child's first-prove diagnostics; fall back to a short diagnostic only if missing."""
+    """Invalid child lemmas go on the parent. Situation A is library + tree only."""
     child_profile = load_routing_state(base_path, subgoal).active_profile
     blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
     child_data = load_failed_lemmas(base_path, subgoal)
@@ -507,36 +516,6 @@ def _record_subgoal_failure_feedback(
                     "profile": child_profile,
                 },
             )
-    if repair_hints_enabled():
-        diag = _load_cached_diag(base_path, subgoal, "baseline_diag")
-        if diag is None:
-            subgoal_file = Path(base_path) / f"{subgoal}.smt2"
-            if subgoal_file.exists():
-                logging.info("子目标 %s 无缓存诊断，回退短诊断", subgoal)
-                diag = run_vampire_diagnostic(
-                    subgoal_file,
-                    timeout=_DIAGNOSTIC_TIMEOUT,
-                    show_induction=True,
-                    profile=child_profile,
-                )
-                _store_cached_diag(base_path, subgoal, "baseline_diag", diag)
-        if diag is not None:
-            hints = derive_repair_hints(diag, context=f"subgoal:{subgoal}")
-            hints.append({
-                "kind": "subgoal_failed",
-                "context": f"subgoal:{subgoal}",
-                "detail": (
-                    f"Lemma was useful for the parent goal but its own proof "
-                    f"({subgoal}) failed. Generate easier lemmas, or lemmas that "
-                    f"help prove this subgoal directly."
-                ),
-                "induction_focus": diag.induction_focus[:6],
-                "suggested_actions": [
-                    "Propose a weaker/simpler variant of the failing lemma",
-                    "Add bridging lemmas targeting the subgoal induction focus",
-                ],
-            })
-            add_repair_hints(base_path, parent_goal_name, hints)
     parent_state = load_routing_state(base_path, parent_goal_name)
     child_state = load_routing_state(base_path, subgoal)
     if child_state.active_profile:
@@ -623,7 +602,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
     if failed_data.get("invalid_lemmas"):
         parts.append(
             "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. "
-            "DO NOT generate these lemmas:"
+            "Do not generate these lemmas, and do not weaken them; use the reason:"
         )
         for i, record in enumerate(failed_data["invalid_lemmas"], 1):
             parts.append(f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}")
@@ -668,18 +647,13 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
     if unproved_not_invalid_enabled() and failed_data.get("unproved_lemmas"):
         parts.append(
             "\n; USEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
-            "own proofs timed out. Do not discard them; generate weaker variants or "
-            "bridging lemmas for them:"
+            "own proofs did not succeed. Do not discard them; generate weaker variants "
+            "or bridging lemmas for them:"
         )
         for i, record in enumerate(failed_data["unproved_lemmas"], 1):
             parts.append(
                 f"; Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
             )
-
-    if llm_lemma_diagnosis_enabled() and failed_data.get("last_llm_reason"):
-        parts.append(
-            f"; Previous empty output reason: {failed_data['last_llm_reason']}"
-        )
 
     if routing_enabled():
         routing_txt = format_routing_for_prompt(
@@ -689,19 +663,21 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
             parts.append(routing_txt)
 
     if repair_hints_enabled() and failed_data.get("repair_hints"):
-        parts.append(
-            "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
-            "Use these hints to choose the NEXT lemmas:"
-        )
-        for i, hint in enumerate(failed_data["repair_hints"], 1):
-            parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
-            focus = hint.get("induction_focus") or []
-            if focus:
-                parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
-            for schema in (hint.get("induction_formulas") or [])[:2]:
-                parts.append(f";   Induction schema: {schema}")
-            for action in hint.get("suggested_actions", [])[:3]:
-                parts.append(f";   -> {action}")
+        hints = [h for h in failed_data["repair_hints"] if repair_hint_for_prompt(h)]
+        if hints:
+            parts.append(
+                "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
+                "Use these hints to choose the NEXT lemmas:"
+            )
+            for i, hint in enumerate(hints, 1):
+                parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
+                focus = hint.get("induction_focus") or []
+                if focus:
+                    parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+                for schema in (hint.get("induction_formulas") or [])[:2]:
+                    parts.append(f";   Induction schema: {schema}")
+                for action in hint.get("suggested_actions", [])[:3]:
+                    parts.append(f";   -> {action}")
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
@@ -713,7 +689,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
 
     return "\n".join(parts)
 
-def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None, depth: int = 0) -> Tuple[list, str]:
+def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None, depth: int = 0, diagnosis_only: bool = False) -> Tuple[list, str]:
     """创建用于 LLM 的结构化消息列表。返回 (messages, 本轮追加的反馈文本)。"""
     if folder_path is None:
         raise ValueError("folder path of prompts must be provided")
@@ -726,12 +702,17 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
     failed_info = ""
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
-        failed_info = format_solver_feedback_for_prompt(failed_data, base_path=base_path)
+        if diagnosis_only:
+            failed_info = format_diagnosis_tree_prompt(failed_data.get("obligation"))
+        else:
+            failed_info = format_solver_feedback_for_prompt(failed_data, base_path=base_path)
         log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
     
     # 构建结构化消息列表
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
-    if should_append_diagnosis_suffix(depth):
+    if diagnosis_only:
+        user_content += FINAL_DIAGNOSIS_PROMPT_SUFFIX
+    elif should_append_diagnosis_suffix(depth):
         user_content += DIAGNOSIS_PROMPT_SUFFIX
     
     messages = [
@@ -1411,10 +1392,18 @@ def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
     logging.info(f"提取到原始目标: {original_assert.group(1)}, forall 表达式: {original_forall}")
     return original_assert, original_forall
 
-def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_file: Path, base_path: str, goal_name: str, folder_path: str, depth: int = 0) -> List[str]:
-    """使用LLM生成引理"""
-    logging.info(f"即将使用LLM生成引理, 目标文件: {goal_smt_file}, 提示策略: {prompt_strategy}")
-    messages, feedback = create_prompt(smt_content, prompt_strategy, base_path, goal_name, folder_path, depth=depth)
+def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_file: Path, base_path: str, goal_name: str, folder_path: str, depth: int = 0, diagnosis_only: bool = False) -> List[str]:
+    """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。"""
+    logging.info(
+        "即将使用LLM%s, 目标文件: %s, 提示策略: %s",
+        "鉴定当前目标" if diagnosis_only else "生成引理",
+        goal_smt_file,
+        prompt_strategy,
+    )
+    messages, feedback = create_prompt(
+        smt_content, prompt_strategy, base_path, goal_name, folder_path,
+        depth=depth, diagnosis_only=diagnosis_only,
+    )
     system_text = (messages[0].get("content") if messages else "") or ""
     user_text = (messages[1].get("content") if len(messages) > 1 else "") or ""
     started = time.time()
@@ -1424,8 +1413,19 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
     try:
         response = llm.invoke(messages)
         raw = getattr(response, "content", "") or ""
-        extracted_asserts = parse_llm_response(raw)
-        if extracted_asserts:
+        try:
+            extracted_asserts = parse_llm_response(raw)
+        except ValueError:
+            if not diagnosis_only:
+                raise
+            extracted_asserts = []
+        if diagnosis_only:
+            verdict, reason = parse_final_diagnosis(raw)
+            _store_last_llm_reason(
+                base_path, goal_name,
+                (reason or "invalid") if verdict == "invalid" else "failed",
+            )
+        elif extracted_asserts:
             _store_last_llm_reason(base_path, goal_name, None)
         elif llm_lemma_diagnosis_enabled():
             _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
@@ -1438,7 +1438,10 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
         record_llm_generation(
             base_path,
             goal=goal_name,
-            strategy=prompt_strategy,
+            strategy=(
+                f"{prompt_strategy}|final_diagnosis"
+                if diagnosis_only else prompt_strategy
+            ),
             prompt_folder=folder_path,
             smt_file=str(goal_smt_file),
             system_text=system_text,
@@ -1905,6 +1908,30 @@ def prove_subgoals_parallel(
             for sg in subgoals
         ]
 
+    def _collect_remaining(*, record_failures: bool) -> None:
+        """Cancel unstarted siblings; wait for in-flight ones so invalid/reason is kept."""
+        for f, sg in future_to_subgoal.items():
+            if sg in snapshots:
+                continue
+            if not f.done():
+                f.cancel()
+            try:
+                ok = f.result()
+            except Exception:
+                snapshots[sg] = _snap(sg, "cancelled")
+                continue
+            status = "proved" if ok else "failed"
+            if (
+                record_failures
+                and not ok
+                and parent_lemmas
+                and parent_goal_name
+            ):
+                _record_subgoal_failure_feedback(
+                    base_path, parent_goal_name, sg, parent_lemmas
+                )
+            snapshots[sg] = _snap(sg, status)
+
     with ThreadPoolExecutor(max_workers=min(len(subgoals), 4)) as executor:
         future_to_subgoal = {
             executor.submit(
@@ -1925,17 +1952,7 @@ def prove_subgoals_parallel(
                                 base_path, parent_goal_name, subgoal, parent_lemmas
                             )
                         snapshots[subgoal] = _snap(subgoal, "failed")
-                        for f, sg in future_to_subgoal.items():
-                            if sg in snapshots:
-                                continue
-                            if not f.done():
-                                f.cancel()
-                                snapshots[sg] = _snap(sg, "cancelled")
-                                continue
-                            try:
-                                snapshots[sg] = _snap(sg, "proved" if f.result() else "failed")
-                            except Exception:
-                                snapshots[sg] = _snap(sg, "cancelled")
+                        _collect_remaining(record_failures=True)
                         return False, _ordered()
                     snapshots[subgoal] = _snap(subgoal, "proved")
                     logging.info(f"✅ 子目标 {subgoal} 验证成功")
@@ -1946,17 +1963,12 @@ def prove_subgoals_parallel(
                             parent_goal_name, subgoal, parent_lemmas
                         )
                         if blocking is not None:
-                            add_unproved_lemma(
+                            _record_blocking_lemma(
                                 base_path, parent_goal_name, blocking,
                                 {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
                             )
                     snapshots[subgoal] = _snap(subgoal, "failed")
-                    for f, sg in future_to_subgoal.items():
-                        if sg in snapshots:
-                            continue
-                        if not f.done():
-                            f.cancel()
-                            snapshots[sg] = _snap(sg, "cancelled")
+                    _collect_remaining(record_failures=True)
                     return False, _ordered()
 
             logging.info(f"🌟 所有 {len(subgoals)} 个子目标并行验证通过")
@@ -1968,6 +1980,52 @@ def prove_subgoals_parallel(
                 if not f.done():
                     f.cancel()
             return False, _ordered("cancelled")
+
+
+def _run_final_goal_diagnosis(
+    base_path: str,
+    base_name: str,
+    depth: int,
+    pack: Dict[str, Any],
+    prompt_strategy: Optional[str],
+) -> bool:
+    """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?"""
+    if not should_run_final_diagnosis(depth):
+        return False
+    existing = load_failed_lemmas(base_path, base_name).get("node_outcome") or {}
+    if str(existing.get("kind") or "") == "invalid":
+        return True
+    smt_path = Path(base_path) / f"{base_name}.smt2"
+    if not smt_path.exists():
+        return False
+    strat = prompt_strategy or (pack.get("strategies") or [None])[0]
+    if not strat:
+        return False
+    logging.info("子目标 %s attempts 用尽，额外鉴定当前目标是否 invalid", base_name)
+    log_exp("final_diagnosis", goal=base_name, depth=depth)
+    try:
+        generate_lemmas_with_llm(
+            smt_path.read_text(encoding="utf-8"),
+            strat,
+            smt_path,
+            base_path,
+            base_name,
+            pack.get("folder_path"),
+            depth=depth,
+            diagnosis_only=True,
+        )
+    except Exception as exc:
+        logging.warning("最终鉴定调用失败: %s", exc)
+        return False
+    reason = load_failed_lemmas(base_path, base_name).get("last_llm_reason")
+    if not is_invalid_diagnosis_reason(reason):
+        logging.info("最终鉴定为 failed: %s", reason or "empty")
+        return False
+    _set_node_outcome(
+        base_path, base_name, kind="invalid", reason=reason, source="llm_final",
+    )
+    logging.info("子目标 %s 最终鉴定不可证: %s", base_name, reason)
+    return True
 
 
 def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None) -> bool:
@@ -2235,6 +2293,10 @@ def _prove_run_body(
     # the paper: this node already had a 60s initialCheck on the same file.
     # Keep the helper below (commented) in case we want to restore it.
     # return _retry_original_after_llm_exhausted(base_path, base_name)
+    if _run_final_goal_diagnosis(
+        base_path, base_name, depth, pack, current_prompt,
+    ):
+        return _done(False, "llm_invalid")
     return _done(False, "attempts_exhausted")
 
 

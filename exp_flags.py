@@ -41,7 +41,7 @@ def prompt_retarget_enabled() -> bool:
 
 
 def unproved_not_invalid_enabled() -> bool:
-    """Record a failed useful subgoal as useful_but_unproved instead of invalid."""
+    """When on, a useful-but-unproved subgoal stays off invalid_lemmas (tree-only)."""
     return _flag_enabled("UNPROVED_NOT_INVALID")
 
 

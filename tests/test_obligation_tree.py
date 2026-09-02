@@ -17,8 +17,10 @@ from obligation_tree import (
     append_attempt,
     classify_failed_attempt,
     compact_atp_from_failed_data,
+    format_diagnosis_tree_prompt,
     format_obligation_prompt,
     inject_library_axioms,
+    first_invalid_reason,
     last_normal_tree,
     lemma_library_enabled,
     lemma_library_path,
@@ -183,6 +185,35 @@ def test_compressed_prompt_matches_expected_shape() -> None:
     assert "│  " in rendered or "   ├─" in rendered or "   └─" in rendered
 
 
+def test_first_invalid_reason_walks_nested() -> None:
+    tree = make_goal_tree(
+        "template",
+        [
+            make_child_node(
+                node_id="template_1",
+                formula="(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))",
+                status="failed",
+                children=[
+                    make_child_node(
+                        node_id="template_1_1",
+                        formula="(forall ((m Nat)) (= (plus zero m) m))",
+                        status="failed",
+                    ),
+                    make_child_node(
+                        node_id="template_1_2",
+                        formula="(forall ((n Nat) (m Nat)) (= (plus (succ n) m) (succ (plus n m))))",
+                        status="invalid",
+                        reason="plus has no defining axioms",
+                    ),
+                ],
+            ),
+        ],
+        proved=False,
+    )
+    assert first_invalid_reason(tree) == "plus has no defining axioms"
+    assert first_invalid_reason({"status": "open", "children": []}) == ""
+
+
 def test_invalid_node_shows_reason_not_atp_hints() -> None:
     tree = make_goal_tree(
         "template",
@@ -203,6 +234,34 @@ def test_invalid_node_shows_reason_not_atp_hints() -> None:
     assert "L1  invalid [undefined_symbol:plus]" in text
     assert "need_rewrite" not in text
     assert "do not weaken" in text
+    assert "Child invalid: use its reason to judge whether the CURRENT goal is also invalid." in text
+
+
+def test_diagnosis_tree_prompt_omits_library_and_generation_legend() -> None:
+    library = [{"id": "lib_1", "formula": "(forall ((x Nat)) (= x x))"}]
+    tree = make_goal_tree(
+        "template",
+        [
+            make_child_node(
+                node_id="template_1",
+                formula="(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))",
+                status="invalid",
+                reason="plus has no axioms",
+            ),
+        ],
+        proved=False,
+    )
+    obligation = append_attempt({}, "obligation_tree", tree)
+    with _patch_flags("on", "on"):
+        text = format_diagnosis_tree_prompt(obligation)
+        mixed = format_obligation_prompt(library, obligation, for_diagnosis=True)
+    assert "Last obligation tree" in text
+    assert "L1  invalid [plus has no axioms]" in text
+    assert "do not propose lemmas" in text
+    assert "generate lemmas for the CURRENT goal only" not in text
+    assert "Library (already proved, in axioms):" not in text
+    assert "lib_1" not in mixed
+    assert "Library (already proved, in axioms):" not in mixed
 
 
 def test_compact_atp_keeps_actionable_hints() -> None:
@@ -406,7 +465,9 @@ def main() -> int:
     test_classify_failed_attempt()
     test_inject_library_axioms_before_proof_goal()
     test_compressed_prompt_matches_expected_shape()
+    test_first_invalid_reason_walks_nested()
     test_invalid_node_shows_reason_not_atp_hints()
+    test_diagnosis_tree_prompt_omits_library_and_generation_legend()
     test_compact_atp_keeps_actionable_hints()
     test_flags_default_on_and_off_synonyms()
     test_library_flag_controls_persist_and_inject()

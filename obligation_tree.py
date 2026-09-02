@@ -323,6 +323,19 @@ def short_label(node: dict) -> str:
     return f"L{rest}" if rest else node_id
 
 
+def first_invalid_reason(node: Optional[dict]) -> str:
+    """Depth-first reason from an invalid node; empty if the tree has none."""
+    if not isinstance(node, dict):
+        return ""
+    if str(node.get("status") or "") == "invalid":
+        return str(node.get("reason") or "").strip() or "invalid"
+    for child in node.get("children") or []:
+        found = first_invalid_reason(child)
+        if found:
+            return found
+    return ""
+
+
 def _guidance_bracket(node: dict) -> str:
     """Tree labels: only invalid carries a short reason. No ATP hint kinds."""
     if str(node.get("status") or "") != "invalid":
@@ -370,9 +383,14 @@ def format_obligation_prompt(
     *,
     include_library: Optional[bool] = None,
     include_tree: Optional[bool] = None,
+    for_diagnosis: bool = False,
 ) -> str:
     """Compressed, comment-prefixed block for the next LLM attempt."""
-    if include_library is None:
+    if for_diagnosis:
+        include_library = False
+        if include_tree is None:
+            include_tree = True
+    elif include_library is None:
         include_library = lemma_library_enabled()
     if include_tree is None:
         include_tree = obligation_tree_enabled()
@@ -381,12 +399,26 @@ def format_obligation_prompt(
     if not shown_library and not tree:
         return ""
 
+    tree_legend = (
+        [
+            "; OBLIGATION HISTORY: use this tree to judge whether the CURRENT goal is a theorem; do not propose lemmas.",
+            "; proved / failed / invalid describe child lemmas; only invalid includes a reason.",
+            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
+        ]
+        if for_diagnosis else
+        [
+            "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
+            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
+            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
+        ]
+    )
     parts = [""]
     if shown_library and tree:
         parts.extend([
             "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
             "; Library formulas are already axioms. Do not resend a failed split.",
             "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
+            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
         ])
     elif shown_library:
         parts.extend([
@@ -394,10 +426,7 @@ def format_obligation_prompt(
             "; You may reuse them; do not regenerate equivalent lemmas.",
         ])
     else:
-        parts.extend([
-            "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
-            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
-        ])
+        parts.extend(tree_legend)
     if shown_library:
         parts.append("; Library (already proved, in axioms):")
         for item in shown_library:
@@ -410,3 +439,14 @@ def format_obligation_prompt(
         for line in render_obligation_tree(tree):
             parts.append(f";   {line}")
     return "\n".join(parts)
+
+
+def format_diagnosis_tree_prompt(obligation: Optional[dict]) -> str:
+    """Tree-only block for the extra invalid-check LLM call."""
+    return format_obligation_prompt(
+        [],
+        obligation,
+        include_library=False,
+        include_tree=True,
+        for_diagnosis=True,
+    )

@@ -208,9 +208,10 @@ def test_subgoal_reuses_child_cache() -> None:
         diag.assert_not_called()
         parent = mate.load_failed_lemmas(tmp, "template")
         kinds = [h.get("kind") for h in parent.get("repair_hints") or []]
-        assert "subgoal_failed" in kinds
-        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
-        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["(assert true)"]
+        assert "subgoal_failed" not in kinds
+        assert "need_rewrite" not in kinds
+        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
 
 
 def test_subgoal_falls_back_when_cache_missing() -> None:
@@ -224,10 +225,12 @@ def test_subgoal_falls_back_when_cache_missing() -> None:
             mate._record_subgoal_failure_feedback(
                 tmp, "template", "template_1", ["(assert false)"]
             )
-        diag.assert_called_once()
-        cached = mate._load_cached_diag(tmp, "template_1", "baseline_diag")
-        assert cached is not None
-        assert cached.difficulty[0][1] == 4
+        diag.assert_not_called()
+        parent = mate.load_failed_lemmas(tmp, "template")
+        assert "subgoal_failed" not in [
+            h.get("kind") for h in parent.get("repair_hints") or []
+        ]
+        assert parent["unproved_lemmas"] == []
 
 
 def test_vampire_compact_and_subgoal_cache() -> None:
@@ -253,8 +256,10 @@ def test_vampire_compact_and_subgoal_cache() -> None:
             )
         diag.assert_not_called()
         parent = mv.load_failed_lemmas(tmp, "template")
-        assert any(h.get("kind") == "subgoal_failed" for h in parent["repair_hints"])
-        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["(assert true)"]
+        kinds = [h.get("kind") for h in parent.get("repair_hints") or []]
+        assert "subgoal_failed" not in kinds
+        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
 
 
 def test_empty_stats_skip_hint_and_utility() -> None:
@@ -432,26 +437,13 @@ def test_cvc_diagnostic_still_remaps_cvc4() -> None:
 
 
 def test_subgoal_hard_axioms_skip_proof_goal() -> None:
-    import Mate_new as mate
+    from cvc5_runner import hard_axioms_from_difficulty
 
     goal = "(not (forall ((x Int)) (P x)))"
     axiom = "(forall ((x Int)) (P x))"
-    child = CvcResult(
-        status="timeout",
-        difficulty=[(goal, 20), (axiom, 10)],
-        goal_term=goal,
-        strategy="cvc5_inductive",
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        mate._store_cached_diag(tmp, "template_1", "baseline_diag", child)
-        mate._record_subgoal_failure_feedback(
-            tmp, "template", "template_1", ["lemma-a"]
-        )
-        parent = mate.load_failed_lemmas(tmp, "template")
-        failed = next(h for h in parent["repair_hints"] if h.get("kind") == "subgoal_failed")
-        hard = failed.get("hard_axioms") or []
-        assert axiom in hard
-        assert goal not in hard
+    hard = hard_axioms_from_difficulty([(goal, 20), (axiom, 10)], goal)
+    assert axiom in hard
+    assert goal not in hard
 
 
 def test_repair_hints_keep_all_kinds() -> None:
@@ -504,14 +496,16 @@ def test_blocking_lemma_only_and_unmatched_skips_unproved() -> None:
             tmp, "template", "template_2", ["lemma-a", "lemma-b"]
         )
         parent = mate.load_failed_lemmas(tmp, "template")
-        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["lemma-b"]
+        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
 
         mate._store_cached_diag(tmp, "template_1_2", "baseline_diag", child)
         mate._record_subgoal_failure_feedback(
             tmp, "template", "template_1_2", ["lemma-a", "lemma-b"]
         )
         parent = mate.load_failed_lemmas(tmp, "template")
-        assert [r["lemma"] for r in parent["unproved_lemmas"]] == ["lemma-b"]
+        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
 
 
 def test_trivial_implication_and_control_shape() -> None:

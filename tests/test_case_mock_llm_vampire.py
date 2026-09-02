@@ -89,6 +89,17 @@ class ScriptedLLM:
 
     def invoke(self, messages, **_kwargs):
         text = _message_text(messages)
+        if "FINAL CHECK" in text:
+            self.calls.append(
+                {
+                    "n_lemmas": 0,
+                    "lemmas": [],
+                    "prompt_chars": len(text),
+                    "final_diagnosis": True,
+                }
+            )
+            logging.info("[mock-llm] call=%s final_diagnosis failed", len(self.calls))
+            return SimpleNamespace(content="failed\n")
         lemmas = lemmas_for_prompt(text)
         self.calls.append(
             {

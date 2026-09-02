@@ -262,7 +262,8 @@ def test_repair_hints_off_skips_subgoal_diagnostic() -> None:
         diag.assert_not_called()
         parent = mate.load_failed_lemmas(tmp, "template")
         assert parent["repair_hints"] == []
-        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
 
 
 def test_prompt_retarget_off_uses_paper_order() -> None:
