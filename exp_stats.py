@@ -93,6 +93,10 @@ _FLAG_ENV = (
     "FEEDBACK_PROGRESS",
     "PROMPT_RETARGET",
     "UNPROVED_NOT_INVALID",
+    "SUBGOAL_SAT_ABORT",
+    "LEMMA_DEFINED_SYMBOLS",
+    "LLM_LEMMA_DIAGNOSIS",
+    "CHILD_LLM_ATTEMPTS",
     "MODEL_TYPE",
     "OPENAI_MODEL",
 )
@@ -376,6 +380,7 @@ def log_subgoal_split(folder: Optional[str], goal: Optional[str], children: Sequ
         n=len(children),
         proved=int(counts.get("proved", 0)),
         failed=int(counts.get("failed", 0)),
+        invalid=int(counts.get("invalid", 0)),
         cancelled=int(counts.get("cancelled", 0)),
     )
 
@@ -392,6 +397,10 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "FEEDBACK_PROGRESS": "on",
         "PROMPT_RETARGET": "on",
         "UNPROVED_NOT_INVALID": "on",
+        "SUBGOAL_SAT_ABORT": "on",
+        "LEMMA_DEFINED_SYMBOLS": "on",
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "CHILD_LLM_ATTEMPTS": "2",
         "MODEL_TYPE": "gpt-4o",
         "OPENAI_MODEL": "openai/gpt-5",
     }

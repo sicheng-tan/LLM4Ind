@@ -45,6 +45,10 @@ def unproved_not_invalid_enabled() -> bool:
     return _flag_enabled("UNPROVED_NOT_INVALID")
 
 
+# Fail-fast / child-budget switches live in lemma_gates.py (same default-on
+# pattern). paper.env must set them off / CHILD_LLM_ATTEMPTS=0.
+
+
 def normalize_strategy_mode(strategy_mode: str) -> str:
     mode = (strategy_mode or "default").strip().lower().replace("-", "_")
     if mode in ("naive",):

@@ -174,12 +174,35 @@ def test_compressed_prompt_matches_expected_shape() -> None:
     assert "Last obligation tree (attempt 1; for reference only):" in text
     assert "G  open" in text
     assert "├─ lib_1  proved" in text
-    assert "└─ L2  failed [need_rewrite; focus: (plus x y)]" in text
+    assert "└─ L2  failed" in text
+    assert "need_rewrite" not in text
     assert "lib_2  proved" in text
     assert "L2_2  cancelled" in text
     assert "CURRENT goal" in text
     rendered = "\n".join(render_obligation_tree(tree))
     assert "│  " in rendered or "   ├─" in rendered or "   └─" in rendered
+
+
+def test_invalid_node_shows_reason_not_atp_hints() -> None:
+    tree = make_goal_tree(
+        "template",
+        [
+            make_child_node(
+                node_id="template_1",
+                formula="(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))",
+                status="invalid",
+                reason="undefined_symbol:plus",
+                atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
+            ),
+        ],
+        proved=False,
+    )
+    obligation = append_attempt({}, "obligation_tree", tree)
+    with _patch_flags("off", "on"):
+        text = format_obligation_prompt([], obligation)
+    assert "L1  invalid [undefined_symbol:plus]" in text
+    assert "need_rewrite" not in text
+    assert "do not weaken" in text
 
 
 def test_compact_atp_keeps_actionable_hints() -> None:
@@ -383,6 +406,7 @@ def main() -> int:
     test_classify_failed_attempt()
     test_inject_library_axioms_before_proof_goal()
     test_compressed_prompt_matches_expected_shape()
+    test_invalid_node_shows_reason_not_atp_hints()
     test_compact_atp_keeps_actionable_hints()
     test_flags_default_on_and_off_synonyms()
     test_library_flag_controls_persist_and_inject()

@@ -187,6 +187,10 @@ def test_mock_llm_case_experiments(result_parent: Path | None = None) -> Path:
         "FEEDBACK_PROGRESS": "on",
         "PROMPT_RETARGET": "on",
         "UNPROVED_NOT_INVALID": "on",
+        "SUBGOAL_SAT_ABORT": "on",
+        "LEMMA_DEFINED_SYMBOLS": "on",
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "CHILD_LLM_ATTEMPTS": "2",
     }
     results: list[tuple] = []
     with patch.dict(os.environ, env, clear=False), patch.object(mate, "llm", fake):

@@ -24,12 +24,20 @@ from exp_flags import (
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
+from lemma_gates import (
+    defined_symbols_enabled,
+    llm_lemma_diagnosis_enabled,
+    subgoal_sat_abort_enabled,
+)
 
 _FLAG_NAMES = (
     "FEEDBACK_REPAIR_HINTS",
     "FEEDBACK_PROGRESS",
     "PROMPT_RETARGET",
     "UNPROVED_NOT_INVALID",
+    "SUBGOAL_SAT_ABORT",
+    "LEMMA_DEFINED_SYMBOLS",
+    "LLM_LEMMA_DIAGNOSIS",
 )
 
 _FEEDBACK_PAYLOAD = {
@@ -75,6 +83,9 @@ def test_flags_default_on() -> None:
         assert progress_feedback_enabled() is True
         assert prompt_retarget_enabled() is True
         assert unproved_not_invalid_enabled() is True
+        assert subgoal_sat_abort_enabled() is True
+        assert defined_symbols_enabled() is True
+        assert llm_lemma_diagnosis_enabled() is True
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
@@ -86,6 +97,12 @@ def test_flags_default_on() -> None:
             assert prompt_retarget_enabled() is False
         with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": val}):
             assert unproved_not_invalid_enabled() is False
+        with patch.dict(os.environ, {"SUBGOAL_SAT_ABORT": val}):
+            assert subgoal_sat_abort_enabled() is False
+        with patch.dict(os.environ, {"LEMMA_DEFINED_SYMBOLS": val}):
+            assert defined_symbols_enabled() is False
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": val}):
+            assert llm_lemma_diagnosis_enabled() is False
 
 
 def test_resolve_prompt_pack() -> None:

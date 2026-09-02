@@ -624,7 +624,8 @@ def test_prompt_includes_compressed_obligation_tree() -> None:
     assert "lib_1:" in txt
     assert "Last obligation tree" in txt
     assert "G  open" in txt
-    assert "L2  failed [need_rewrite; focus: (plus x y)]" in txt
+    assert "L2  failed" in txt
+    assert "need_rewrite" not in txt
     assert "CURRENT goal" in txt
     assert "├─" in txt
 

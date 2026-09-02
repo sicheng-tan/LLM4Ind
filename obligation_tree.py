@@ -266,6 +266,7 @@ def make_child_node(
     status: str,
     lib: Optional[str] = None,
     atp: Optional[dict] = None,
+    reason: Optional[str] = None,
     children: Optional[List[dict]] = None,
 ) -> dict:
     node: Dict[str, Any] = {
@@ -276,11 +277,9 @@ def make_child_node(
         "lib": lib,
         "children": list(children or []),
     }
-    if atp and (atp.get("hints") or atp.get("focus")):
-        node["atp"] = {
-            "hints": list(atp.get("hints") or [])[:MAX_HINT_KINDS],
-            "focus": list(atp.get("focus") or [])[:MAX_FOCUS_TERMS],
-        }
+    # ATP hints stay on the node prompt (FEEDBACK_REPAIR_HINTS), not the tree.
+    if reason and status == "invalid":
+        node["reason"] = compact_formula(str(reason), MAX_FOCUS_CHARS * 2)
     return node
 
 
@@ -325,15 +324,13 @@ def short_label(node: dict) -> str:
 
 
 def _guidance_bracket(node: dict) -> str:
-    atp = node.get("atp") or {}
-    bits = [str(h) for h in (atp.get("hints") or [])[:MAX_HINT_KINDS]]
-    focus = [compact_formula(t, MAX_FOCUS_CHARS) for t in (atp.get("focus") or [])[:MAX_FOCUS_TERMS]]
-    focus = [t for t in focus if t]
-    if focus:
-        bits.append("focus: " + "; ".join(focus))
-    if not bits:
+    """Tree labels: only invalid carries a short reason. No ATP hint kinds."""
+    if str(node.get("status") or "") != "invalid":
         return ""
-    return " [" + "; ".join(bits) + "]"
+    reason = compact_formula(node.get("reason"), MAX_FOCUS_CHARS * 2)
+    if not reason:
+        return ""
+    return f" [{reason}]"
 
 
 def _node_line(node: dict, *, is_root: bool = False) -> str:
@@ -388,8 +385,8 @@ def format_obligation_prompt(
     if shown_library and tree:
         parts.extend([
             "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
-            "; Library formulas are already axioms. Do not resend a failed split;",
-            "; you may reuse proved lemmas, weaken a failed lemma, or choose a new split.",
+            "; Library formulas are already axioms. Do not resend a failed split.",
+            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
         ])
     elif shown_library:
         parts.extend([
@@ -399,7 +396,7 @@ def format_obligation_prompt(
     else:
         parts.extend([
             "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
-            "; The last well-formed tree is for reference; do not resend a failed split.",
+            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
         ])
     if shown_library:
         parts.append("; Library (already proved, in axioms):")
