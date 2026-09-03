@@ -7,7 +7,7 @@ Design notes vs Vampire:
 - Diagnostic path: short single-strategy run for usefulness-failure sidecars.
 - Difficulty: SMT-LIB produce-difficulty / get-difficulty (cvc5-specific).
 - Unsat cores on inductive problems are unreliable; we do NOT depend on them
-  for lemma pruning (unlike Vampire ucore).
+  for lemma pruning (unlike Vampire, which also no longer prunes via ucore).
 """
 
 import subprocess

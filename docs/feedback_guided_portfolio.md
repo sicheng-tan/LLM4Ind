@@ -4,6 +4,7 @@
 
 相关信号细节：
 
+- 当前闭环与指标（含 cand vs baseline 改动备忘）：[当前反馈闭环与指标设计.md](当前反馈闭环与指标设计.md)
 - Vampire 统计 / 归纳焦点 / unsat core：[vampire_feedback.md](vampire_feedback.md)
 - CVC5 stats / difficulty：[cvc5_feedback.md](cvc5_feedback.md)
 - 相对进度度量：[relative_metrics.md](relative_metrics.md)

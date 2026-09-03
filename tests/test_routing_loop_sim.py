@@ -175,7 +175,7 @@ def test_quick_run_simulated_llm_and_3s_feedback() -> None:
         (Path(tmp) / "template.smt2").write_text(ADT_SMT, encoding="utf-8")
         with patch.dict(
             os.environ,
-            {"SOLVER_ROUTING": "on", "SOLVER_ROUTING_PROBES": "off"},
+            {"SOLVER_ROUTING": "on", "SOLVER_ROUTING_PROBES": "off", "FEEDBACK_PROGRESS": "on"},
             clear=False,
         ), patch(
             "Mate_new.generate_lemmas_with_llm", return_value=lemmas

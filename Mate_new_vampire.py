@@ -73,7 +73,10 @@ from exp_flags import (
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    attach_source_lemmas,
     defined_symbols_enabled,
+    format_mix_source_comment,
+    group_repair_hints_by_mix_source,
     is_invalid_diagnosis_reason,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
@@ -485,7 +488,10 @@ def _record_failed_prove_diagnostics(
         return
     if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
         _store_cached_diag(base_path, goal_name, "baseline_diag", result)
-    add_repair_hints(base_path, goal_name, derive_repair_hints(result, context=context))
+    add_repair_hints(
+        base_path, goal_name,
+        attach_source_lemmas(derive_repair_hints(result, context=context), [], context=context),
+    )
     if result.induction_focus:
         logging.info("归纳焦点 (%s): %s", context, result.induction_focus[:4])
 
@@ -542,6 +548,34 @@ def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
 
 def _result_has_stats(result: VampireResult) -> bool:
     return any(int(v or 0) > 0 for v in (result.stats or {}).values())
+
+
+def _usefulness_has_mix_signal(result: VampireResult) -> bool:
+    """True when the failed A∧C→P run can yield a mix / focus hint."""
+    if result.proved:
+        return False
+    if _result_has_stats(result):
+        return True
+    return bool(result.induction_focus or result.induction_formulas)
+
+
+def _record_failed_usefulness_mix(
+    base_path: str,
+    goal_name: str,
+    result: VampireResult,
+    lemmas: Optional[List[str]] = None,
+) -> None:
+    """Single-run mix from the failed full-timeout A∧C→P prove, not the 3s sidecar."""
+    if not _usefulness_has_mix_signal(result):
+        return
+    add_repair_hints(
+        base_path, goal_name,
+        attach_source_lemmas(
+            derive_repair_hints(result, context="usefulness_check"),
+            lemmas,
+            context="usefulness_check",
+        ),
+    )
 
 
 def record_solver_attempt(
@@ -669,15 +703,25 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
                 "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
                 "Use these hints to choose the NEXT lemmas:"
             )
-            for i, hint in enumerate(hints, 1):
-                parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
-                focus = hint.get("induction_focus") or []
-                if focus:
-                    parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
-                for schema in (hint.get("induction_formulas") or [])[:2]:
-                    parts.append(f";   Induction schema: {schema}")
-                for action in hint.get("suggested_actions", [])[:3]:
-                    parts.append(f";   -> {action}")
+            parts.append(
+                "; Mix kinds describe the solver run under Mix source; "
+                "they are not the obligation tree."
+            )
+            n = 1
+            for group in group_repair_hints_by_mix_source(hints):
+                parts.extend(format_mix_source_comment(group[0]))
+                for hint in group:
+                    parts.append(
+                        f"; Repair hint {n} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
+                    )
+                    focus = hint.get("induction_focus") or []
+                    if focus:
+                        parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+                    for schema in (hint.get("induction_formulas") or [])[:2]:
+                        parts.append(f";   Induction schema: {schema}")
+                    for action in (hint.get("suggested_actions") or [])[:3]:
+                        parts.append(f";   -> {action}")
+                    n += 1
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
@@ -908,13 +952,9 @@ def analyze_lemma_progress(
         _store_cached_diag(base_path, goal_name, "baseline_diag_short", progress_baseline)
         if hint_baseline is None:
             _store_cached_diag(base_path, goal_name, "baseline_diag", progress_baseline)
-            add_repair_hints(
-                base_path, goal_name,
-                derive_repair_hints(progress_baseline, context="baseline_goal"),
-            )
             hint_baseline = progress_baseline
         else:
-            logging.info("Vampire progress 使用 3s short baseline；60s 结果只用于 repair hint")
+            logging.info("Vampire progress 使用 3s short baseline；mix 来自失败的 60s A∧C→P")
     else:
         logging.info("复用缓存的 Vampire 3s progress baseline (profile=%s)", want)
     if hint_baseline is None:
@@ -987,16 +1027,14 @@ def verify_combined_lemmas(
 ) -> Tuple[bool, List[str], Optional[VampireResult]]:
     """
     有用性检查，对齐原文：只做一次整组 A∧C→P。
-    成功时用同一次 run 的 unsat core 剪枝（不额外超时）。
-    失败后不二次满超时、不枚举子集再证明，仅做短诊断写入下一轮。
+    成功时保留全部引理（不做 ucore 剪枝）。
+    失败后用这次满超时 prove 的统计写 mix hint；不二次满超时、不枚举子集。
     """
     combined_timeout = config['COMBINED_CVC_TIMEOUT']
     work_dir = output_path.parent
     gname = goal_name or output_path.stem
 
-    # 1) Full set with named lemmas → prove + optional ucore filtering
-    named_path = work_dir / f"{output_path.stem}_named.smt2"
-    _write_combined_smt(original_assert, asserts, original_content, named_path, named=True)
+    _write_combined_smt(original_assert, asserts, original_content, output_path, named=False)
     state = load_routing_state(base_path, gname) if base_path else GoalSearchState()
     if solver_profile:
         set_routing_candidates(
@@ -1008,67 +1046,52 @@ def verify_combined_lemmas(
         state.decision_source = decision_source or state.decision_source
         if base_path:
             save_routing_state(base_path, gname, state)
-    ucore_result = run_vampire_routed(
-        named_path, timeout=combined_timeout, state=state, collect_ucore=True
+    useful_result = run_vampire_routed(
+        output_path,
+        timeout=combined_timeout,
+        state=state,
+        collect_stats=True,
+        collect_ucore=False,
+        show_induction=True,
     )
     record_solver_attempt(
         base_path,
         gname,
         prompt_strategy=prompt_strategy,
         selected_profile=solver_profile or state.active_profile,
-        result=ucore_result,
+        result=useful_result,
     )
 
     log_exp(
         "usefulness",
         goal=gname,
-        proved=ucore_result.proved,
-        status=ucore_result.status,
-        elapsed=ucore_result.elapsed,
-        strategy=ucore_result.strategy,
+        proved=useful_result.proved,
+        status=useful_result.status,
+        elapsed=useful_result.elapsed,
+        strategy=useful_result.strategy,
         n_lemmas=len(asserts),
-        n_kept=(
-            len(ucore_result.used_lemma_names)
-            if ucore_result.proved and ucore_result.used_lemma_names
-            else (len(asserts) if ucore_result.proved else 0)
-        ),
+        n_kept=len(asserts) if useful_result.proved else 0,
         profile=solver_profile or state.active_profile,
     )
-    if ucore_result.proved:
-        used = []
-        if ucore_result.used_lemma_names:
-            for name in ucore_result.used_lemma_names:
-                m = re.fullmatch(r"lemma_(\d+)", name)
-                if m:
-                    idx = int(m.group(1)) - 1
-                    if 0 <= idx < len(asserts):
-                        used.append(asserts[idx])
-        selected = used if used else list(asserts)
-        # Also write the non-named combined file for debugging compatibility
-        _write_combined_smt(original_assert, selected, original_content, output_path, named=False)
+    if useful_result.proved:
         logging.info(
-            "组合引理证出目标；ucore 保留 %d/%d 条引理",
-            len(selected), len(asserts),
+            "组合引理证出目标；保留全部 %d 条引理（不做 ucore 剪枝）",
+            len(asserts),
         )
-        return True, selected, ucore_result
-
-    # Same lemmas, one attempt: do not re-prove at full timeout or search subsets.
-    _write_combined_smt(original_assert, asserts, original_content, output_path, named=False)
+        return True, list(asserts), useful_result
 
     progressive: List[str] = []
-    baseline = VampireResult(status="unknown")
     if base_path and goal_name:
-        meta = {"status": ucore_result.status}
+        meta = {"status": useful_result.status}
+        _record_failed_usefulness_mix(base_path, gname, useful_result, asserts)
         if progress_feedback_enabled():
-            progressive, baseline = analyze_lemma_progress(
+            progressive, _baseline = analyze_lemma_progress(
                 original_assert, asserts, original_content, work_dir, gname, base_path
             )
-            hint_kind = "no_progress"
-            if progressive:
-                hint_kind = "partial_progress"
+            hint_kind = "partial_progress" if progressive else "no_progress"
             meta["hint_kind"] = hint_kind
             meta["progressive_count"] = len(progressive)
-            add_repair_hints(base_path, goal_name, [{
+            add_repair_hints(base_path, goal_name, attach_source_lemmas([{
                 "kind": hint_kind,
                 "context": "usefulness_check",
                 "detail": (
@@ -1081,7 +1104,7 @@ def verify_combined_lemmas(
                         "(generalization / rewrite bridge)."
                     )
                 ),
-                "induction_focus": baseline.induction_focus[:6],
+                "induction_focus": useful_result.induction_focus[:6],
                 "progress_signals": load_failed_lemmas(
                     base_path, goal_name
                 ).get("progress_routing_signals") or [],
@@ -1090,7 +1113,7 @@ def verify_combined_lemmas(
                     "Target induction focus terms reported by Vampire",
                     "Do not repeat the same useless lemma group",
                 ],
-            }])
+            }], asserts, context="usefulness_check"))
         add_useless_lemma_group(
             base_path,
             goal_name,
@@ -1098,7 +1121,7 @@ def verify_combined_lemmas(
             meta=meta,
         )
 
-    return False, progressive, ucore_result
+    return False, progressive, useful_result
 
 
 def perform_initial_verification(
@@ -1844,7 +1867,7 @@ def quick_run(
         return False, [], extracted_asserts
 
 
-    # 步骤6: 一次整组有用性检查；失败则短诊断反馈（不搜索子集证明）
+    # 步骤6: 一次整组有用性检查；失败则用 60s A∧C→P 写 mix（可选 sidecar 只打 progress）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
     useful, selected_lemmas, _vres = verify_combined_lemmas(
         original_assert,
@@ -1866,7 +1889,7 @@ def quick_run(
         len(selected_lemmas), len(extracted_asserts),
     )
 
-    # 步骤7: 生成正式验证文件（仅对 ucore/子集保留的引理）
+    # 步骤7: 生成正式验证文件（有用性成功则整组保留）
     generated_files = generate_formal_proof_files(
         selected_lemmas, smt_content, smt_file_path, goal_smt_name
     )
@@ -1992,9 +2015,14 @@ def _run_final_goal_diagnosis(
     """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?"""
     if not should_run_final_diagnosis(depth):
         return False
-    existing = load_failed_lemmas(base_path, base_name).get("node_outcome") or {}
+    failed_data = load_failed_lemmas(base_path, base_name)
+    existing = failed_data.get("node_outcome") or {}
     if str(existing.get("kind") or "") == "invalid":
         return True
+    if last_normal_tree(failed_data.get("obligation")) is None:
+        logging.info("子目标 %s 无可用义务树，跳过最终鉴定", base_name)
+        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_tree")
+        return False
     smt_path = Path(base_path) / f"{base_name}.smt2"
     if not smt_path.exists():
         return False

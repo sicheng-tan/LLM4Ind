@@ -19,6 +19,9 @@ from exp_flags import resolve_prompt_pack
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    attach_source_lemmas,
+    format_mix_source_comment,
+    group_repair_hints_by_mix_source,
     is_invalid_diagnosis_reason,
     node_attempt_plan,
     parse_final_diagnosis,
@@ -76,6 +79,7 @@ def test_parse_llm_reason() -> None:
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
         assert should_run_final_diagnosis(1) is True
         assert should_run_final_diagnosis(0) is False
+        assert should_run_final_diagnosis(1, has_tree=False) is False
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert should_run_final_diagnosis(1) is False
 
@@ -148,6 +152,72 @@ def test_repair_hint_for_prompt_drops_subgoal_atp() -> None:
     assert not repair_hint_for_prompt({
         "kind": "induction_stuck", "context": "subgoal:template_1",
     })
+
+
+def test_mix_source_names_candidate_lemmas() -> None:
+    initial = attach_source_lemmas(
+        [{"kind": "need_rewrite", "context": "initial_goal", "detail": "d"}],
+        [],
+        context="initial_goal",
+    )
+    useful = attach_source_lemmas(
+        [{"kind": "need_rewrite", "context": "usefulness_check", "detail": "d2"}],
+        [PLUS_LEMMA],
+        context="usefulness_check",
+    )
+    assert "no candidate lemmas" in "\n".join(format_mix_source_comment(initial[0]))
+    src = "\n".join(format_mix_source_comment(useful[0]))
+    assert "failed usefulness check" in src
+    assert "C1:" in src
+    assert "plus" in src
+    groups = group_repair_hints_by_mix_source(initial + useful)
+    assert len(groups) == 2
+
+
+def test_prompt_mix_source_and_kept_tree() -> None:
+    import Mate_new_vampire as mate
+    from obligation_tree import append_attempt, make_child_node, make_goal_tree
+
+    tree = make_goal_tree(
+        "template",
+        [make_child_node(node_id="template_1", formula=PLUS_LEMMA, status="failed")],
+        proved=False,
+    )
+    data = mate._empty_failed_data()
+    data["repair_hints"] = attach_source_lemmas(
+        [{
+            "kind": "need_rewrite",
+            "context": "usefulness_check",
+            "detail": "rewrite scarce with C2",
+            "suggested_actions": [],
+        }],
+        [SNOC_LEMMA],
+        context="usefulness_check",
+    ) + attach_source_lemmas(
+        [{
+            "kind": "induction_stuck",
+            "context": "initial_goal",
+            "detail": "stuck on goal",
+            "suggested_actions": [],
+        }],
+        [],
+        context="initial_goal",
+    )
+    data["obligation"] = append_attempt({}, "obligation_tree", tree)
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {
+            "FEEDBACK_REPAIR_HINTS": "on",
+            "OBLIGATION_TREE": "on",
+            "LEMMA_LIBRARY": "off",
+        }):
+            txt = mate.format_solver_feedback_for_prompt(data, base_path=tmp)
+    assert "Mix source: failed usefulness check" in txt
+    assert "C1:" in txt
+    assert "snoc" in txt.lower() or "cons" in txt
+    assert "Mix source: initial prove of the CURRENT goal" in txt
+    assert "Last obligation tree" in txt
+    assert "later useless attempts do not replace it" in txt
+    assert "they are not the obligation tree" in txt
 
 
 def test_quick_run_rejects_undefined_plus() -> None:
@@ -502,6 +572,47 @@ def test_final_diagnosis_marks_goal_invalid() -> None:
         assert outcome.get("source") == "llm_final"
 
 
+def test_final_diagnosis_skipped_without_tree() -> None:
+    import Mate_new_vampire as mate
+    from obligation_tree import last_normal_tree
+
+    diag = {"n": 0}
+
+    def fake_quick(*_args, **_kwargs):
+        return False, [], [
+            "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
+        ]
+
+    def fake_gen(*_args, diagnosis_only=False, **_kwargs):
+        if diagnosis_only:
+            diag["n"] += 1
+        return []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "CHILD_LLM_ATTEMPTS": "2",
+            "SUBGOAL_SAT_ABORT": "off",
+            "LEMMA_LIBRARY": "off",
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "OBLIGATION_TREE": "on",
+        }), patch(
+            "Mate_new_vampire.perform_initial_verification", return_value=False
+        ), patch(
+            "Mate_new_vampire.quick_run", side_effect=fake_quick
+        ), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen
+        ):
+            ok = mate.prove_run(tmp, "template", depth=1)
+        assert ok is False
+        assert diag["n"] == 0
+        obligation = mate.load_failed_lemmas(tmp, "template").get("obligation") or {}
+        assert last_normal_tree(obligation) is None
+        outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
+        assert outcome.get("kind") != "invalid"
+
+
 def test_final_diagnosis_skipped_at_root() -> None:
     import Mate_new_vampire as mate
 
@@ -538,6 +649,8 @@ def main() -> int:
     test_tree_status_sat_is_invalid()
     test_tree_status_nested_invalid_does_not_mark_parent()
     test_repair_hint_for_prompt_drops_subgoal_atp()
+    test_mix_source_names_candidate_lemmas()
+    test_prompt_mix_source_and_kept_tree()
     test_quick_run_rejects_undefined_plus()
     test_sat_aborts_child_without_llm()
     test_diagnosis_suffix_flag()
@@ -549,6 +662,7 @@ def main() -> int:
     test_invalid_child_does_not_stop_parent_attempts()
     test_final_diagnosis_prompt_is_tree_only()
     test_final_diagnosis_marks_goal_invalid()
+    test_final_diagnosis_skipped_without_tree()
     test_final_diagnosis_skipped_at_root()
     print("lemma gate tests passed")
     return 0

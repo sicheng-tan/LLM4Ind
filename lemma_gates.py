@@ -4,8 +4,9 @@ Boolean flags default on (current method). Set them off in paper.env to restore
 the original loop. CHILD_LLM_ATTEMPTS=0 keeps the root 2N budget at every depth.
 The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
-judges whether the CURRENT goal is invalid from the obligation tree only
-(no invalid/unproved/repair/progress/routing blocks).
+judges whether the CURRENT goal is invalid from the last well-formed obligation
+tree only (no invalid/unproved/repair/progress/routing blocks). Skip the extra
+call when that tree does not exist.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import _flag_enabled
+from obligation_tree import compact_formula, normalize_lemma_formula
 
 _DECLARE_FUN = re.compile(
     r"\(declare-fun\s+([A-Za-z_][A-Za-z0-9_+*/<>=!?-]*)"
@@ -71,6 +73,7 @@ _VERDICT_LINE = re.compile(
 )
 
 MAX_REASON_CHARS = 200
+MAX_MIX_SOURCE_LEMMAS = 6
 
 
 def subgoal_sat_abort_enabled() -> bool:
@@ -120,9 +123,17 @@ def node_attempt_plan(depth: int, pack: Dict[str, Any]) -> Tuple[int, int]:
     return capped, per_capped
 
 
-def should_run_final_diagnosis(depth: int = 0) -> bool:
-    """Extra invalid-check LLM call after child attempts are exhausted."""
-    return int(depth or 0) >= 1 and llm_lemma_diagnosis_enabled()
+def should_run_final_diagnosis(depth: int = 0, *, has_tree: bool = True) -> bool:
+    """Extra invalid-check LLM call after child attempts are exhausted.
+
+    Requires a last well-formed obligation tree. Empty / invalid / useless
+    attempts do not create one, and the extra call is skipped.
+    """
+    return (
+        int(depth or 0) >= 1
+        and llm_lemma_diagnosis_enabled()
+        and bool(has_tree)
+    )
 
 
 def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
@@ -214,6 +225,79 @@ def repair_hint_for_prompt(hint: dict) -> bool:
     if kind == "subgoal_failed" or context.startswith("subgoal:"):
         return False
     return True
+
+
+def attach_source_lemmas(
+    hints: Sequence[dict],
+    lemmas: Optional[Sequence[str]] = None,
+    *,
+    context: Optional[str] = None,
+) -> List[dict]:
+    """Copy hints and record which candidate lemmas the mix run used."""
+    formulas = [
+        normalize_lemma_formula(str(item))
+        for item in (lemmas or [])
+        if normalize_lemma_formula(str(item))
+    ]
+    attached: List[dict] = []
+    for hint in hints or []:
+        rec = dict(hint)
+        rec["source_lemmas"] = list(formulas)
+        if context:
+            rec["context"] = context
+        attached.append(rec)
+    return attached
+
+
+def mix_source_key(hint: Optional[dict]) -> Tuple[str, Tuple[str, ...]]:
+    rec = hint or {}
+    lemmas = tuple(
+        normalize_lemma_formula(str(item))
+        for item in (rec.get("source_lemmas") or [])
+        if normalize_lemma_formula(str(item))
+    )
+    return (str(rec.get("context") or ""), lemmas)
+
+
+def format_mix_source_comment(hint: Optional[dict]) -> List[str]:
+    """Prompt lines naming the solver run a mix kind came from."""
+    context, lemmas = mix_source_key(hint)
+    if context == "usefulness_check" or lemmas:
+        lines = [
+            "; Mix source: failed usefulness check "
+            "(axioms + these lemmas => CURRENT goal):",
+        ]
+        shown = lemmas[:MAX_MIX_SOURCE_LEMMAS]
+        if not shown:
+            lines.append(";   (candidate formulas were not recorded)")
+        else:
+            for i, formula in enumerate(shown, 1):
+                lines.append(f";   C{i}: {compact_formula(formula)}")
+            extra = len(lemmas) - len(shown)
+            if extra > 0:
+                lines.append(f";   ... and {extra} more")
+        return lines
+    if context == "initial_goal":
+        return [
+            "; Mix source: initial prove of the CURRENT goal (no candidate lemmas).",
+        ]
+    return [
+        "; Mix source: CURRENT goal solver failure (no candidate lemmas).",
+    ]
+
+
+def group_repair_hints_by_mix_source(hints: Sequence[dict]) -> List[List[dict]]:
+    groups: List[List[dict]] = []
+    index: Dict[Tuple[str, Tuple[str, ...]], int] = {}
+    for hint in hints:
+        key = mix_source_key(hint)
+        pos = index.get(key)
+        if pos is None:
+            index[key] = len(groups)
+            groups.append([hint])
+        else:
+            groups[pos].append(hint)
+    return groups
 
 
 def tree_status_from_child_data(failed_data: Optional[dict]) -> Tuple[str, str]:

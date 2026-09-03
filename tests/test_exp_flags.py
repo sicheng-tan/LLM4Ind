@@ -80,7 +80,7 @@ def test_flags_default_on() -> None:
     saved = _clear_flags()
     try:
         assert repair_hints_enabled() is True
-        assert progress_feedback_enabled() is True
+        assert progress_feedback_enabled() is False
         assert prompt_retarget_enabled() is True
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
@@ -103,6 +103,8 @@ def test_flags_default_on() -> None:
             assert defined_symbols_enabled() is False
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": val}):
             assert llm_lemma_diagnosis_enabled() is False
+    with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+        assert progress_feedback_enabled() is True
 
 
 def test_resolve_prompt_pack() -> None:
@@ -165,7 +167,8 @@ def test_paper_schedule_prompt() -> None:
 def test_prompt_hides_disabled_feedback_sections() -> None:
     import Mate_new as mate
 
-    on_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
+    with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+        on_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
     assert "SOLVER PROGRESS SIGNALS" in on_txt
     assert "USEFUL BUT UNPROVED" in on_txt
     assert "SOLVER-GUIDED REPAIR" in on_txt
@@ -199,7 +202,8 @@ def test_add_repair_and_progress_respect_flags() -> None:
         assert mate.load_failed_lemmas(tmp, "template")["progress_lemmas"] == []
 
         mate.add_repair_hints(tmp, "template", [{"kind": "need_rewrite", "detail": "x"}])
-        mate.add_progress_lemma(tmp, "template", "(L)", 1.0, ["sig"])
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+            mate.add_progress_lemma(tmp, "template", "(L)", 1.0, ["sig"])
         data = mate.load_failed_lemmas(tmp, "template")
         assert data["repair_hints"][0]["kind"] == "need_rewrite"
         assert data["progress_lemmas"][0]["lemma"] == "(L)"

@@ -394,7 +394,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "LEMMA_LIBRARY": "on",
         "OBLIGATION_TREE": "on",
         "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_PROGRESS": "on",
+        "FEEDBACK_PROGRESS": "off",
         "PROMPT_RETARGET": "on",
         "UNPROVED_NOT_INVALID": "on",
         "SUBGOAL_SAT_ABORT": "on",

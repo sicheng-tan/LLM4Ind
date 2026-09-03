@@ -1,7 +1,7 @@
 """Ablation switches for features added on top of the original PaperMate loop.
 
-Defaults are on so the current full method is unchanged. Set any value in
-``off`` / ``0`` / ``false`` / ``no`` to disable that piece.
+Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
+Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``, and
 ``OBLIGATION_TREE``.
@@ -31,8 +31,11 @@ def repair_hints_enabled() -> bool:
 
 
 def progress_feedback_enabled() -> bool:
-    """Run the 3s usefulness sidecar and inject progress lemmas into the prompt."""
-    return _flag_enabled("FEEDBACK_PROGRESS")
+    """Run the 3s usefulness sidecar and inject progress lemmas into the prompt.
+
+    Default off: mix hints come from the failed 60s A∧C→P prove, not the sidecar.
+    """
+    return _flag_enabled("FEEDBACK_PROGRESS", default="off")
 
 
 def prompt_retarget_enabled() -> bool:

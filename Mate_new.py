@@ -75,7 +75,10 @@ from exp_flags import (
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    attach_source_lemmas,
     defined_symbols_enabled,
+    format_mix_source_comment,
+    group_repair_hints_by_mix_source,
     is_invalid_diagnosis_reason,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
@@ -493,7 +496,10 @@ def _record_failed_prove_diagnostics(
         return
     if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
         _store_cached_diag(base_path, goal_name, "baseline_diag", result)
-    add_repair_hints(base_path, goal_name, derive_repair_hints(result, context=context))
+    add_repair_hints(
+        base_path, goal_name,
+        attach_source_lemmas(derive_repair_hints(result, context=context), [], context=context),
+    )
     if result.difficulty:
         logging.info(
             "cvc5 高难度断言 (%s): %s",
@@ -554,6 +560,34 @@ def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
 
 def _result_has_stats(result: CvcResult) -> bool:
     return any(int(v or 0) > 0 for v in (result.stats or {}).values())
+
+
+def _usefulness_has_mix_signal(result: CvcResult) -> bool:
+    """True when the failed A∧C→P run can yield a mix / difficulty hint."""
+    if result.proved:
+        return False
+    if _result_has_stats(result):
+        return True
+    return bool(result.difficulty)
+
+
+def _record_failed_usefulness_mix(
+    base_path: str,
+    goal_name: str,
+    result: CvcResult,
+    lemmas: Optional[List[str]] = None,
+) -> None:
+    """Single-run mix from the failed full-timeout A∧C→P prove, not the 3s sidecar."""
+    if not _usefulness_has_mix_signal(result):
+        return
+    add_repair_hints(
+        base_path, goal_name,
+        attach_source_lemmas(
+            derive_repair_hints(result, context="usefulness_check"),
+            lemmas,
+            context="usefulness_check",
+        ),
+    )
 
 
 def record_solver_attempt(
@@ -682,22 +716,30 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
                 "\n; SOLVER-GUIDED REPAIR (from cvc5 failure analysis). "
                 "Use these hints to choose the NEXT lemmas:"
             )
-            for i, hint in enumerate(hints, 1):
-                parts.append(
-                    f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
-                )
-                rare = set(hint.get("rarely_instantiated") or [])
-                for ax in (hint.get("hard_axioms") or [])[:3]:
-                    label = (
-                        "Hard axiom (rarely instantiated)"
-                        if ax in rare
-                        else "Hard axiom"
+            parts.append(
+                "; Mix kinds describe the solver run under Mix source; "
+                "they are not the obligation tree."
+            )
+            n = 1
+            for group in group_repair_hints_by_mix_source(hints):
+                parts.extend(format_mix_source_comment(group[0]))
+                for hint in group:
+                    parts.append(
+                        f"; Repair hint {n} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
                     )
-                    parts.append(f";   {label}: {ax[:160]}")
-                for g in (hint.get("goal_fragments") or [])[:2]:
-                    parts.append(f";   Goal fragment: {g[:160]}")
-                for action in hint.get("suggested_actions", [])[:3]:
-                    parts.append(f";   -> {action}")
+                    rare = set(hint.get("rarely_instantiated") or [])
+                    for ax in (hint.get("hard_axioms") or [])[:3]:
+                        label = (
+                            "Hard axiom (rarely instantiated)"
+                            if ax in rare
+                            else "Hard axiom"
+                        )
+                        parts.append(f";   {label}: {ax[:160]}")
+                    for g in (hint.get("goal_fragments") or [])[:2]:
+                        parts.append(f";   Goal fragment: {g[:160]}")
+                    for action in (hint.get("suggested_actions") or [])[:3]:
+                        parts.append(f";   -> {action}")
+                    n += 1
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
@@ -918,13 +960,9 @@ def analyze_lemma_progress(
         _store_cached_diag(base_path, goal_name, "baseline_diag_short", progress_baseline)
         if hint_baseline is None:
             _store_cached_diag(base_path, goal_name, "baseline_diag", progress_baseline)
-            add_repair_hints(
-                base_path, goal_name,
-                derive_repair_hints(progress_baseline, context="baseline_goal"),
-            )
             hint_baseline = progress_baseline
         else:
-            logging.info("cvc5 progress 使用 3s short baseline；60s 结果只用于 repair hint")
+            logging.info("cvc5 progress 使用 3s short baseline；mix 来自失败的 60s A∧C→P")
     else:
         logging.info("复用缓存的 cvc5 3s progress baseline (profile=%s)", want)
     if hint_baseline is None:
@@ -1002,7 +1040,7 @@ def verify_combined_lemmas(
 ) -> Tuple[bool, List[str], Optional[CvcResult]]:
     """
     有用性检查，对齐原文：只做一次整组 A∧C→P。
-    失败后不枚举子集再证明，仅做短诊断写入下一轮 LLM / routing。
+    失败后用这次满超时 prove 的统计写 mix hint；不枚举子集。
     """
     combined_timeout = config['COMBINED_CVC_TIMEOUT']
     work_dir = output_path.parent
@@ -1020,7 +1058,13 @@ def verify_combined_lemmas(
         state.decision_source = decision_source or state.decision_source
         if base_path:
             save_routing_state(base_path, gname, state)
-    full = run_cvc_routed(output_path, timeout=combined_timeout, state=state)
+    full = run_cvc_routed(
+        output_path,
+        timeout=combined_timeout,
+        state=state,
+        collect_stats=True,
+        collect_difficulty=True,
+    )
     record_solver_attempt(
         base_path,
         gname,
@@ -1047,17 +1091,17 @@ def verify_combined_lemmas(
         return True, list(asserts), full
 
     progressive: List[str] = []
-    baseline = CvcResult(status="unknown")
     if base_path and goal_name:
         meta = {"status": full.status}
+        _record_failed_usefulness_mix(base_path, gname, full, asserts)
         if progress_feedback_enabled():
-            progressive, baseline = analyze_lemma_progress(
+            progressive, _baseline = analyze_lemma_progress(
                 asserts, original_content, work_dir, gname, base_path
             )
             hint_kind = "partial_progress" if progressive else "no_progress"
             meta["hint_kind"] = hint_kind
             meta["progressive_count"] = len(progressive)
-            add_repair_hints(base_path, goal_name, [{
+            add_repair_hints(base_path, goal_name, attach_source_lemmas([{
                 "kind": hint_kind,
                 "context": "usefulness_check",
                 "detail": (
@@ -1071,7 +1115,7 @@ def verify_combined_lemmas(
                     )
                 ),
                 "hard_axioms": hard_axioms_from_difficulty(
-                    baseline.difficulty, baseline.goal_term
+                    full.difficulty, full.goal_term
                 ),
                 "progress_signals": load_failed_lemmas(
                     base_path, goal_name
@@ -1081,7 +1125,7 @@ def verify_combined_lemmas(
                     "Target high-difficulty recursive definitions reported by cvc5",
                     "Do not repeat the same useless lemma group",
                 ],
-            }])
+            }], asserts, context="usefulness_check"))
         add_useless_lemma_group(
             base_path,
             goal_name,
@@ -1829,7 +1873,7 @@ def quick_run(
         return False, [], extracted_asserts
 
 
-    # 步骤6: 一次整组有用性检查；失败则短诊断反馈（不搜索子集证明）
+    # 步骤6: 一次整组有用性检查；失败则用 60s A∧C→P 写 mix（可选 sidecar 只打 progress）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
     useful, selected_lemmas, _cres = verify_combined_lemmas(
         original_assert,
@@ -1977,9 +2021,14 @@ def _run_final_goal_diagnosis(
     """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?"""
     if not should_run_final_diagnosis(depth):
         return False
-    existing = load_failed_lemmas(base_path, base_name).get("node_outcome") or {}
+    failed_data = load_failed_lemmas(base_path, base_name)
+    existing = failed_data.get("node_outcome") or {}
     if str(existing.get("kind") or "") == "invalid":
         return True
+    if last_normal_tree(failed_data.get("obligation")) is None:
+        logging.info("子目标 %s 无可用义务树，跳过最终鉴定", base_name)
+        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_tree")
+        return False
     smt_path = Path(base_path) / f"{base_name}.smt2"
     if not smt_path.exists():
         return False

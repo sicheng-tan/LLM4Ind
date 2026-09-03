@@ -299,7 +299,9 @@ def test_progress_uses_3s_short_baseline() -> None:
                 return control
             return short
 
-        with patch("Mate_new.run_cvc_diagnostic", side_effect=fake_diag):
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}), patch(
+            "Mate_new.run_cvc_diagnostic", side_effect=fake_diag
+        ):
             _ordered, hint_b = mate.analyze_lemma_progress(
                 [], TINY_SMT, Path(tmp), "template", tmp
             )
@@ -327,7 +329,9 @@ def test_progress_cache_reused_for_same_profile() -> None:
         mate.save_routing_state(tmp, "template", state)
         mate._store_cached_diag(tmp, "template", "baseline_diag_short", short)
         mate._store_cached_diag(tmp, "template", "control_diag", control)
-        with patch("Mate_new.run_cvc_diagnostic") as diag:
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}), patch(
+            "Mate_new.run_cvc_diagnostic"
+        ) as diag:
             mate.analyze_lemma_progress([], TINY_SMT, Path(tmp), "template", tmp)
         diag.assert_not_called()
 
@@ -355,7 +359,9 @@ def test_progress_cache_invalidated_on_profile_change() -> None:
             stats = {"CONJ_TOTAL": 1 if "control" in str(path) else 2}
             return CvcResult(status="timeout", elapsed=3.0, stats=stats, strategy=name)
 
-        with patch("Mate_new.run_cvc_diagnostic", side_effect=fake_diag) as diag:
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}), patch(
+            "Mate_new.run_cvc_diagnostic", side_effect=fake_diag
+        ) as diag:
             _ordered, hint_b = mate.analyze_lemma_progress(
                 [], TINY_SMT, Path(tmp), "template", tmp
             )
@@ -527,14 +533,15 @@ def test_trivial_implication_and_control_shape() -> None:
 def test_progress_prompt_does_not_fight_useless_group() -> None:
     import Mate_new as mate
 
-    txt = mate.format_solver_feedback_for_prompt({
-        "useless_lemma_groups": [{"lemmas": ["(L1)", "(L2)"], "status": "timeout"}],
-        "progress_lemmas": [{"lemma": "(L1)", "score": 1.2, "signals": ["more_demodulations"]}],
-        "repair_hints": [],
-        "invalid_lemmas": [],
-        "unproved_lemmas": [],
-        "routing": {},
-    })
+    with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+        txt = mate.format_solver_feedback_for_prompt({
+            "useless_lemma_groups": [{"lemmas": ["(L1)", "(L2)"], "status": "timeout"}],
+            "progress_lemmas": [{"lemma": "(L1)", "score": 1.2, "signals": ["more_demodulations"]}],
+            "repair_hints": [],
+            "invalid_lemmas": [],
+            "unproved_lemmas": [],
+            "routing": {},
+        })
     assert "GROUPS (combinations)" in txt
     assert "in_failed_group" in txt
     assert "NOT proof of usefulness" in txt
@@ -985,6 +992,143 @@ def test_proved_attempt_still_has_no_pair_utility() -> None:
         assert last["winner_profile"] == "cvc5_inductive"
 
 
+_PROOF_GOAL_SMT = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+
+
+def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
+    import Mate_new as mate
+    import Mate_new_vampire as mate_v
+    from vampire_runner import VampireResult
+
+    failed_v = VampireResult(
+        status="timeout",
+        proved=False,
+        elapsed=60.0,
+        stats={"StructuralInduction": 40, "Fw demodulations": 20},
+        induction_focus=["(P sK0)"],
+    )
+    failed_c = CvcResult(
+        status="timeout",
+        proved=False,
+        elapsed=60.0,
+        stats={"CONJ_TOTAL": 100, "QUANTIFIERS_SKOLEMIZE": 2, "INST_TOTAL": 80},
+        difficulty=[("(forall ((x Int)) (P x))", 9)],
+    )
+    lemma = "(forall ((x Int)) (P x))"
+    with tempfile.TemporaryDirectory() as tmp:
+        original, _ = mate_v.extract_original_goal(_PROOF_GOAL_SMT)
+        out = Path(tmp) / "template_with_lemmas.smt2"
+        with patch.dict(os.environ, {
+            "FEEDBACK_PROGRESS": "off",
+            "SOLVER_ROUTING": "off",
+        }), patch(
+            "Mate_new_vampire.run_vampire_routed", return_value=failed_v
+        ) as routed, patch("Mate_new_vampire.run_vampire_diagnostic") as diag:
+            useful, kept, _ = mate_v.verify_combined_lemmas(
+                original, [lemma], _PROOF_GOAL_SMT, out,
+                base_path=tmp, goal_name="template",
+            )
+        assert useful is False
+        assert kept == []
+        kwargs = routed.call_args.kwargs
+        assert kwargs.get("collect_ucore") is False
+        assert kwargs.get("collect_stats") is True
+        assert kwargs.get("show_induction") is True
+        diag.assert_not_called()
+        hints = mate_v.load_failed_lemmas(tmp, "template")["repair_hints"]
+        by_kind = {h["kind"]: h for h in hints}
+        assert "need_rewrite" in by_kind
+        assert by_kind["need_rewrite"].get("context") == "usefulness_check"
+        assert by_kind["need_rewrite"].get("source_lemmas") == [lemma]
+        assert "induction_stuck" in by_kind
+        assert "no_progress" not in by_kind
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original, _ = mate.extract_original_goal(_PROOF_GOAL_SMT)
+        out = Path(tmp) / "template_with_lemmas.smt2"
+        with patch.dict(os.environ, {
+            "FEEDBACK_PROGRESS": "off",
+            "SOLVER_ROUTING": "off",
+        }), patch(
+            "Mate_new.run_cvc_routed", return_value=failed_c
+        ) as routed, patch("Mate_new.run_cvc_diagnostic") as diag:
+            useful, kept, _ = mate.verify_combined_lemmas(
+                original, [lemma], _PROOF_GOAL_SMT, out,
+                base_path=tmp, goal_name="template",
+            )
+        assert useful is False
+        assert kept == []
+        kwargs = routed.call_args.kwargs
+        assert kwargs.get("collect_stats") is True
+        assert kwargs.get("collect_difficulty") is True
+        diag.assert_not_called()
+        kinds = [h["kind"] for h in mate.load_failed_lemmas(tmp, "template")["repair_hints"]]
+        assert "need_stronger_lemma" in kinds
+        assert "high_difficulty_assertions" in kinds
+        cvc_hints = mate.load_failed_lemmas(tmp, "template")["repair_hints"]
+        assert any(h.get("source_lemmas") == [lemma] for h in cvc_hints)
+
+
+def test_usefulness_success_keeps_all_lemmas_without_ucore() -> None:
+    import Mate_new_vampire as mate
+    from vampire_runner import VampireResult
+
+    lemmas = [
+        "(forall ((x Int)) (P x))",
+        "(forall ((y Int)) (= y y))",
+    ]
+    proved = VampireResult(
+        proved=True,
+        status="unsat",
+        elapsed=1.0,
+        used_lemma_names=["lemma_1"],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        original, _ = mate.extract_original_goal(_PROOF_GOAL_SMT)
+        out = Path(tmp) / "template_with_lemmas.smt2"
+        with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}), patch(
+            "Mate_new_vampire.run_vampire_routed", return_value=proved
+        ):
+            useful, kept, _ = mate.verify_combined_lemmas(
+                original, lemmas, _PROOF_GOAL_SMT, out,
+                base_path=tmp, goal_name="template",
+            )
+        assert useful is True
+        assert kept == lemmas
+        assert mate.load_failed_lemmas(tmp, "template")["repair_hints"] == []
+
+
+def test_sidecar_does_not_write_mix_hints() -> None:
+    import Mate_new as mate
+
+    mixy = CvcResult(
+        status="timeout",
+        elapsed=3.0,
+        stats={"CONJ_TOTAL": 100, "QUANTIFIERS_SKOLEMIZE": 1, "INST_TOTAL": 2},
+        difficulty=[("(P x)", 8)],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}), patch(
+            "Mate_new.run_cvc_diagnostic", return_value=mixy
+        ):
+            mate.analyze_lemma_progress(
+                [], TINY_SMT, Path(tmp), "template", tmp
+            )
+        kinds = [
+            h.get("kind")
+            for h in mate.load_failed_lemmas(tmp, "template").get("repair_hints") or []
+        ]
+        assert "need_stronger_lemma" not in kinds
+        assert "need_rewrite" not in kinds
+        assert "high_difficulty_assertions" not in kinds
+
+
 def main() -> int:
     test_inject_difficulty_script()
     test_inject_difficulty_without_set_logic()
@@ -1026,6 +1170,9 @@ def main() -> int:
     test_useful_subgoal_failure_resets_no_help_streak()
     test_timeout_breaks_no_help_streak()
     test_kind_feedback_switches_after_one_no_help()
+    test_usefulness_failure_mix_from_full_timeout_ac_implies_p()
+    test_usefulness_success_keeps_all_lemmas_without_ucore()
+    test_sidecar_does_not_write_mix_hints()
     print("prove diagnostics tests passed")
     return 0
 
