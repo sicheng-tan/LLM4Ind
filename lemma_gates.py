@@ -29,8 +29,9 @@ _PROOF_GOAL = re.compile(
     r"; proof goal\s*.*?; proof goal end",
     flags=re.DOTALL,
 )
-_REASON_LINE = re.compile(
-    r"^[;\s]*reason\s*:\s*(.+)$",
+INVALID_GOAL_TAG = "INVALID_GOAL"
+_INVALID_GOAL_LINE = re.compile(
+    rf"^[;\s]*{INVALID_GOAL_TAG}\s*:\s*(.+)$",
     flags=re.IGNORECASE,
 )
 
@@ -42,24 +43,24 @@ _RESERVED = frozenset({
 })
 
 DIAGNOSIS_PROMPT_SUFFIX = (
-    "\n; If the CURRENT goal is invalid (not a theorem of the given axioms, "
+    "\nIf the CURRENT goal is invalid (not a theorem of the given axioms, "
     "for example it is missing hypotheses, it contradicts existing axioms or lemmas, "
     "or a used function is only declared with no defining assert), "
     "output no lemmas and write one line:\n"
-    "; reason: <short explanation>\n"
-    "; If a previously proposed child lemma is marked invalid, use that invalid mark "
+    "; INVALID_GOAL: <short explanation>\n"
+    "If a previously proposed child lemma is marked invalid, use that invalid mark "
     "and its reason to decide whether the CURRENT goal is also invalid "
     "(e.g. it depends on the same missing definition or contradiction).\n"
 )
 
 FINAL_DIAGNOSIS_PROMPT_SUFFIX = (
-    "\n; FINAL CHECK (do not propose new lemmas).\n"
-    "; Using the obligation tree "
+    "\nFINAL CHECK (do not propose new lemmas).\n"
+    "Using the obligation tree "
     "(especially child lemmas marked invalid and their reasons), "
     "decide whether the CURRENT goal is a theorem of the given axioms.\n"
-    "; If it is INVALID (not a theorem), output invalid and write one line:\n"
-    "; reason: <short explanation>\n"
-    "; If it MAY still be a theorem, output failed.\n"
+    "If it is INVALID (not a theorem), output invalid and write one line:\n"
+    "; INVALID_GOAL: <short explanation>\n"
+    "If it MAY still be a theorem, output failed.\n"
 )
 
 _OPEN_DIAGNOSIS = frozenset({
@@ -137,10 +138,11 @@ def should_run_final_diagnosis(depth: int = 0, *, has_tree: bool = True) -> bool
 
 
 def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
+    """Extract the ``; INVALID_GOAL:`` diagnosis line. Plain ``reason:`` is ignored."""
     if not raw:
         return None
     for line in str(raw).splitlines():
-        match = _REASON_LINE.match(line.strip())
+        match = _INVALID_GOAL_LINE.match(line.strip())
         if match:
             reason = match.group(1).strip()
             if reason:
@@ -148,11 +150,28 @@ def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def allow_unmarked_lemma_output(
+    raw: Optional[str], *, diagnosis_only: bool = False
+) -> bool:
+    """True when missing ``; Output begin/end`` should not abort the attempt.
+
+    Final diagnosis never wraps lemmas. Child generation may also emit only
+    ``; INVALID_GOAL:`` (the diagnosis suffix) instead of a lemma block.
+    """
+    if diagnosis_only:
+        return True
+    if not llm_lemma_diagnosis_enabled():
+        return False
+    return bool(parse_llm_reason(raw))
+
+
 def parse_final_diagnosis(raw: Optional[str]) -> Tuple[str, Optional[str]]:
     """Parse extra-check output into ('invalid'|'failed', reason).
 
     Unparsed or open verdicts are failed (this node stays failed, not invalid).
     ``still_open`` is accepted as an alias of ``failed``.
+    A bare ``; INVALID_GOAL:`` line (no ``invalid`` token) still counts as invalid,
+    matching the generation-round diagnosis suffix.
     """
     reason = parse_llm_reason(raw)
     token = None
@@ -218,6 +237,29 @@ def lemmas_undefined_symbols(lemmas: Sequence[str], smt: str) -> Dict[str, List[
     return out
 
 
+def _stored_invalid_formula(record: Any) -> str:
+    stored = record.get("lemma") if isinstance(record, dict) else record
+    return normalize_lemma_formula(str(stored or ""))
+
+
+def lemma_known_invalid(lemma: str, invalid_lemmas: Sequence[Any]) -> bool:
+    """True iff *lemma* matches a stored invalid formula after whitespace collapse.
+
+    Character-level equality only (no substring, no equality-order swap) so a
+    different but overlapping formula is not treated as already invalid.
+    """
+    key = normalize_lemma_formula(lemma)
+    if not key:
+        return False
+    return any(_stored_invalid_formula(record) == key for record in invalid_lemmas or [])
+
+
+def lemmas_known_invalid(
+    lemmas: Sequence[str], invalid_lemmas: Sequence[Any]
+) -> List[str]:
+    return [lemma for lemma in lemmas if lemma_known_invalid(lemma, invalid_lemmas)]
+
+
 def repair_hint_for_prompt(hint: dict) -> bool:
     """Keep current-goal / usefulness ATP hints; drop subgoal copies and subgoal_failed."""
     kind = str((hint or {}).get("kind") or "")
@@ -267,19 +309,19 @@ def usefulness_source_lemmas(hints: Sequence[dict]) -> List[str]:
 
 def format_repair_header(backend: str, hints: Sequence[dict]) -> List[str]:
     """Header for the repair block. Usefulness-failed C is listed before the hints."""
-    title = f"\n; SOLVER-GUIDED REPAIR (from {backend} failure analysis)."
+    title = f"\nSOLVER-GUIDED REPAIR (from {backend} failure analysis)."
     lemmas = usefulness_source_lemmas(hints)
     if not lemmas:
         return [title + " Use these hints to choose the NEXT lemmas:"]
     lines = [title]
     shown = lemmas[:MAX_MIX_SOURCE_LEMMAS]
     for i, formula in enumerate(shown, 1):
-        lines.append(f";   C{i}: {compact_formula(formula)}")
+        lines.append(f"  C{i}: {compact_formula(formula)}")
     extra = len(lemmas) - len(shown)
     if extra > 0:
-        lines.append(f";   ... and {extra} more")
+        lines.append(f"  ... and {extra} more")
     lines.append(
-        "; Failed to prove the goal using the above lemmas and produced hints. "
+        "Failed to prove the goal using the above lemmas and produced hints. "
         "Use these hints to choose the NEXT lemmas:"
     )
     return lines

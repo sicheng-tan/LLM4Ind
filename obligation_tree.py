@@ -43,6 +43,10 @@ MAX_ATTEMPTS_KEPT = 12
 MAX_HINT_KINDS = 3
 MAX_FOCUS_TERMS = 2
 
+CHILD_INVALID_JUDGE_LINE = (
+    "Child invalid: use its reason to judge whether the CURRENT goal is also invalid."
+)
+
 _LIB_LOCK = threading.Lock()
 _OFF_VALUES = frozenset({"0", "off", "false", "no"})
 
@@ -384,8 +388,14 @@ def format_obligation_prompt(
     include_library: Optional[bool] = None,
     include_tree: Optional[bool] = None,
     for_diagnosis: bool = False,
+    depth: int = 0,
 ) -> str:
-    """Compressed, comment-prefixed block for the next LLM attempt."""
+    """Compressed title-and-indent block for the next LLM attempt.
+
+    The 'CURRENT goal may also be invalid' instruction is only for child
+    generation (depth >= 1) and the extra diagnosis call. The root still sees
+    invalid children as history, but is not asked to abort the original goal.
+    """
     if for_diagnosis:
         include_library = False
         if include_tree is None:
@@ -399,45 +409,46 @@ def format_obligation_prompt(
     if not shown_library and not tree:
         return ""
 
-    tree_legend = (
-        [
-            "; OBLIGATION HISTORY: use this tree to judge whether the CURRENT goal is a theorem; do not propose lemmas.",
-            "; proved / failed / invalid describe child lemmas; only invalid includes a reason.",
-            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
+    judge_current = bool(for_diagnosis or int(depth or 0) >= 1)
+    if for_diagnosis:
+        tree_legend = [
+            "OBLIGATION HISTORY: use this tree to judge whether the CURRENT goal is a theorem; do not propose lemmas.",
+            "proved / failed / invalid describe child lemmas; only invalid includes a reason.",
         ]
-        if for_diagnosis else
-        [
-            "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
-            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
-            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
+    else:
+        tree_legend = [
+            "OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
+            "proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
         ]
-    )
+    if judge_current:
+        tree_legend.append(CHILD_INVALID_JUDGE_LINE)
     parts = [""]
     if shown_library and tree:
         parts.extend([
-            "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
-            "; Library formulas are already axioms. Do not resend a failed split.",
-            "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
-            "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
+            "OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
+            "Library formulas are already axioms. Do not resend a failed split.",
+            "proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
         ])
+        if judge_current:
+            parts.append(CHILD_INVALID_JUDGE_LINE)
     elif shown_library:
         parts.extend([
-            "; LEMMA LIBRARY: these formulas are already axioms for the CURRENT goal.",
-            "; You may reuse them; do not regenerate equivalent lemmas.",
+            "LEMMA LIBRARY: these formulas are already axioms for the CURRENT goal.",
+            "You may reuse them; do not regenerate equivalent lemmas.",
         ])
     else:
         parts.extend(tree_legend)
     if shown_library:
-        parts.append("; Library (already proved, in axioms):")
+        parts.append("Library (already proved, in axioms):")
         for item in shown_library:
             lib_id = item.get("id") or "lib"
             formula = compact_formula(item.get("formula"))
-            parts.append(f";   {lib_id}: {formula}")
+            parts.append(f"  {lib_id}: {formula}")
     if tree:
         attempt_id = (obligation or {}).get("last_normal_tree_id") or "?"
-        parts.append(f"; Last obligation tree (attempt {attempt_id}; for reference only):")
+        parts.append(f"Last obligation tree (attempt {attempt_id}; for reference only):")
         for line in render_obligation_tree(tree):
-            parts.append(f";   {line}")
+            parts.append(f"  {line}")
     return "\n".join(parts)
 
 

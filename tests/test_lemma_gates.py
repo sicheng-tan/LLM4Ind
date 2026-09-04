@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,9 +19,12 @@ from exp_flags import resolve_prompt_pack
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    allow_unmarked_lemma_output,
     attach_source_lemmas,
     format_repair_header,
     is_invalid_diagnosis_reason,
+    lemma_known_invalid,
+    lemmas_known_invalid,
     node_attempt_plan,
     parse_final_diagnosis,
     parse_llm_reason,
@@ -55,21 +58,58 @@ def test_undefined_plus_and_defined_snoc() -> None:
     assert undefined_symbols_in_lemma(SNOC_LEMMA, P2_SMT) == []
 
 
+def test_known_invalid_match_whitespace_not_substring() -> None:
+    records = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+    spaced = "  " + PLUS_LEMMA.replace(" ", "  ") + "\n"
+    assert lemma_known_invalid(spaced, records)
+    assert lemmas_known_invalid([spaced, SNOC_LEMMA], records) == [spaced]
+    overlapping = PLUS_LEMMA + " (P a)"
+    assert PLUS_LEMMA in overlapping
+    assert not lemma_known_invalid(overlapping, records)
+    assert not lemma_known_invalid(SNOC_LEMMA, records)
+    assert lemmas_known_invalid([SNOC_LEMMA], records) == []
+    assert lemmas_known_invalid([PLUS_LEMMA], []) == []
+
+
 def test_parse_llm_reason() -> None:
-    raw = "; Output begin\n\n; Output end\n; reason: plus has no axioms\n"
+    raw = "; Output begin\n\n; Output end\n; INVALID_GOAL: plus has no axioms\n"
     assert parse_llm_reason(raw) == "plus has no axioms"
+    assert parse_llm_reason("INVALID_GOAL: plus has no axioms") == "plus has no axioms"
     assert parse_llm_reason("; Output begin\n(forall ((x Int)) true)\n; Output end") is None
-    assert parse_final_diagnosis("invalid\n; reason: plus has no axioms") == (
+    assert parse_llm_reason("reason: the IH does not match") is None
+    assert parse_llm_reason("; reason: plus has no axioms") is None
+    assert parse_final_diagnosis("invalid\n; INVALID_GOAL: plus has no axioms") == (
         "invalid", "plus has no axioms",
     )
-    assert parse_final_diagnosis("; Output begin\ninvalid\n; Output end\n; reason: plus")[0] == "invalid"
+    assert parse_final_diagnosis("; Output begin\ninvalid\n; Output end\n; INVALID_GOAL: plus")[0] == "invalid"
     assert parse_final_diagnosis("failed") == ("failed", None)
     assert parse_final_diagnosis("still_open") == ("failed", None)
-    assert parse_final_diagnosis("; reason: still_open") == ("failed", None)
-    assert parse_final_diagnosis("; reason: plus has no axioms") == (
+    assert parse_final_diagnosis("; INVALID_GOAL: still_open") == ("failed", None)
+    assert parse_final_diagnosis("; INVALID_GOAL: plus has no axioms") == (
         "invalid", "plus has no axioms",
     )
+    assert parse_final_diagnosis("; reason: plus has no axioms") == ("failed", None)
     assert parse_final_diagnosis("") == ("failed", None)
+    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
+        assert allow_unmarked_lemma_output(
+            "thinking\n; INVALID_GOAL: plus has no axioms\n", diagnosis_only=False,
+        )
+        assert not allow_unmarked_lemma_output(
+            "thinking with no diagnosis line", diagnosis_only=False,
+        )
+        assert not allow_unmarked_lemma_output(
+            "thinking\nreason: the IH does not match\n", diagnosis_only=False,
+        )
+        assert not allow_unmarked_lemma_output(
+            "; reason: plus has no axioms", diagnosis_only=False,
+        )
+        assert allow_unmarked_lemma_output(
+            "thinking with no diagnosis line", diagnosis_only=True,
+        )
+    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
+        assert not allow_unmarked_lemma_output(
+            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False,
+        )
     assert is_invalid_diagnosis_reason("plus has no axioms")
     assert is_invalid_diagnosis_reason("invalid")
     assert not is_invalid_diagnosis_reason("still_open")
@@ -101,7 +141,7 @@ def test_repair_header_lists_usefulness_lemmas() -> None:
         context="usefulness_check",
     )
     header = "\n".join(format_repair_header("Vampire", hints))
-    assert header.startswith("\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis).")
+    assert header.startswith("\nSOLVER-GUIDED REPAIR (from Vampire failure analysis).")
     assert "C1:" in header
     assert "plus" in header
     bridge = (
@@ -205,6 +245,65 @@ def test_quick_run_rejects_undefined_plus() -> None:
         assert any("undefined_symbol:plus" in str(item.get("reason")) for item in invalid)
 
 
+def test_quick_run_skips_known_invalid_without_solver() -> None:
+    import Mate_new_vampire as mate
+
+    spaced = "  " + PLUS_LEMMA.replace(" ", "  ") + "\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        data = mate.load_failed_lemmas(tmp, "template")
+        data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+        mate.save_failed_lemmas(tmp, "template", data)
+        with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm",
+            return_value=[spaced, SNOC_LEMMA],
+        ), patch("Mate_new_vampire.run_vampire") as vampire:
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+        assert proved is False
+        assert subgoals == []
+        assert lemmas == [spaced, SNOC_LEMMA]
+        vampire.assert_not_called()
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert invalid == [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+
+
+def test_quick_run_does_not_skip_unrelated_lemma() -> None:
+    import Mate_new_vampire as mate
+    from vampire_runner import VampireResult
+
+    timeout = VampireResult(status="timeout", proved=False, elapsed=0.01)
+    overlapping = PLUS_LEMMA + " (P a)"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        data = mate.load_failed_lemmas(tmp, "template")
+        data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+        mate.save_failed_lemmas(tmp, "template", data)
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "LEMMA_DEFINED_SYMBOLS": "off",
+        }), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm", return_value=[overlapping]
+        ), patch("Mate_new_vampire.run_vampire", return_value=timeout) as vampire:
+            mate.quick_run(tmp, "template", "p", "./prompts_ours")
+        vampire.assert_called()
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert invalid[0]["reason"] == "plus has no axioms"
+
+
+def test_add_invalid_lemma_keeps_original_reason() -> None:
+    import Mate_new as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.add_invalid_lemma(tmp, "template", PLUS_LEMMA, "plus has no axioms")
+        mate.add_invalid_lemma(
+            tmp, "template", "  " + PLUS_LEMMA + "\n", "undefined_symbol:plus"
+        )
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert invalid == [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+
+
 def test_sat_aborts_child_without_llm() -> None:
     import Mate_new_vampire as mate
     from vampire_runner import VampireResult
@@ -241,7 +340,7 @@ def test_diagnosis_suffix_flag() -> None:
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
                 "./prompts_ours", depth=1,
             )
-        assert "reason: <short explanation>" not in root[1]["content"]
+        assert "INVALID_GOAL: <short explanation>" not in root[1]["content"]
         assert DIAGNOSIS_PROMPT_SUFFIX.strip() in child[1]["content"]
         assert "previously proposed child lemma is marked invalid" in child[1]["content"]
         final, _ = mate.create_prompt(
@@ -261,7 +360,7 @@ def test_diagnosis_suffix_flag() -> None:
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
                 "./prompts_ours", depth=1,
             )
-        assert "reason: <short explanation>" not in child_off[1]["content"]
+        assert "INVALID_GOAL: <short explanation>" not in child_off[1]["content"]
 
 
 def test_should_append_diagnosis_by_depth() -> None:
@@ -295,6 +394,232 @@ def test_child_empty_reason_stops_attempts() -> None:
             ok = mate.prove_run(tmp, "template", depth=1)
         assert ok is False
         assert gen.call_count == 1
+        outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
+        assert outcome.get("kind") == "invalid"
+        assert "plus" in outcome.get("reason", "")
+
+
+class _InvalidGoalOnlyReply:
+    content = (
+        "The CURRENT goal uses plus, which is only declared.\n"
+        "; INVALID_GOAL: plus has no axioms\n"
+    )
+
+
+class _CotReasonOnlyReply:
+    content = (
+        "The inductive case fails.\n"
+        "reason: the IH does not match the conclusion.\n"
+    )
+
+
+def test_generate_reason_without_markers_stores_reason() -> None:
+    for mod_name in ("Mate_new", "Mate_new_vampire"):
+        mate = __import__(mod_name)
+        fake_llm = MagicMock()
+        fake_llm.invoke.return_value = _InvalidGoalOnlyReply()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+            with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+                f"{mod_name}.create_prompt",
+                return_value=(
+                    [
+                        {"role": "system", "content": "s"},
+                        {"role": "user", "content": "u"},
+                    ],
+                    {},
+                ),
+            ), patch(f"{mod_name}.llm", fake_llm):
+                lemmas = mate.generate_lemmas_with_llm(
+                    _GOAL,
+                    "prove_prompt_equational_reasoning",
+                    Path(tmp) / "template.smt2",
+                    tmp,
+                    "template",
+                    "./prompts_ours",
+                    depth=1,
+                )
+            assert lemmas == []
+            stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
+            assert "plus" in stored, mod_name
+
+
+def test_generate_unmarked_without_reason_still_raises() -> None:
+    import Mate_new as mate
+
+    class Fake:
+        content = "I will propose lemmas but forgot the markers."
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = Fake()
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+            "Mate_new.create_prompt",
+            return_value=(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+                {},
+            ),
+        ), patch("Mate_new.llm", fake_llm):
+            raised = False
+            try:
+                mate.generate_lemmas_with_llm(
+                    _GOAL,
+                    "p",
+                    Path(tmp) / "template.smt2",
+                    tmp,
+                    "template",
+                    "./prompts_ours",
+                    depth=1,
+                )
+            except ValueError as exc:
+                raised = True
+                assert "输出标记" in str(exc)
+            assert raised
+
+
+def test_generate_cot_reason_without_tag_still_raises() -> None:
+    import Mate_new as mate
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = _CotReasonOnlyReply()
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+            "Mate_new.create_prompt",
+            return_value=(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+                {},
+            ),
+        ), patch("Mate_new.llm", fake_llm):
+            raised = False
+            try:
+                mate.generate_lemmas_with_llm(
+                    _GOAL,
+                    "p",
+                    Path(tmp) / "template.smt2",
+                    tmp,
+                    "template",
+                    "./prompts_ours",
+                    depth=1,
+                )
+            except ValueError as exc:
+                raised = True
+                assert "输出标记" in str(exc)
+            assert raised
+            stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
+            assert stored == ""
+
+
+def test_empty_output_cot_reason_does_not_store_invalid() -> None:
+    import Mate_new as mate
+
+    class Fake:
+        content = (
+            "; Output begin\n\n; Output end\n"
+            "reason: the IH does not match the conclusion.\n"
+        )
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = Fake()
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+            "Mate_new.create_prompt",
+            return_value=(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+                {},
+            ),
+        ), patch("Mate_new.llm", fake_llm):
+            lemmas = mate.generate_lemmas_with_llm(
+                _GOAL,
+                "p",
+                Path(tmp) / "template.smt2",
+                tmp,
+                "template",
+                "./prompts_ours",
+                depth=1,
+            )
+        assert lemmas == []
+        stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
+        assert stored == ""
+
+
+def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
+    import Mate_new as mate
+    from obligation_tree import append_attempt, make_child_node, make_goal_tree
+
+    tree = make_goal_tree(
+        "template",
+        [
+            make_child_node(
+                node_id="template_1",
+                formula=PLUS_LEMMA,
+                status="invalid",
+                reason="plus has no axioms",
+            ),
+        ],
+        proved=False,
+    )
+    judge = "judge whether the CURRENT goal is also invalid"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        data = mate._empty_failed_data()
+        data["obligation"] = append_attempt({}, "obligation_tree", tree)
+        mate.save_failed_lemmas(tmp, "template", data)
+        with patch.dict(os.environ, {
+            "OBLIGATION_TREE": "on",
+            "LEMMA_LIBRARY": "off",
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "FEEDBACK_REPAIR_HINTS": "off",
+        }):
+            root, root_extra = mate.create_prompt(
+                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
+                "./prompts_ours", depth=0,
+            )
+            child, child_extra = mate.create_prompt(
+                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
+                "./prompts_ours", depth=1,
+            )
+            final, final_extra = mate.create_prompt(
+                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
+                "./prompts_ours", depth=1, diagnosis_only=True,
+            )
+        assert "L1  invalid [plus has no axioms]" in root_extra
+        assert judge not in root[1]["content"]
+        assert judge not in root_extra
+        assert judge in child_extra
+        assert judge in child[1]["content"]
+        assert "INVALID_GOAL: <short explanation>" in child[1]["content"]
+        assert judge in final_extra
+        assert "INVALID_GOAL: <short explanation>" in final[1]["content"]
+
+
+def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
+    import Mate_new as mate
+    from cvc5_runner import CvcResult
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = _InvalidGoalOnlyReply()
+    timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "SUBGOAL_SAT_ABORT": "off",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY": "off",
+            "CHILD_LLM_ATTEMPTS": "2",
+        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+            "Mate_new.create_prompt",
+            return_value=(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+                {},
+            ),
+        ), patch("Mate_new.llm", fake_llm):
+            ok = mate.prove_run(tmp, "template", depth=1)
+        assert ok is False
+        assert fake_llm.invoke.call_count == 1
         outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
         assert outcome.get("kind") == "invalid"
         assert "plus" in outcome.get("reason", "")
@@ -477,13 +802,13 @@ def test_final_diagnosis_prompt_is_tree_only() -> None:
         assert "FINAL CHECK" in text
         assert "Last obligation tree" in extra
         assert "L1  invalid [plus has no axioms]" in extra
-        assert "IMPORTANT: The following lemmas are INVALID" not in text
+        assert "The following lemmas are INVALID or CANNOT" not in text
         assert "USEFUL BUT UNPROVED" not in text
         assert "SOLVER-GUIDED REPAIR" not in extra
         assert "Previous empty output reason" not in text
         assert "Previous empty output reason" not in gen_extra
         assert "generate lemmas for the CURRENT goal only" not in extra
-        assert "IMPORTANT: The following lemmas are INVALID" in gen_extra
+        assert "The following lemmas are INVALID or CANNOT" in gen_extra
         assert "Last obligation tree" in gen_extra
 
 
@@ -618,6 +943,12 @@ def main() -> int:
     test_diagnosis_suffix_flag()
     test_should_append_diagnosis_by_depth()
     test_child_empty_reason_stops_attempts()
+    test_generate_reason_without_markers_stores_reason()
+    test_generate_unmarked_without_reason_still_raises()
+    test_generate_cot_reason_without_tag_still_raises()
+    test_empty_output_cot_reason_does_not_store_invalid()
+    test_root_tree_prompt_does_not_ask_to_judge_goal_invalid()
+    test_cvc5_unmarked_reason_marks_child_invalid()
     test_invalid_child_records_invalid_not_unproved()
     test_cancelled_invalid_child_keeps_reason()
     test_prompt_invalid_not_unproved_and_drops_child_atp()

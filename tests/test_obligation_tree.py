@@ -181,6 +181,7 @@ def test_compressed_prompt_matches_expected_shape() -> None:
     assert "lib_2  proved" in text
     assert "L2_2  cancelled" in text
     assert "CURRENT goal" in text
+    assert "judge whether the CURRENT goal is also invalid" not in text
     rendered = "\n".join(render_obligation_tree(tree))
     assert "│  " in rendered or "   ├─" in rendered or "   └─" in rendered
 
@@ -231,10 +232,14 @@ def test_invalid_node_shows_reason_not_atp_hints() -> None:
     obligation = append_attempt({}, "obligation_tree", tree)
     with _patch_flags("off", "on"):
         text = format_obligation_prompt([], obligation)
+        child = format_obligation_prompt([], obligation, depth=1)
+        diag = format_obligation_prompt([], obligation, for_diagnosis=True)
     assert "L1  invalid [undefined_symbol:plus]" in text
     assert "need_rewrite" not in text
     assert "do not weaken" in text
-    assert "Child invalid: use its reason to judge whether the CURRENT goal is also invalid." in text
+    assert "judge whether the CURRENT goal is also invalid" not in text
+    assert "judge whether the CURRENT goal is also invalid" in child
+    assert "judge whether the CURRENT goal is also invalid" in diag
 
 
 def test_diagnosis_tree_prompt_omits_library_and_generation_legend() -> None:
@@ -258,6 +263,7 @@ def test_diagnosis_tree_prompt_omits_library_and_generation_legend() -> None:
     assert "Last obligation tree" in text
     assert "L1  invalid [plus has no axioms]" in text
     assert "do not propose lemmas" in text
+    assert "judge whether the CURRENT goal is also invalid" in text
     assert "generate lemmas for the CURRENT goal only" not in text
     assert "Library (already proved, in axioms):" not in text
     assert "lib_1" not in mixed

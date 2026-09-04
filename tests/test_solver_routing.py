@@ -104,10 +104,10 @@ def test_cvc5_static_and_hint_routing() -> None:
 def test_prompt_reorder_keeps_all() -> None:
     strats = ["prove_prompt_equational_reasoning", "prove_prompt_term_rewrite"]
     out = order_prompt_strategies(strats, [{"kind": "need_stronger_lemma"}])
-    _ok(out[0] == "prove_prompt_term_rewrite", out)
+    _ok(out[0] == "prove_prompt_equational_reasoning", out)
     _ok(set(out) == set(strats), "must not drop prompts")
     out2 = order_prompt_strategies(strats, [{"kind": "need_rewrite"}])
-    _ok(out2[0] == "prove_prompt_equational_reasoning", out2)
+    _ok(out2[0] == "prove_prompt_term_rewrite", out2)
     both = order_prompt_strategies(
         strats,
         [{"kind": "need_stronger_lemma"}, {"kind": "need_rewrite"}],
@@ -123,13 +123,13 @@ def test_generation_prompt_start_and_switch() -> None:
     )
     _ok(
         select_generation_prompt(strats, [{"kind": "need_stronger_lemma"}])
-        == "prove_prompt_term_rewrite",
-        "stronger/generalize hints start on term rewrite",
+        == "prove_prompt_equational_reasoning",
+        "stronger/generalize hints start on equational",
     )
     _ok(
         select_generation_prompt(strats, [{"kind": "need_rewrite"}])
-        == "prove_prompt_equational_reasoning",
-        "rewrite hints start on equational",
+        == "prove_prompt_term_rewrite",
+        "rewrite hints start on term rewrite",
     )
 
     cur, n, switched = advance_generation_prompt(
@@ -157,7 +157,7 @@ def test_both_kind_families_sample_by_overshoot() -> None:
         {"kind": "need_rewrite", "strength": 0.1},
     ]
     p = term_rewrite_sample_prob(hints)
-    _ok(p is not None and abs(p - 0.9) < 1e-9, p)
+    _ok(p is not None and abs(p - 0.1) < 1e-9, p)
 
     class _Fixed:
         def __init__(self, x: float) -> None:
@@ -169,18 +169,18 @@ def test_both_kind_families_sample_by_overshoot() -> None:
     _ok(
         select_generation_prompt(strats, hints, rng=_Fixed(0.05))
         == "prove_prompt_term_rewrite",
-        "u < p picks generalize template",
+        "u < p picks rewrite template (term_rewrite)",
     )
     _ok(
         select_generation_prompt(strats, hints, rng=_Fixed(0.95))
         == "prove_prompt_equational_reasoning",
-        "u >= p picks rewrite template",
+        "u >= p picks generalize template (equational)",
     )
     _ok(
         select_generation_prompt(
             strats, [{"kind": "need_rewrite", "strength": 0.1}], rng=_Fixed(0.0)
         )
-        == "prove_prompt_equational_reasoning",
+        == "prove_prompt_term_rewrite",
         "single family stays deterministic",
     )
 
@@ -212,7 +212,7 @@ def test_family_scores_floor_legacy_and_sum() -> None:
         {"kind": "induction_stuck", "strength": 0.5},
         {"kind": "need_induction_lemma", "strength": 0.2},
     ])
-    _ok(p is not None and abs(p - 0.2 / 1.1) < 1e-9, p)
+    _ok(p is not None and abs(p - 0.9 / 1.1) < 1e-9, p)
 
     rewrite, generalize = prompt_family_scores([
         {"kind": "need_directed_rewrite", "strength": 0.3},
@@ -231,25 +231,34 @@ def test_kind_signature_change_retargets_before_streak() -> None:
         1,
         "none",
     )
-    _ok(why == "kind" and nxt == TERM_REWRITE_PROMPT and n == 0 and sig == "generalize", (nxt, n, sig, why))
+    _ok(why == "keep" and nxt == EQUATIONAL_PROMPT and n == 1 and sig == "generalize", (nxt, n, sig, why))
+
+    nxt, n, sig, why = retarget_generation_prompt(
+        strats,
+        [{"kind": "need_rewrite"}],
+        EQUATIONAL_PROMPT,
+        1,
+        "none",
+    )
+    _ok(why == "kind" and nxt == TERM_REWRITE_PROMPT and n == 0 and sig == "rewrite", (nxt, n, sig, why))
 
     nxt, n, sig, why = retarget_generation_prompt(
         strats,
         [{"kind": "need_stronger_lemma"}],
-        TERM_REWRITE_PROMPT,
+        EQUATIONAL_PROMPT,
         1,
         "generalize",
     )
-    _ok(why == "keep" and n == 1 and nxt == TERM_REWRITE_PROMPT, (nxt, n, why))
+    _ok(why == "keep" and n == 1 and nxt == EQUATIONAL_PROMPT, (nxt, n, why))
 
     nxt, n, sig, why = retarget_generation_prompt(
         strats,
         [{"kind": "need_stronger_lemma"}],
-        TERM_REWRITE_PROMPT,
+        EQUATIONAL_PROMPT,
         2,
         "generalize",
     )
-    _ok(why == "consecutive" and nxt == EQUATIONAL_PROMPT and n == 0, (nxt, n, why))
+    _ok(why == "consecutive" and nxt == TERM_REWRITE_PROMPT and n == 0, (nxt, n, why))
 
 
 def test_prompt_mode_seed_replays_first_draw() -> None:

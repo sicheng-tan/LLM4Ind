@@ -138,6 +138,7 @@ def test_initial_verify_caches_baseline_without_diagnostic() -> None:
         strategy="cvc5_inductive",
         stats={"CONJ_TOTAL": 5},
         difficulty=[("(P x)", 9)],
+        elapsed=60.0,
     )
     with tempfile.TemporaryDirectory() as tmp:
         smt = Path(tmp) / "template.smt2"
@@ -158,6 +159,10 @@ def test_initial_verify_caches_baseline_without_diagnostic() -> None:
         assert cached is not None
         assert cached.stats["CONJ_TOTAL"] == 5
         assert cached.difficulty[0][1] == 9
+        from exp_stats import load_counters
+        counters = load_counters(tmp)
+        assert counters["solver_s"] == 60.0
+        assert counters["n_solver"] == 1
 
 
 def test_seed_does_not_run_diagnostic() -> None:
@@ -764,8 +769,8 @@ def test_two_no_help_switches_generation_prompt() -> None:
             mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
         ):
             assert mate.prove_run(tmp, "template") is False
-    assert calls[0] == "prove_prompt_term_rewrite", calls
-    assert calls[2] == "prove_prompt_equational_reasoning", calls
+    assert calls[0] == "prove_prompt_equational_reasoning", calls
+    assert calls[2] == "prove_prompt_term_rewrite", calls
 
 
 class _FixedRng:
@@ -899,7 +904,7 @@ def test_prove_run_samples_when_both_kind_families() -> None:
         "Mate_new",
         quick,
         hints=hints,
-        select_rng=_FixedRng(0.95),
+        select_rng=_FixedRng(0.50),
     )
     assert equational[0] == "prove_prompt_equational_reasoning", equational
 
@@ -940,7 +945,7 @@ def test_timeout_breaks_no_help_streak() -> None:
 
 
 def test_kind_feedback_switches_after_one_no_help() -> None:
-    def quick(n, _prompt, **kwargs):
+    def keep_generalize(n, _prompt, **kwargs):
         if n == 0:
             kwargs["mate"].add_repair_hints(
                 kwargs["base_path"],
@@ -949,9 +954,22 @@ def test_kind_feedback_switches_after_one_no_help() -> None:
             )
         return False, [], []
 
-    calls = _collect_prove_prompts("Mate_new", quick)
-    assert calls[0] == "prove_prompt_equational_reasoning", calls
-    assert calls[1] == "prove_prompt_term_rewrite", calls
+    keep = _collect_prove_prompts("Mate_new", keep_generalize)
+    assert keep[0] == "prove_prompt_equational_reasoning", keep
+    assert keep[1] == "prove_prompt_equational_reasoning", keep
+
+    def switch_rewrite(n, _prompt, **kwargs):
+        if n == 0:
+            kwargs["mate"].add_repair_hints(
+                kwargs["base_path"],
+                "template",
+                [{"kind": "need_rewrite", "detail": "r", "context": "goal"}],
+            )
+        return False, [], []
+
+    switched = _collect_prove_prompts("Mate_new", switch_rewrite)
+    assert switched[0] == "prove_prompt_equational_reasoning", switched
+    assert switched[1] == "prove_prompt_term_rewrite", switched
 
 
 def test_stats_without_reference_skip_utility() -> None:

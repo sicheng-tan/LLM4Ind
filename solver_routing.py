@@ -96,6 +96,8 @@ CVC5_PROMPT_GUIDANCE = {
     ),
 }
 
+# Rewrite-family hints → term_rewrite template (matching / demodulation lemmas).
+# Generalize-family hints → equational template (induction-case bridges / stronger IH).
 _REWRITE_HINTS = {"need_rewrite", "induction_stuck", "need_directed_rewrite"}
 _GENERALIZE_HINTS = {
     "need_induction_lemma",
@@ -580,26 +582,34 @@ def _relative_profile_utility(
     return score, signals
 
 
+def preferred_prompt_for_hints(hints: Sequence[dict]) -> Optional[str]:
+    """Template that matches a single hint family, or None if mixed / empty.
+
+    Rewrite-family kinds ask for lemmas that fire matching and demodulation;
+    that is ``prove_prompt_term_rewrite``. Generalize / induction-family kinds
+    ask for induction-case bridges and stronger IHs; that is
+    ``prove_prompt_equational_reasoning``.
+    """
+    kinds = set(hint_kinds(hints))
+    has_generalize = bool(kinds & _GENERALIZE_HINTS)
+    has_rewrite = bool(kinds & _REWRITE_HINTS)
+    if has_rewrite and not has_generalize:
+        return TERM_REWRITE_PROMPT
+    if has_generalize and not has_rewrite:
+        return EQUATIONAL_PROMPT
+    return None
+
+
 def order_prompt_strategies(
     strategies: Sequence[str],
     hints: Sequence[dict],
 ) -> List[str]:
     """Reorder the paper prompt pool; never drop a strategy.
 
-    One hint family: that family goes first. Both families: keep the given
-    order — ``select_generation_prompt`` samples instead of preferring
-    generalize.
+    One hint family: that family's template goes first. Both families: keep
+    the given order — ``select_generation_prompt`` samples instead.
     """
-    kinds = set(hint_kinds(hints))
-    has_generalize = bool(kinds & _GENERALIZE_HINTS)
-    has_rewrite = bool(kinds & _REWRITE_HINTS)
-    if has_generalize and has_rewrite:
-        return list(strategies)
-    prefer: Optional[str] = None
-    if has_generalize:
-        prefer = TERM_REWRITE_PROMPT
-    elif has_rewrite:
-        prefer = EQUATIONAL_PROMPT
+    prefer = preferred_prompt_for_hints(hints)
     if not prefer:
         return list(strategies)
     return sorted(strategies, key=lambda s: 0 if s == prefer else 1)
@@ -644,11 +654,15 @@ def prompt_family_scores(hints: Sequence[dict]) -> Tuple[float, float]:
 
 
 def term_rewrite_sample_prob(hints: Sequence[dict]) -> Optional[float]:
-    """P(term-rewrite template) when both families fire; otherwise None."""
+    """P(term-rewrite template) when both families fire; otherwise None.
+
+    Weight follows rewrite-family strength, matching
+    ``preferred_prompt_for_hints`` (rewrite → term_rewrite).
+    """
     rewrite, generalize = prompt_family_scores(hints)
     if rewrite <= 0 or generalize <= 0:
         return None
-    return generalize / (generalize + rewrite)
+    return rewrite / (generalize + rewrite)
 
 
 def prompt_kind_signature(hints: Sequence[dict]) -> str:
@@ -691,8 +705,9 @@ def select_generation_prompt(
 ) -> str:
     """Starting LLM template from existing repair-hint kinds.
 
-    One family: deterministic (hint order). Both families: sample with
-    P(term_rewrite) = generalize_strength / (generalize + rewrite), using
+    One family: that family's template (rewrite → term_rewrite,
+    generalize → equational). Both families: sample with
+    P(term_rewrite) = rewrite_strength / (generalize + rewrite), using
     mix-gate overshoot stored on each hint. Does not drop a strategy from the pool.
     """
     pool = [s for s in strategies if s]
@@ -924,25 +939,25 @@ def format_routing_for_prompt(state: Optional[GoalSearchState]) -> str:
     if state is None or not state.active_profile:
         return ""
     parts = [
-        "\n; SOLVER ROUTING (feedback-guided theory portfolio):",
-        f";   backend={state.backend}; recommended_profile={state.active_profile}",
-        f";   decision_mode={state.decision_mode}; source={state.decision_source}",
-        f";   candidates={', '.join(state.candidate_profiles)}",
+        "\nSOLVER ROUTING (feedback-guided theory portfolio):",
+        f"  backend={state.backend}, recommended_profile={state.active_profile}",
+        f"  decision_mode={state.decision_mode}, source={state.decision_source}",
+        f"  candidates={', '.join(state.candidate_profiles)}",
     ]
     if state.active_prompt:
-        parts.append(f";   recommended_prompt={state.active_prompt}")
+        parts.append(f"  recommended_prompt={state.active_prompt}")
     feats = state.theory_features or {}
     parts.append(
-        ";   theory: "
-        f"ADT={feats.get('has_adt')}; Int={feats.get('has_int')}; "
-        f"mixed={feats.get('mixed_adt_lia')}; logic={feats.get('logic', '')}"
+        "  theory: "
+        f"ADT={feats.get('has_adt')}, Int={feats.get('has_int')}, "
+        f"mixed={feats.get('mixed_adt_lia')}, logic={feats.get('logic', '')}"
     )
     if state.routing_reasons:
-        parts.append(f";   reasons: {', '.join(state.routing_reasons[:6])}")
+        parts.append(f"  reasons: {', '.join(state.routing_reasons[:6])}")
     if state.prompt_guidance:
-        parts.append(f";   {state.prompt_guidance}")
+        parts.append(f"  {state.prompt_guidance}")
     if state.pair_history:
-        parts.append(";   recent prompt/profile outcomes:")
+        parts.append("  recent prompt/profile outcomes:")
         for item in state.pair_history[-4:]:
             pair = f"{item.get('prompt_strategy', '?')} + {item.get('profile', '?')}"
             outcome = item.get("status", "unknown")
@@ -951,14 +966,14 @@ def format_routing_for_prompt(state: Optional[GoalSearchState]) -> str:
             fallback = " [fallback]" if item.get("fallback_used") else ""
             winner = item.get("winner_profile")
             winner_text = (
-                f"; winner={winner}"
+                f", winner={winner}"
                 if winner and winner != item.get("profile")
                 else ""
             )
             signals = ", ".join(item.get("signals", [])[:3])
-            signal_text = f"; signals={signals}" if signals else ""
+            signal_text = f", signals={signals}" if signals else ""
             parts.append(
-                f";     {pair}: {outcome}{fallback}{winner_text}{signal_text}"
+                f"    {pair}: {outcome}{fallback}{winner_text}{signal_text}"
             )
     return "\n".join(parts)
 

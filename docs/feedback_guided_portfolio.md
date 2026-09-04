@@ -172,8 +172,8 @@ cvc4_default
 hint 再提升：
 
 - `need_arithmetic_lemma` → Vampire `alasca_arith` / CVC5 `integer_recursive`
-- `need_rewrite` / `induction_stuck` → 结构归纳或 no-ematching
-- `need_stronger_lemma` / `need_induction_lemma` → 归纳 + 一般化 prompt
+- `need_rewrite` / `induction_stuck` → 结构归纳或 no-ematching；引理侧用 `term_rewrite` 模板
+- `need_stronger_lemma` / `need_induction_lemma` → 归纳配置；引理侧用 `equational_reasoning` 模板
 - `search_explosion` → Vampire 收窄到 `struct_induction`；CVC5 `controlled_conjecture`
 
 ### 3.5 Mate 闭环（`Mate_new.py` / `Mate_new_vampire.py`）
@@ -300,8 +300,8 @@ Vampire selector 会区分结构归纳、整数归纳、SMT-COMP schedule 和 AL
 | hint | 引理生成 | Vampire 路由 | CVC5 路由 |
 |---|---|---|---|
 | `induction_stuck` | 针对 focus 项的等式桥 | 保持/提升 `struct_induction` | `adt_structural` |
-| `need_rewrite` | 左侧匹配目标子项的重写引理 | 结构归纳 + 重写活跃的 schedule | `cvc5_inductive_no_ematching` |
-| `need_induction_lemma` / `need_stronger_lemma` | 优先 `term_rewrite` 一般化 | `induction_portfolio` | `cvc5_inductive` |
+| `need_rewrite` | 左侧匹配目标子项的重写引理（`term_rewrite` 模板） | 结构归纳 + 重写活跃的 schedule | `cvc5_inductive_no_ematching` |
+| `need_induction_lemma` / `need_stronger_lemma` | 优先 `equational_reasoning` 补归纳桥 / 更强 IH | `induction_portfolio` | `cvc5_inductive` |
 | `need_arithmetic_lemma` | 递推/单调性/界 | `alasca_arith`, `integer_induction` | `integer_recursive` |
 | `search_explosion` | 更小、更局部的桥 | 收窄 schedule | `controlled_conjecture` |
 | `high_difficulty_assertions` | 连接高难度公理与目标 | （Vampire 无 difficulty） | `adt_structural` |

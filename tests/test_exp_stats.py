@@ -98,6 +98,9 @@ def test_summarize_artifacts_counts_attempts_and_library(tmp_path: Path) -> None
     assert summary["n_subgoals_proved"] == 1
     assert summary["n_subgoals_failed"] == 1
     assert summary["n_fallback"] == 1
+    assert summary["n_goals_touched"] == 2
+    assert summary["n_invalid"] == 0
+    assert summary["n_invalid_lemmas"] == 0
 
 
 def test_write_task_summary_and_csv(tmp_path: Path) -> None:
@@ -173,14 +176,14 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
 
     folder = str(tmp_path)
     feedback = (
-        "; IMPORTANT: The following lemmas are INVALID or CANNOT be verified.\n"
-        "; The following lemma GROUPS (combinations) did not prove\n"
-        "; SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty)\n"
-        "; USEFUL BUT UNPROVED: these lemmas helped\n"
-        "; SOLVER ROUTING (feedback-guided theory portfolio):\n"
-        "; SOLVER-GUIDED REPAIR (from cvc5 failure analysis).\n"
-        "; Library (already proved, in axioms):\n"
-        "; Last obligation tree (attempt 2; for reference only):\n"
+        "INVALID: The following lemmas are INVALID or CANNOT be verified.\n"
+        "The following lemma GROUPS (combinations) did not prove\n"
+        "SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty)\n"
+        "USEFUL BUT UNPROVED: these lemmas helped\n"
+        "SOLVER ROUTING (feedback-guided theory portfolio):\n"
+        "SOLVER-GUIDED REPAIR (from cvc5 failure analysis).\n"
+        "Library (already proved, in axioms):\n"
+        "Last obligation tree (attempt 2; for reference only):\n"
     )
     inv = log_prompt_blocks(folder, "template", "prove_prompt_term_rewrite", feedback)
     assert inv["has_tree"] is True
@@ -207,7 +210,7 @@ def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
 
     folder = str(tmp_path)
     system = "* Task Environment\nYou are an expert."
-    user = "Input: SMTFile:\n(set-logic ALL)\n; SOLVER-GUIDED REPAIR\nneed_rewrite"
+    user = "Input: SMTFile:\n(set-logic ALL)\nSOLVER-GUIDED REPAIR\nneed_rewrite"
     record = record_llm_generation(
         folder,
         goal="template",
@@ -221,6 +224,7 @@ def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
             "(forall ((n Nat)) (= (plus n zero) n))",
         ],
         elapsed=1.25,
+        raw="; Output begin\n(forall ((n Nat)) (= (plus n zero) n))\n; Output end",
     )
     assert record["n"] == 2
     assert record["call"] == 1
@@ -230,6 +234,8 @@ def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
     assert "(set-logic ALL)" in text
     assert "need_rewrite" in text
     assert "(forall ((n Nat)) (= (plus n zero) n))" in text
+    assert "----- RAW RESPONSE -----" in text
+    assert "; Output begin" in text
 
     record_llm_generation(
         folder,
@@ -240,11 +246,124 @@ def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
         lemmas=[],
         elapsed=0.4,
         parse_error="响应格式错误，缺少输出标记",
+        raw="; INVALID_GOAL: plus is only declared, no defining axioms",
     )
     text = (tmp_path / LLM_PROMPTS_FILENAME).read_text(encoding="utf-8")
     assert "===== LLM CALL 2 =====" in text
     assert "user2 full prompt" in text
     assert "parse_error: 响应格式错误，缺少输出标记" in text
+    assert "; INVALID_GOAL: plus is only declared, no defining axioms" in text
+
+
+def test_summarize_direct_proved_child_without_failed_file(tmp_path: Path) -> None:
+    """A child that proves on first check writes no failed_lemmas_1.json."""
+    _write(
+        tmp_path / "failed_lemmas.json",
+        {
+            "exp_attempts": [{"kind": "obligation_tree", "has_tree": True}],
+            "invalid_lemmas": [],
+            "obligation": {
+                "attempts": [
+                    {
+                        "kind": "obligation_tree",
+                        "tree": {
+                            "id": "template",
+                            "status": "open",
+                            "children": [
+                                {
+                                    "id": "template_1",
+                                    "status": "proved",
+                                    "lib": "lib_1",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    _write(
+        tmp_path / "lemma_library.json",
+        {
+            "lemmas": [
+                {
+                    "id": "lib_1",
+                    "formula": "(forall ((x Lst)) (= (len (rev x)) (len x)))",
+                    "origin": "template_1",
+                    "depth": 1,
+                }
+            ]
+        },
+    )
+    (tmp_path / "template_1.smt2").write_text("(set-logic ALL)\n", encoding="utf-8")
+    assert not (tmp_path / "failed_lemmas_1.json").exists()
+    summary = summarize_artifacts(str(tmp_path))
+    assert summary["max_goal_depth"] == 1
+    assert summary["n_goals_touched"] == 2
+    assert summary["n_subgoals_proved"] == 1
+    assert summary["n_subgoals_failed"] == 0
+    assert summary["n_invalid"] == 0
+    assert summary["n_library_lemmas"] == 1
+
+
+def test_summarize_invalid_on_child_node(tmp_path: Path) -> None:
+    """Invalid diagnosed on a child is copied to parent lemmas, not a root attempt kind."""
+    plus = (
+        "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
+    )
+    _write(
+        tmp_path / "failed_lemmas.json",
+        {
+            "exp_attempts": [
+                {"kind": "useless"},
+                {"kind": "obligation_tree", "has_tree": True},
+            ],
+            "invalid_lemmas": [{"lemma": plus, "reason": "plus has no axioms"}],
+            "useless_lemma_groups": [{"lemmas": [plus]}],
+            "obligation": {
+                "attempts": [
+                    {
+                        "kind": "obligation_tree",
+                        "tree": {
+                            "id": "template",
+                            "children": [
+                                {
+                                    "id": "template_1",
+                                    "status": "invalid",
+                                    "reason": "plus has no axioms",
+                                },
+                                {"id": "template_2", "status": "proved"},
+                            ],
+                        },
+                    }
+                ]
+            },
+        },
+    )
+    _write(
+        tmp_path / "failed_lemmas_1.json",
+        {
+            "exp_attempts": [],
+            "node_outcome": {
+                "kind": "invalid",
+                "reason": "plus has no axioms",
+                "source": "llm",
+            },
+            "invalid_lemmas": [],
+        },
+    )
+    summary = write_task_summary(
+        str(tmp_path), proved=True, exit_reason="llm_subgoals"
+    )
+    assert summary["n_invalid"] == 1
+    assert summary["n_invalid_lemmas"] == 1
+    assert summary["n_useless"] == 1
+    assert summary["max_goal_depth"] == 1
+    assert summary["n_goals_touched"] == 3
+    assert summary["n_subgoals_proved"] == 1
+    dumped = (tmp_path / "exp_summary.json").read_text(encoding="utf-8")
+    assert '"n_invalid": 1' in dumped
+    assert '"n_invalid_lemmas": 1' in dumped
 
 
 if __name__ == "__main__":
@@ -259,4 +378,8 @@ if __name__ == "__main__":
         test_prompt_blocks_and_timing_counters(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_record_llm_generation_writes_plain_prompt_dump(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_summarize_direct_proved_child_without_failed_file(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_summarize_invalid_on_child_node(Path(tmp))
     print("exp_stats tests passed")

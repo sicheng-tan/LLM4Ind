@@ -77,11 +77,14 @@ from lemma_gates import (
     defined_symbols_enabled,
     format_repair_header,
     is_invalid_diagnosis_reason,
+    lemma_known_invalid,
+    lemmas_known_invalid,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
     node_attempt_plan,
     parse_llm_reason,
     parse_final_diagnosis,
+    allow_unmarked_lemma_output,
     repair_hint_for_prompt,
     should_append_diagnosis_suffix,
     should_run_final_diagnosis,
@@ -201,14 +204,15 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
                 pass
 
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
-    """添加无效引理记录"""
+    """添加无效引理记录。公式已在列表中则保留原 reason，不追加。"""
     failed_data = load_failed_lemmas(base_path, goal_name)
+    if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
+        return
     lemma_record = {"lemma": lemma, "reason": reason}
-    if lemma_record not in failed_data["invalid_lemmas"]:
-        failed_data["invalid_lemmas"].append(lemma_record)
-        save_failed_lemmas(base_path, goal_name, failed_data)
-        logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
-        log_exp("invalid_lemma", goal=goal_name, reason=reason)
+    failed_data["invalid_lemmas"].append(lemma_record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
+    log_exp("invalid_lemma", goal=goal_name, reason=reason)
 
 def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
                             meta: Optional[dict] = None):
@@ -627,23 +631,23 @@ def record_solver_attempt(
             prompt=prompt_strategy,
         )
 
-def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) -> str:
+def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, depth: int = 0) -> str:
     """把 Vampire 失败/进展信号格式化进下一轮 LLM prompt。"""
     parts: List[str] = []
 
     if failed_data.get("invalid_lemmas"):
         parts.append(
-            "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be verified. "
+            "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
             "Do not generate these lemmas, and do not weaken them; use the reason:"
         )
         for i, record in enumerate(failed_data["invalid_lemmas"], 1):
-            parts.append(f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}")
+            parts.append(f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}")
 
     useless_members = _lemmas_in_useless_groups(failed_data)
 
     if failed_data.get("useless_lemma_groups"):
         parts.append(
-            "\n; IMPORTANT: The following lemma GROUPS (combinations) did not prove "
+            "\nUSELESS GROUPS: The following lemma GROUPS (combinations) did not prove "
             "the original goal. Do not emit the exact same combination again. "
             "Individual members may still be useful if refined or paired differently:"
         )
@@ -653,38 +657,38 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
                 f" [vampire_status={group.get('status', '?')}; "
                 f"hint={group.get('hint_kind', '')}]"
             )
-            parts.append(f"; Useless group {i}{meta}:")
+            parts.append(f"  Useless group {i}{meta}:")
             for j, lemma in enumerate(lemmas, 1):
-                parts.append(f";   {j}. {lemma}")
+                parts.append(f"    {j}. {lemma}")
 
     if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
         parts.append(
-            "\n; SOLVER PROGRESS SIGNALS: singleton search changes vs control. "
+            "\nSOLVER PROGRESS SIGNALS: singleton search changes vs control. "
             "This is NOT proof of usefulness; a lemma here can still belong to a "
             "failed combination. Prefer refining these, but do not resend the same group:"
         )
         for i, record in enumerate(failed_data["progress_lemmas"], 1):
             signals = ", ".join(record.get("signals", []))
             profile = record.get("best_profile")
-            profile_bit = f"; profile={profile}" if profile else ""
+            profile_bit = f", profile={profile}" if profile else ""
             in_group = (
-                "; in_failed_group: refine this lemma, do not resend the whole group"
+                ", in_failed_group: refine this lemma, do not resend the whole group"
                 if record.get("lemma") in useless_members else ""
             )
             parts.append(
-                f"; Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}{in_group}): "
+                f"  Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}{in_group}): "
                 f"{record['lemma']}"
             )
 
     if unproved_not_invalid_enabled() and failed_data.get("unproved_lemmas"):
         parts.append(
-            "\n; USEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
+            "\nUSEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
             "own proofs did not succeed. Do not discard them; generate weaker variants "
             "or bridging lemmas for them:"
         )
         for i, record in enumerate(failed_data["unproved_lemmas"], 1):
             parts.append(
-                f"; Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
+                f"  Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
             )
 
     if routing_enabled():
@@ -699,19 +703,20 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
         if hints:
             parts.extend(format_repair_header("Vampire", hints))
             for i, hint in enumerate(hints, 1):
-                parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
+                parts.append(f"  Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
                 focus = hint.get("induction_focus") or []
                 if focus:
-                    parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+                    parts.append(f"    Induction focus: {'; '.join(focus[:4])}")
                 for schema in (hint.get("induction_formulas") or [])[:2]:
-                    parts.append(f";   Induction schema: {schema}")
+                    parts.append(f"    Induction schema: {schema}")
                 for action in hint.get("suggested_actions", [])[:3]:
-                    parts.append(f";   -> {action}")
+                    parts.append(f"    -> {action}")
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
             load_lemma_library(base_path),
             failed_data.get("obligation"),
+            depth=depth,
         )
         if obligation_txt:
             parts.append(obligation_txt)
@@ -734,7 +739,9 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
         if diagnosis_only:
             failed_info = format_diagnosis_tree_prompt(failed_data.get("obligation"))
         else:
-            failed_info = format_solver_feedback_for_prompt(failed_data, base_path=base_path)
+            failed_info = format_solver_feedback_for_prompt(
+                failed_data, base_path=base_path, depth=depth,
+            )
         log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
     
     # 构建结构化消息列表
@@ -1139,6 +1146,18 @@ def perform_initial_verification(
             selected_profile=routing_state.active_profile,
             result=result,
         )
+    elif base_path:
+        add_solver_time(base_path, result.elapsed)
+        log_exp(
+            "solver_run",
+            goal=goal_name or goal_smt_file.stem,
+            status=result.status,
+            proved=result.proved,
+            elapsed=result.elapsed,
+            strategy=result.strategy,
+            fallback=False,
+            prompt="initial_prove",
+        )
     log_exp(
         "initial_prove",
         goal=goal_name or goal_smt_file.stem,
@@ -1424,7 +1443,7 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
         try:
             extracted_asserts = parse_llm_response(raw)
         except ValueError:
-            if not diagnosis_only:
+            if not allow_unmarked_lemma_output(raw, diagnosis_only=diagnosis_only):
                 raise
             extracted_asserts = []
         if diagnosis_only:
@@ -1698,8 +1717,8 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
                             f"vampire error: {result.error}",
                         )
                 else:
-                    logging.error(
-                        f"暂时无法过滤引理: {valid_path.name} (status={result.status})"
+                    logging.info(
+                        f"1s 未证伪，进入有用性: {valid_path.name} (status={result.status})"
                     )
             except Exception as e:
                 path = future_to_path[future]
@@ -1804,6 +1823,14 @@ def quick_run(
     if not extracted_asserts:
         logging.info("大模型未返回引理，跳过本 attempt（不加时）")
         return False, [], []
+
+    known_invalid = lemmas_known_invalid(
+        extracted_asserts, failed_data.get("invalid_lemmas") or []
+    )
+    if known_invalid:
+        logging.info("已记录的无效引理被再次生成，跳过: %s", [item[:80] for item in known_invalid])
+        log_exp("known_invalid", goal=goal_smt_name, n=len(known_invalid))
+        return False, [], extracted_asserts
 
     # TODO: 去掉这一部分做消融实验↓
     # 步骤4: 验证引理是否与原目标相同

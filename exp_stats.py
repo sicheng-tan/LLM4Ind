@@ -50,6 +50,7 @@ CSV_COLUMNS = [
     "winner_profile",
     "theory",
     "max_goal_depth",
+    "n_goals_touched",
     "n_pair_history",
     "llm_s",
     "solver_s",
@@ -102,6 +103,7 @@ _FLAG_ENV = (
 )
 
 _FAILED_LEMMAS_RE = re.compile(r"^failed_lemmas((?:_\d+)*)\.json$")
+_GOAL_SMT_RE = re.compile(r"^template(?:_\d+)*\.smt2$")
 
 
 def _fmt(value: Any) -> str:
@@ -211,6 +213,7 @@ def _format_llm_prompt_dump(
     user_text: str,
     lemmas: Sequence[str],
     parse_error: Optional[str],
+    raw: str = "",
 ) -> str:
     header = [
         "",
@@ -231,6 +234,9 @@ def _format_llm_prompt_dump(
             "",
             "----- USER -----",
             user_text or "",
+            "",
+            "----- RAW RESPONSE -----",
+            raw if raw else "(empty)",
             "",
             f"----- EXTRACTED LEMMAS (n={len(lemmas)}) -----",
         ]
@@ -258,13 +264,14 @@ def record_llm_generation(
     parse_error: Optional[str] = None,
     raw: str = "",
 ) -> Dict[str, Any]:
-    """Dump the full LLM input (system + user) as plaintext, plus extracted lemmas.
+    """Dump the full LLM input and the raw model reply, plus extracted lemmas.
 
-    Does not store the raw model transcript. ``feedback`` is already inside
-    ``user_text``; it is accepted for callers but not written separately.
+    ``feedback`` is already inside ``user_text``; it is accepted for callers
+    but not written separately.
     """
-    del feedback, raw
+    del feedback
     lemmas = [str(item) for item in (lemmas or []) if item]
+    raw_text = str(raw or "")
     call_index = 0
     if folder:
         try:
@@ -281,6 +288,7 @@ def record_llm_generation(
                     user_text=user_text,
                     lemmas=lemmas,
                     parse_error=parse_error,
+                    raw=raw_text,
                 )
                 with _llm_prompts_path(folder).open("a", encoding="utf-8") as handle:
                     handle.write(dump)
@@ -295,7 +303,15 @@ def record_llm_generation(
         elapsed=round(float(elapsed or 0), 3),
         prompt_file=LLM_PROMPTS_FILENAME if folder else None,
         parse_error=parse_error,
+        raw_chars=len(raw_text) or None,
     )
+    if parse_error:
+        logging.info(
+            "[exp] llm_raw goal=%s chars=%s preview=%s",
+            goal,
+            len(raw_text),
+            _compact_formula(raw_text, 400),
+        )
     for index, lemma in enumerate(lemmas, 1):
         logging.info(
             "[exp] llm_lemma goal=%s i=%s n=%s formula=%s",
@@ -515,18 +531,125 @@ def _theory_label(features: Any) -> str:
     return logic.lower() if logic else "unknown"
 
 
-def _split_child_counts(records: Dict[str, dict]) -> Counter:
-    """First-level children of every recorded obligation tree."""
-    counts: Counter = Counter()
+def _walk_tree_nodes(tree: Optional[dict]) -> List[dict]:
+    if not isinstance(tree, dict):
+        return []
+    nodes = [tree]
+    for child in tree.get("children") or []:
+        if isinstance(child, dict):
+            nodes.extend(_walk_tree_nodes(child))
+    return nodes
+
+
+def _obligation_trees(data: dict) -> List[dict]:
+    trees: List[dict] = []
+    obligation = data.get("obligation") or {}
+    for attempt in obligation.get("attempts") or []:
+        if attempt.get("kind") != "obligation_tree":
+            continue
+        tree = attempt.get("tree")
+        if isinstance(tree, dict):
+            trees.append(tree)
+    return trees
+
+
+def _goal_ids_from_tree(tree: dict) -> List[str]:
+    ids: List[str] = []
+    for node in _walk_tree_nodes(tree):
+        node_id = str(node.get("id") or "")
+        if node_id:
+            ids.append(node_id)
+    return ids
+
+
+def _collect_goal_names(
+    folder: str,
+    records: Dict[str, dict],
+    library: Sequence[dict],
+) -> List[str]:
+    """Goals from failed_lemmas*, obligation-tree ids, library origins, SMT files."""
+    names = set(records)
     for data in records.values():
-        obligation = data.get("obligation") or {}
-        for attempt in obligation.get("attempts") or []:
-            if attempt.get("kind") != "obligation_tree":
-                continue
-            tree = attempt.get("tree") if isinstance(attempt.get("tree"), dict) else {}
+        for tree in _obligation_trees(data):
+            names.update(_goal_ids_from_tree(tree))
+    for item in library:
+        origin = str(item.get("origin") or "")
+        if origin:
+            names.add(origin)
+    root = Path(folder)
+    if root.is_dir():
+        for path in root.glob("template*.smt2"):
+            if _GOAL_SMT_RE.match(path.name):
+                names.add(path.stem)
+    return sorted(names)
+
+
+def _max_goal_depth(
+    names: Sequence[str],
+    library: Sequence[dict],
+) -> int:
+    depth = 0
+    for name in names:
+        depth = max(depth, _depth_from_goal_name(name))
+    for item in library:
+        origin = str(item.get("origin") or "")
+        if origin:
+            depth = max(depth, _depth_from_goal_name(origin))
+        try:
+            depth = max(depth, int(item.get("depth") or 0))
+        except (TypeError, ValueError):
+            pass
+    return depth
+
+
+def _node_invalid_attempts(data: dict) -> int:
+    """Invalid attempt-kinds plus a node_outcome invalid that has no such attempt."""
+    kinds = _attempt_kinds(data)
+    n = sum(1 for kind in kinds if kind == "invalid")
+    outcome = data.get("node_outcome") or {}
+    if str(outcome.get("kind") or "") == "invalid" and "invalid" not in kinds:
+        n += 1
+    return n
+
+
+def _all_attempt_kinds(records: Dict[str, dict]) -> List[str]:
+    kinds: List[str] = []
+    for data in records.values():
+        kinds.extend(_attempt_kinds(data))
+    return kinds
+
+
+def _all_pair_history(records: Dict[str, dict]) -> List[dict]:
+    items: List[dict] = []
+    root = records.get("template") or {}
+    routing = root.get("routing") if isinstance(root.get("routing"), dict) else {}
+    items.extend(routing.get("pair_history") or [])
+    for goal, data in records.items():
+        if goal == "template":
+            continue
+        routing = data.get("routing") if isinstance(data.get("routing"), dict) else {}
+        items.extend(routing.get("pair_history") or [])
+    return items
+
+
+def _split_child_counts(records: Dict[str, dict]) -> Counter:
+    """Subgoal statuses across obligation trees. Dedup nodes that have an id."""
+    by_id: Dict[str, str] = {}
+    anonymous: Counter = Counter()
+    for data in records.values():
+        for tree in _obligation_trees(data):
             for child in tree.get("children") or []:
-                if isinstance(child, dict):
-                    counts[str(child.get("status") or "")] += 1
+                if not isinstance(child, dict):
+                    continue
+                for node in _walk_tree_nodes(child):
+                    node_id = str(node.get("id") or "")
+                    status = str(node.get("status") or "")
+                    if node_id:
+                        by_id[node_id] = status
+                    else:
+                        anonymous[status] += 1
+    counts: Counter = Counter(by_id.values())
+    counts.update(anonymous)
     return counts
 
 
@@ -559,10 +682,12 @@ def collect_goal_records(folder: str) -> Dict[str, dict]:
 def summarize_artifacts(folder: str) -> Dict[str, Any]:
     """Rebuild algorithm counters from on-disk artifacts (works after timeouts)."""
     records = collect_goal_records(folder)
+    library = _load_library(folder)
+    goal_names = _collect_goal_names(folder, records, library)
     root = records.get("template") or {}
     routing = root.get("routing") if isinstance(root.get("routing"), dict) else {}
-    pair_history = routing.get("pair_history") or []
-    kinds = _attempt_kinds(root)
+    pair_history = _all_pair_history(records)
+    kinds = _all_attempt_kinds(records)
     kind_counts = Counter(kinds)
     prompts = []
     seen_prompts = set()
@@ -572,42 +697,41 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
             seen_prompts.add(prompt)
             prompts.append(prompt)
     winner = ""
-    for item in reversed(pair_history):
+    for item in reversed(routing.get("pair_history") or []):
         if item.get("proved") and item.get("winner_profile"):
             winner = str(item.get("winner_profile"))
             break
-    max_depth = 0
     n_progress = 0
-    n_invalid = 0
-    n_useless = 0
+    n_invalid_lemmas = 0
+    n_useless_groups = 0
     n_unproved = 0
+    n_invalid = 0
     all_hints: List[str] = []
     hint_seen = set()
-    for goal, data in records.items():
-        max_depth = max(max_depth, _depth_from_goal_name(goal))
+    for data in records.values():
         n_progress += len(data.get("progress_lemmas") or [])
-        n_invalid += len(data.get("invalid_lemmas") or [])
-        n_useless += len(data.get("useless_lemma_groups") or [])
+        n_invalid_lemmas += len(data.get("invalid_lemmas") or [])
+        n_useless_groups += len(data.get("useless_lemma_groups") or [])
         n_unproved += len(data.get("unproved_lemmas") or [])
+        n_invalid += _node_invalid_attempts(data)
         for kind in _hint_kinds(data):
             if kind not in hint_seen:
                 hint_seen.add(kind)
                 all_hints.append(kind)
-    library = _load_library(folder)
     split_counts = _split_child_counts(records)
     n_fallback = sum(1 for item in pair_history if item.get("fallback_used"))
     counters = load_counters(folder)
     summary = {
         "n_llm_attempts": len(kinds),
         "n_empty": int(kind_counts.get("empty", 0)),
-        "n_invalid": int(kind_counts.get("invalid", 0)),
+        "n_invalid": int(n_invalid),
         "n_useless": int(kind_counts.get("useless", 0)),
         "n_obligation_trees": int(kind_counts.get("obligation_tree", 0)),
         "attempt_kinds": kinds,
         "n_library_lemmas": len(library),
         "n_progress_lemmas": n_progress,
-        "n_invalid_lemmas": n_invalid,
-        "n_useless_groups": n_useless,
+        "n_invalid_lemmas": n_invalid_lemmas,
+        "n_useless_groups": n_useless_groups,
         "n_unproved": n_unproved,
         "hint_kinds": all_hints,
         "prompts_used": prompts,
@@ -616,9 +740,9 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
         "decision_mode": routing.get("decision_mode") or "",
         "decision_source": routing.get("decision_source") or "",
         "theory": _theory_label(routing.get("theory_features")),
-        "max_goal_depth": max_depth,
+        "max_goal_depth": _max_goal_depth(goal_names, library),
         "n_pair_history": len(pair_history),
-        "n_goals_touched": len(records),
+        "n_goals_touched": len(goal_names),
         "routing_reasons": list(routing.get("routing_reasons") or [])[-6:],
         "n_cancelled": int(split_counts.get("cancelled", 0)),
         "n_subgoals_proved": int(split_counts.get("proved", 0)),
@@ -691,6 +815,7 @@ def write_task_summary(
         attempts=summary.get("n_llm_attempts"),
         empty=summary.get("n_empty"),
         invalid=summary.get("n_invalid"),
+        invalid_lemmas=summary.get("n_invalid_lemmas"),
         useless=summary.get("n_useless"),
         trees=summary.get("n_obligation_trees"),
         lib=summary.get("n_library_lemmas"),
@@ -699,10 +824,13 @@ def write_task_summary(
         winner=summary.get("winner_profile") or None,
         theory=summary.get("theory") or None,
         depth=summary.get("max_goal_depth"),
+        goals=summary.get("n_goals_touched"),
         llm_s=summary.get("llm_s") or None,
         solver_s=summary.get("solver_s") or None,
         fallback=summary.get("n_fallback") or None,
         cancelled=summary.get("n_cancelled") or None,
+        sub_proved=summary.get("n_subgoals_proved") or None,
+        sub_failed=summary.get("n_subgoals_failed") or None,
         error=error or None,
     )
     return summary
@@ -800,6 +928,7 @@ def csv_row(
         "winner_profile": summary.get("winner_profile") or "",
         "theory": summary.get("theory") or "",
         "max_goal_depth": summary.get("max_goal_depth", ""),
+        "n_goals_touched": summary.get("n_goals_touched", ""),
         "n_pair_history": summary.get("n_pair_history", ""),
         "llm_s": summary.get("llm_s", ""),
         "solver_s": summary.get("solver_s", ""),
