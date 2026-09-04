@@ -249,55 +249,40 @@ def attach_source_lemmas(
     return attached
 
 
-def mix_source_key(hint: Optional[dict]) -> Tuple[str, Tuple[str, ...]]:
-    rec = hint or {}
-    lemmas = tuple(
-        normalize_lemma_formula(str(item))
-        for item in (rec.get("source_lemmas") or [])
-        if normalize_lemma_formula(str(item))
+def usefulness_source_lemmas(hints: Sequence[dict]) -> List[str]:
+    """Candidate lemmas from the latest usefulness-check mix among these hints."""
+    found: List[str] = []
+    for hint in hints or []:
+        if str(hint.get("context") or "") != "usefulness_check":
+            continue
+        formulas = [
+            normalize_lemma_formula(str(item))
+            for item in (hint.get("source_lemmas") or [])
+            if normalize_lemma_formula(str(item))
+        ]
+        if formulas:
+            found = formulas
+    return found
+
+
+def format_repair_header(backend: str, hints: Sequence[dict]) -> List[str]:
+    """Header for the repair block. Usefulness-failed C is listed before the hints."""
+    title = f"\n; SOLVER-GUIDED REPAIR (from {backend} failure analysis)."
+    lemmas = usefulness_source_lemmas(hints)
+    if not lemmas:
+        return [title + " Use these hints to choose the NEXT lemmas:"]
+    lines = [title]
+    shown = lemmas[:MAX_MIX_SOURCE_LEMMAS]
+    for i, formula in enumerate(shown, 1):
+        lines.append(f";   C{i}: {compact_formula(formula)}")
+    extra = len(lemmas) - len(shown)
+    if extra > 0:
+        lines.append(f";   ... and {extra} more")
+    lines.append(
+        "; Failed to prove the goal using the above lemmas and produced hints. "
+        "Use these hints to choose the NEXT lemmas:"
     )
-    return (str(rec.get("context") or ""), lemmas)
-
-
-def format_mix_source_comment(hint: Optional[dict]) -> List[str]:
-    """Prompt lines naming the solver run a mix kind came from."""
-    context, lemmas = mix_source_key(hint)
-    if context == "usefulness_check" or lemmas:
-        lines = [
-            "; Mix source: failed usefulness check "
-            "(axioms + these lemmas => CURRENT goal):",
-        ]
-        shown = lemmas[:MAX_MIX_SOURCE_LEMMAS]
-        if not shown:
-            lines.append(";   (candidate formulas were not recorded)")
-        else:
-            for i, formula in enumerate(shown, 1):
-                lines.append(f";   C{i}: {compact_formula(formula)}")
-            extra = len(lemmas) - len(shown)
-            if extra > 0:
-                lines.append(f";   ... and {extra} more")
-        return lines
-    if context == "initial_goal":
-        return [
-            "; Mix source: initial prove of the CURRENT goal (no candidate lemmas).",
-        ]
-    return [
-        "; Mix source: CURRENT goal solver failure (no candidate lemmas).",
-    ]
-
-
-def group_repair_hints_by_mix_source(hints: Sequence[dict]) -> List[List[dict]]:
-    groups: List[List[dict]] = []
-    index: Dict[Tuple[str, Tuple[str, ...]], int] = {}
-    for hint in hints:
-        key = mix_source_key(hint)
-        pos = index.get(key)
-        if pos is None:
-            index[key] = len(groups)
-            groups.append([hint])
-        else:
-            groups[pos].append(hint)
-    return groups
+    return lines
 
 
 def tree_status_from_child_data(failed_data: Optional[dict]) -> Tuple[str, str]:

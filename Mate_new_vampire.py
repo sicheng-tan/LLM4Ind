@@ -75,8 +75,7 @@ from lemma_gates import (
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
     attach_source_lemmas,
     defined_symbols_enabled,
-    format_mix_source_comment,
-    group_repair_hints_by_mix_source,
+    format_repair_header,
     is_invalid_diagnosis_reason,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
@@ -489,8 +488,7 @@ def _record_failed_prove_diagnostics(
     if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
         _store_cached_diag(base_path, goal_name, "baseline_diag", result)
     add_repair_hints(
-        base_path, goal_name,
-        attach_source_lemmas(derive_repair_hints(result, context=context), [], context=context),
+        base_path, goal_name, derive_repair_hints(result, context=context),
     )
     if result.induction_focus:
         logging.info("归纳焦点 (%s): %s", context, result.induction_focus[:4])
@@ -699,29 +697,16 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None) 
     if repair_hints_enabled() and failed_data.get("repair_hints"):
         hints = [h for h in failed_data["repair_hints"] if repair_hint_for_prompt(h)]
         if hints:
-            parts.append(
-                "\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis). "
-                "Use these hints to choose the NEXT lemmas:"
-            )
-            parts.append(
-                "; Mix kinds describe the solver run under Mix source; "
-                "they are not the obligation tree."
-            )
-            n = 1
-            for group in group_repair_hints_by_mix_source(hints):
-                parts.extend(format_mix_source_comment(group[0]))
-                for hint in group:
-                    parts.append(
-                        f"; Repair hint {n} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
-                    )
-                    focus = hint.get("induction_focus") or []
-                    if focus:
-                        parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
-                    for schema in (hint.get("induction_formulas") or [])[:2]:
-                        parts.append(f";   Induction schema: {schema}")
-                    for action in (hint.get("suggested_actions") or [])[:3]:
-                        parts.append(f";   -> {action}")
-                    n += 1
+            parts.extend(format_repair_header("Vampire", hints))
+            for i, hint in enumerate(hints, 1):
+                parts.append(f"; Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
+                focus = hint.get("induction_focus") or []
+                if focus:
+                    parts.append(f";   Induction focus: {'; '.join(focus[:4])}")
+                for schema in (hint.get("induction_formulas") or [])[:2]:
+                    parts.append(f";   Induction schema: {schema}")
+                for action in hint.get("suggested_actions", [])[:3]:
+                    parts.append(f";   -> {action}")
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(

@@ -174,7 +174,6 @@ def test_compressed_prompt_matches_expected_shape() -> None:
     assert "Library (already proved, in axioms):" in text
     assert "lib_1: (forall ((x Nat)) (= (plus x zero) x))" in text
     assert "Last obligation tree (attempt 1; for reference only):" in text
-    assert "later useless attempts do not replace it" in text
     assert "G  open" in text
     assert "├─ lib_1  proved" in text
     assert "└─ L2  failed" in text

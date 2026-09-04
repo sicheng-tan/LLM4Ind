@@ -1045,9 +1045,25 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         by_kind = {h["kind"]: h for h in hints}
         assert "need_rewrite" in by_kind
         assert by_kind["need_rewrite"].get("context") == "usefulness_check"
-        assert by_kind["need_rewrite"].get("source_lemmas") == [lemma]
+        assert lemma in (by_kind["need_rewrite"].get("source_lemmas") or [])
         assert "induction_stuck" in by_kind
         assert "no_progress" not in by_kind
+        txt = mate_v.format_solver_feedback_for_prompt({
+            "repair_hints": hints,
+            "invalid_lemmas": [],
+            "useless_lemma_groups": [],
+            "progress_lemmas": [],
+            "unproved_lemmas": [],
+            "routing": {},
+        })
+        assert "C1:" in txt
+        bridge = (
+            "Failed to prove the goal using the above lemmas and produced hints. "
+            "Use these hints to choose the NEXT lemmas:"
+        )
+        assert bridge in txt
+        assert txt.index("SOLVER-GUIDED REPAIR") < txt.index("C1:")
+        assert txt.index("C1:") < txt.index(bridge)
 
     with tempfile.TemporaryDirectory() as tmp:
         original, _ = mate.extract_original_goal(_PROOF_GOAL_SMT)
@@ -1071,8 +1087,6 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         kinds = [h["kind"] for h in mate.load_failed_lemmas(tmp, "template")["repair_hints"]]
         assert "need_stronger_lemma" in kinds
         assert "high_difficulty_assertions" in kinds
-        cvc_hints = mate.load_failed_lemmas(tmp, "template")["repair_hints"]
-        assert any(h.get("source_lemmas") == [lemma] for h in cvc_hints)
 
 
 def test_usefulness_success_keeps_all_lemmas_without_ucore() -> None:

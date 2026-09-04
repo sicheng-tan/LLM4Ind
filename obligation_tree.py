@@ -404,14 +404,12 @@ def format_obligation_prompt(
             "; OBLIGATION HISTORY: use this tree to judge whether the CURRENT goal is a theorem; do not propose lemmas.",
             "; proved / failed / invalid describe child lemmas; only invalid includes a reason.",
             "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
-            "; This tree is the last split that passed usefulness and recursed; later useless attempts do not replace it.",
         ]
         if for_diagnosis else
         [
             "; OBLIGATION HISTORY: generate lemmas for the CURRENT goal only.",
             "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
             "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
-            "; This tree is the last split that passed usefulness and recursed; later useless attempts do not replace it.",
         ]
     )
     parts = [""]
@@ -421,7 +419,6 @@ def format_obligation_prompt(
             "; Library formulas are already axioms. Do not resend a failed split.",
             "; proved: reuse. failed: you may weaken. invalid: do not weaken; use the reason.",
             "; Child invalid: use its reason to judge whether the CURRENT goal is also invalid.",
-            "; This tree is the last split that passed usefulness and recursed; later useless attempts do not replace it.",
         ])
     elif shown_library:
         parts.extend([

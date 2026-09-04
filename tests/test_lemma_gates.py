@@ -20,8 +20,7 @@ from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
     attach_source_lemmas,
-    format_mix_source_comment,
-    group_repair_hints_by_mix_source,
+    format_repair_header,
     is_invalid_diagnosis_reason,
     node_attempt_plan,
     parse_final_diagnosis,
@@ -82,6 +81,36 @@ def test_parse_llm_reason() -> None:
         assert should_run_final_diagnosis(1, has_tree=False) is False
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert should_run_final_diagnosis(1) is False
+
+
+def test_repair_header_lists_usefulness_lemmas() -> None:
+    lemma = "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
+    initial = format_repair_header("Vampire", [{
+        "kind": "need_rewrite",
+        "context": "initial_goal",
+        "detail": "rewriting scarce",
+    }])
+    assert len(initial) == 1
+    assert "Use these hints to choose the NEXT lemmas:" in initial[0]
+    assert "C1:" not in "\n".join(initial)
+    assert "Failed to prove the goal using the above lemmas" not in "\n".join(initial)
+
+    hints = attach_source_lemmas(
+        [{"kind": "need_rewrite", "detail": "rewriting scarce"}],
+        [lemma],
+        context="usefulness_check",
+    )
+    header = "\n".join(format_repair_header("Vampire", hints))
+    assert header.startswith("\n; SOLVER-GUIDED REPAIR (from Vampire failure analysis).")
+    assert "C1:" in header
+    assert "plus" in header
+    bridge = (
+        "Failed to prove the goal using the above lemmas and produced hints. "
+        "Use these hints to choose the NEXT lemmas:"
+    )
+    assert bridge in header
+    assert header.index("SOLVER-GUIDED REPAIR") < header.index("C1:")
+    assert header.index("C1:") < header.index(bridge)
 
 
 def test_node_attempt_plan_child_cap() -> None:
@@ -152,72 +181,6 @@ def test_repair_hint_for_prompt_drops_subgoal_atp() -> None:
     assert not repair_hint_for_prompt({
         "kind": "induction_stuck", "context": "subgoal:template_1",
     })
-
-
-def test_mix_source_names_candidate_lemmas() -> None:
-    initial = attach_source_lemmas(
-        [{"kind": "need_rewrite", "context": "initial_goal", "detail": "d"}],
-        [],
-        context="initial_goal",
-    )
-    useful = attach_source_lemmas(
-        [{"kind": "need_rewrite", "context": "usefulness_check", "detail": "d2"}],
-        [PLUS_LEMMA],
-        context="usefulness_check",
-    )
-    assert "no candidate lemmas" in "\n".join(format_mix_source_comment(initial[0]))
-    src = "\n".join(format_mix_source_comment(useful[0]))
-    assert "failed usefulness check" in src
-    assert "C1:" in src
-    assert "plus" in src
-    groups = group_repair_hints_by_mix_source(initial + useful)
-    assert len(groups) == 2
-
-
-def test_prompt_mix_source_and_kept_tree() -> None:
-    import Mate_new_vampire as mate
-    from obligation_tree import append_attempt, make_child_node, make_goal_tree
-
-    tree = make_goal_tree(
-        "template",
-        [make_child_node(node_id="template_1", formula=PLUS_LEMMA, status="failed")],
-        proved=False,
-    )
-    data = mate._empty_failed_data()
-    data["repair_hints"] = attach_source_lemmas(
-        [{
-            "kind": "need_rewrite",
-            "context": "usefulness_check",
-            "detail": "rewrite scarce with C2",
-            "suggested_actions": [],
-        }],
-        [SNOC_LEMMA],
-        context="usefulness_check",
-    ) + attach_source_lemmas(
-        [{
-            "kind": "induction_stuck",
-            "context": "initial_goal",
-            "detail": "stuck on goal",
-            "suggested_actions": [],
-        }],
-        [],
-        context="initial_goal",
-    )
-    data["obligation"] = append_attempt({}, "obligation_tree", tree)
-    with tempfile.TemporaryDirectory() as tmp:
-        with patch.dict(os.environ, {
-            "FEEDBACK_REPAIR_HINTS": "on",
-            "OBLIGATION_TREE": "on",
-            "LEMMA_LIBRARY": "off",
-        }):
-            txt = mate.format_solver_feedback_for_prompt(data, base_path=tmp)
-    assert "Mix source: failed usefulness check" in txt
-    assert "C1:" in txt
-    assert "snoc" in txt.lower() or "cons" in txt
-    assert "Mix source: initial prove of the CURRENT goal" in txt
-    assert "Last obligation tree" in txt
-    assert "later useless attempts do not replace it" in txt
-    assert "they are not the obligation tree" in txt
 
 
 def test_quick_run_rejects_undefined_plus() -> None:
@@ -645,12 +608,11 @@ def test_final_diagnosis_skipped_at_root() -> None:
 def main() -> int:
     test_undefined_plus_and_defined_snoc()
     test_parse_llm_reason()
+    test_repair_header_lists_usefulness_lemmas()
     test_node_attempt_plan_child_cap()
     test_tree_status_sat_is_invalid()
     test_tree_status_nested_invalid_does_not_mark_parent()
     test_repair_hint_for_prompt_drops_subgoal_atp()
-    test_mix_source_names_candidate_lemmas()
-    test_prompt_mix_source_and_kept_tree()
     test_quick_run_rejects_undefined_plus()
     test_sat_aborts_child_without_llm()
     test_diagnosis_suffix_flag()
