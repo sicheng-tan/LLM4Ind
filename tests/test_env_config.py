@@ -23,6 +23,8 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
                 "MODEL_TYPE=gpt-5.5",
                 "LLM_TIMEOUT=30",
                 "LLM_MAX_RETRIES=0",
+                "ENABLE_THINKING=false",
+                "MAX_TOKENS=8192",
             ]
         )
         + "\n",
@@ -36,6 +38,8 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
         "DOTENV_PATH",
         "LLM_TIMEOUT",
         "LLM_MAX_RETRIES",
+        "ENABLE_THINKING",
+        "MAX_TOKENS",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DOTENV_PATH", str(env_file))
@@ -47,3 +51,15 @@ def test_dotenv_path_sets_openai_endpoint(tmp_path, monkeypatch) -> None:
     assert config["MODEL_TYPE"] == "gpt-5.5"
     assert config["LLM_TIMEOUT"] == 30.0
     assert config["LLM_MAX_RETRIES"] == 0
+    assert config["ENABLE_THINKING"] is False
+    assert config["MAX_TOKENS"] == 8192
+
+
+def test_llm_call_kwargs_thinking_and_max_tokens() -> None:
+    from env_config import _llm_call_kwargs
+
+    assert _llm_call_kwargs({}) == {}
+    assert _llm_call_kwargs({"ENABLE_THINKING": None, "MAX_TOKENS": None}) == {}
+    kwargs = _llm_call_kwargs({"ENABLE_THINKING": False, "MAX_TOKENS": 8192})
+    assert kwargs["max_tokens"] == 8192
+    assert kwargs["extra_body"] == {"enable_thinking": False}

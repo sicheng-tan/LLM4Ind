@@ -150,6 +150,8 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "PROMPT_RETARGET=" in compact
     assert "MODEL_TYPE=" in compact
     assert "OPENAI_MODEL=" in compact
+    assert "ENABLE_THINKING=" in compact
+    assert "MAX_TOKENS=" in compact
 
 
 def test_timeout_summary_from_artifacts(tmp_path: Path) -> None:

@@ -100,6 +100,8 @@ _FLAG_ENV = (
     "CHILD_LLM_ATTEMPTS",
     "MODEL_TYPE",
     "OPENAI_MODEL",
+    "ENABLE_THINKING",
+    "MAX_TOKENS",
 )
 
 _FAILED_LEMMAS_RE = re.compile(r"^failed_lemmas((?:_\d+)*)\.json$")
@@ -419,6 +421,8 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "CHILD_LLM_ATTEMPTS": "2",
         "MODEL_TYPE": "gpt-4o",
         "OPENAI_MODEL": "openai/gpt-5",
+        "ENABLE_THINKING": "",
+        "MAX_TOKENS": "",
     }
     return {name: os.getenv(name, defaults[name]).strip() for name in _FLAG_ENV}
 

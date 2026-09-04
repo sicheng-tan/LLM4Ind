@@ -76,6 +76,8 @@ def setup_environment():
     llm_timeout = float(raw_llm_timeout) if raw_llm_timeout else None
     raw_llm_retries = os.getenv('LLM_MAX_RETRIES')
     llm_max_retries = int(raw_llm_retries) if raw_llm_retries not in (None, '') else None
+    enable_thinking = _parse_optional_bool(os.getenv('ENABLE_THINKING'), 'ENABLE_THINKING')
+    max_tokens = _parse_optional_int(os.getenv('MAX_TOKENS'), 'MAX_TOKENS')
 
     # 代理配置
     if http_proxy and https_proxy:
@@ -130,11 +132,37 @@ def setup_environment():
         'CHILD_LLM_ATTEMPTS': child_llm_attempts,
         'LLM_TIMEOUT': llm_timeout,
         'LLM_MAX_RETRIES': llm_max_retries,
+        'ENABLE_THINKING': enable_thinking,
+        'MAX_TOKENS': max_tokens,
     }
 
 
+_TRUE_VALUES = frozenset({"1", "true", "on", "yes"})
+_FALSE_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def _parse_optional_bool(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    key = str(raw).strip().lower()
+    if key in _TRUE_VALUES:
+        return True
+    if key in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be true/false (got {raw!r})")
+
+
+def _parse_optional_int(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer (got {raw!r})") from exc
+
+
 def _llm_call_kwargs(config):
-    """Optional per-request timeout / retry cap for ChatOpenAI."""
+    """Optional ChatOpenAI request knobs: timeout, retries, max_tokens, thinking."""
     kwargs = {}
     timeout = config.get('LLM_TIMEOUT')
     if timeout:
@@ -142,11 +170,25 @@ def _llm_call_kwargs(config):
     retries = config.get('LLM_MAX_RETRIES')
     if retries is not None:
         kwargs['max_retries'] = retries
+    max_tokens = config.get('MAX_TOKENS')
+    if max_tokens is not None:
+        kwargs['max_tokens'] = max_tokens
+    thinking = config.get('ENABLE_THINKING')
+    if thinking is not None:
+        extra = dict(kwargs.get('extra_body') or {})
+        extra['enable_thinking'] = thinking
+        kwargs['extra_body'] = extra
     return kwargs
 
 def setup_model(config):
     """根据配置初始化模型"""
     call_kwargs = _llm_call_kwargs(config)
+    if "max_tokens" in call_kwargs or "extra_body" in call_kwargs:
+        logging.info(
+            "LLM request knobs: max_tokens=%s enable_thinking=%s",
+            call_kwargs.get("max_tokens"),
+            (call_kwargs.get("extra_body") or {}).get("enable_thinking"),
+        )
     if config['MODEL_TYPE'] == 'deepseek':
         llm = ChatOpenAI(
             model='deepseek-chat',
