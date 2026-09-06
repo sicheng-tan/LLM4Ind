@@ -202,33 +202,25 @@ def find_template_folders(root_path, template_name="template.smt2"):
     
     return sorted(template_folders)
 
-def copy_folder_for_experiment(original_path):
+def copy_folder_for_experiment(original_path, dest_parent=None):
     """
-    复制原始文件夹到result_files目录下的时间戳命名文件夹
-    返回新文件夹的路径
+    复制原始文件夹到结果目录下的时间戳命名文件夹。
+    dest_parent 默认为项目根下的 result_files。
+    返回新文件夹的路径。
     """
-    # 获取脚本所在的根目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    result_files_dir = os.path.join(script_dir, "result_files")
-    
-    # 创建result_files目录（如果不存在）
+    result_files_dir = dest_parent or os.path.join(script_dir, "result_files")
     os.makedirs(result_files_dir, exist_ok=True)
-    
-    # 获取原始文件夹的最后一层名称
+
     original_folder_name = os.path.basename(original_path.rstrip(os.sep))
-    
-    # 生成时间戳
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 创建新的文件夹名称：时间戳_原始文件夹名
     new_folder_name = f"{timestamp}_{original_folder_name}"
     new_folder_path = os.path.join(result_files_dir, new_folder_name)
-    
-    # 复制文件夹
+
     print(f"正在复制文件夹: {original_path} -> {new_folder_path}")
     shutil.copytree(original_path, new_folder_path)
     print(f"文件夹复制完成: {new_folder_path}")
-    
+
     return new_folder_path
 
 if __name__ == "__main__":
@@ -244,6 +236,9 @@ if __name__ == "__main__":
                        default='default',
                        help='提示词包: default/zero_shot 用 prompts_ours（等式+重写各 N 次）; '
                             'naive 只用 prompt_naive 重复 2N 次，并关闭 prompt 模板选择')
+    parser.add_argument('--result-dir', type=str, default=None,
+                       help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
+                            '未指定时副本在 result_files/，CSV 在 result_csv/')
     args = parser.parse_args()
     
     # 设置多进程启动方法（在某些系统上需要）
@@ -262,9 +257,10 @@ if __name__ == "__main__":
     # original_root_path = "/home/ssdllm/ProofMate/preprocessed/autoproof"
     # original_root_path = "/home/ssdllm/ProofMate/preprocessed/debug_test"
     original_root_path = args.root_path
-    
-    # 复制文件夹到result_files目录，避免污染原始文件
-    root_path = copy_folder_for_experiment(original_root_path)
+    result_parent = os.path.abspath(args.result_dir) if args.result_dir else None
+
+    # 复制文件夹，避免污染原始文件
+    root_path = copy_folder_for_experiment(original_root_path, dest_parent=result_parent)
 
     template_name = "template"
     folders = find_template_folders(root_path, template_name + ".smt2")
@@ -348,10 +344,12 @@ if __name__ == "__main__":
     else:
         csv_filename = f"results_{timestamp}_{dataset_name}_{args.strategy_mode}.csv"
     
-    # 创建result_csv文件夹（如果不存在）
-    result_csv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result_csv")
+    if result_parent:
+        result_csv_dir = root_path
+    else:
+        result_csv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result_csv")
     os.makedirs(result_csv_dir, exist_ok=True)
-    
+
     csv_filepath = os.path.join(result_csv_dir, csv_filename)
     jsonl_filepath = write_results_csv(results, csv_filepath, original_root_path)
     
