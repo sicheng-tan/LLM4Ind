@@ -83,8 +83,10 @@ from lemma_gates import (
     lemmas_known_invalid,
     lemmas_undefined_symbols,
     llm_lemma_diagnosis_enabled,
+    llm_parse_retries,
     node_attempt_plan,
     parse_llm_reason,
+    parse_llm_lemmas,
     parse_final_diagnosis,
     allow_unmarked_lemma_output,
     repair_hint_for_prompt,
@@ -92,6 +94,7 @@ from lemma_gates import (
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
+    with_parse_retry_hint,
 )
 from exp_stats import (
     add_llm_time,
@@ -798,25 +801,8 @@ def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
     return assert_not_content[start_pos:end_pos]
 
 def parse_llm_response(response: str) -> List[str]:
-    """解析LLM输出，提取有效断言"""
-    pattern = r'; Output begin(.*?); Output end'
-    match = re.search(pattern, response, re.DOTALL)
-    if not match:
-        raise ValueError("响应格式错误，缺少输出标记")
-
-    result = []
-    for line in match.group(1).split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        
-        # 使用已有的 extract_balanced_forall 函数提取 forall 内容
-        # 可以处理 (forall...) 和 (assert (forall...)) 两种情况
-        forall_content = extract_balanced_forall(line)
-        if forall_content:
-            result.append(forall_content)
-    
-    return result
+    """解析LLM输出，提取有效断言。"""
+    return parse_llm_lemmas(response)
 
 def _write_combined_smt(
     asserts: List[str],
@@ -1430,7 +1416,10 @@ def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
     return original_assert, original_forall
 
 def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_file: Path, base_path: str, goal_name: str, folder_path: str, depth: int = 0, diagnosis_only: bool = False) -> List[str]:
-    """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。"""
+    """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。
+
+    格式解析失败时在同一次 attempt 内按 LLM_PARSE_RETRIES 再请求，不立刻消耗下一轮 attempt。
+    """
     logging.info(
         "即将使用LLM%s, 目标文件: %s, 提示策略: %s",
         "鉴定当前目标" if diagnosis_only else "生成引理",
@@ -1442,43 +1431,60 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
         depth=depth, diagnosis_only=diagnosis_only,
     )
     system_text = (messages[0].get("content") if messages else "") or ""
-    user_text = (messages[1].get("content") if len(messages) > 1 else "") or ""
-    started = time.time()
-    raw = ""
+    extra_retries = 0 if diagnosis_only else llm_parse_retries()
+    call_messages = list(messages)
     extracted_asserts: List[str] = []
-    parse_error = None
-    try:
-        response = llm.invoke(messages)
-        raw = getattr(response, "content", "") or ""
+    raw = ""
+    strategy_name = (
+        f"{prompt_strategy}|final_diagnosis" if diagnosis_only else prompt_strategy
+    )
+
+    for call_i in range(1 + extra_retries):
+        started = time.time()
+        parse_error = None
+        extracted_asserts = []
+        raw = ""
+        user_text = "\n\n".join(
+            str(item.get("content") or "")
+            for item in call_messages
+            if str(item.get("role") or "") == "user"
+        )
         try:
-            extracted_asserts = parse_llm_response(raw)
-        except ValueError:
-            if not allow_unmarked_lemma_output(raw, diagnosis_only=diagnosis_only):
-                raise
-            extracted_asserts = []
-        if diagnosis_only:
-            verdict, reason = parse_final_diagnosis(raw)
-            _store_last_llm_reason(
-                base_path, goal_name,
-                (reason or "invalid") if verdict == "invalid" else "failed",
+            response = llm.invoke(call_messages)
+            raw = getattr(response, "content", "") or ""
+            try:
+                extracted_asserts = parse_llm_response(raw)
+            except ValueError as exc:
+                if allow_unmarked_lemma_output(raw, diagnosis_only=diagnosis_only):
+                    extracted_asserts = []
+                else:
+                    parse_error = str(exc)
+        except Exception as exc:
+            parse_error = str(exc)
+            elapsed = time.time() - started
+            add_llm_time(base_path, elapsed)
+            record_llm_generation(
+                base_path,
+                goal=goal_name,
+                strategy=strategy_name,
+                prompt_folder=folder_path,
+                smt_file=str(goal_smt_file),
+                system_text=system_text,
+                user_text=user_text,
+                feedback=feedback,
+                lemmas=extracted_asserts,
+                elapsed=elapsed,
+                parse_error=parse_error,
+                raw=raw,
             )
-        elif extracted_asserts:
-            _store_last_llm_reason(base_path, goal_name, None)
-        elif llm_lemma_diagnosis_enabled():
-            _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
-    except Exception as exc:
-        parse_error = str(exc)
-        raise
-    finally:
+            raise
+
         elapsed = time.time() - started
         add_llm_time(base_path, elapsed)
         record_llm_generation(
             base_path,
             goal=goal_name,
-            strategy=(
-                f"{prompt_strategy}|final_diagnosis"
-                if diagnosis_only else prompt_strategy
-            ),
+            strategy=strategy_name,
             prompt_folder=folder_path,
             smt_file=str(goal_smt_file),
             system_text=system_text,
@@ -1489,6 +1495,44 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
             parse_error=parse_error,
             raw=raw,
         )
+        if parse_error:
+            remaining = extra_retries - call_i
+            if remaining > 0:
+                logging.warning(
+                    "LLM 输出无法解析，同一次 attempt 再请求 (%d 次剩余): %s",
+                    remaining,
+                    parse_error,
+                )
+                log_exp(
+                    "parse_retry",
+                    goal=goal_name,
+                    retry=call_i + 1,
+                    remaining=remaining,
+                    max_retries=extra_retries,
+                )
+                call_messages = with_parse_retry_hint(messages, raw)
+                continue
+            logging.warning("LLM 输出无法解析，重试已用尽: %s", parse_error)
+            log_exp(
+                "parse_retry_exhausted",
+                goal=goal_name,
+                retry=call_i + 1,
+                max_retries=extra_retries,
+            )
+            raise ValueError(parse_error)
+
+        if diagnosis_only:
+            verdict, reason = parse_final_diagnosis(raw)
+            _store_last_llm_reason(
+                base_path, goal_name,
+                (reason or "invalid") if verdict == "invalid" else "failed",
+            )
+        elif extracted_asserts:
+            _store_last_llm_reason(base_path, goal_name, None)
+        elif llm_lemma_diagnosis_enabled():
+            _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
+        return extracted_asserts
+
     return extracted_asserts
 
 def normalize_formula(formula: str) -> str:

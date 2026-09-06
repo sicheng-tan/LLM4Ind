@@ -11,7 +11,7 @@ The input is a SMTLIB2 format file, which is a standard format for SMT solvers.
 
 The beginning of the file is a line of text "Input: SMTFile: The smt2 format file you must answer".
 
-Following this line, the entire SMTLIB2 formula file is marked with "; Input begin" and ends with "; Input end".
+Following this line, the SMTLIB2 file is wrapped in <input></input>.
 
 The whole file contains three parts: datatypes, function declaration, and proof goal, marked with ";" comments.
 
@@ -93,13 +93,9 @@ following the chain of thoughts:
 4. Equational reasoning:
     - Transform expressions step by step, annotating axiom/hypothesis usage.
     - Identify "unknown lemma" needed for further proof.
-5. Output the "unknown lemma" in SMTLIB2 format.
+5. Output the unknown lemmas in <output>/<lemma> tags.
 
-Identify the "unknown lemma" from the above chain of thoughts, and output them in SMTLIB2 format. 
-
-Please fill the content between comments, and generate auxiliary lemmas, 
-
-Output: A deductive equational reasoning process.
+Output: a deductive equational reasoning process, then the lemmas:
 
 ; The prove goal is :
 
@@ -113,10 +109,9 @@ Output: A deductive equational reasoning process.
 
 
 ; Need unknown lemma :
-; Output begin
-
-
-; Output end
+<output>
+<lemma>(forall ...)</lemma>
+</output>
 
 * Task Requirements
 
@@ -126,7 +121,14 @@ For example, to prove a formula related to "plus", you need to know through the 
 Note that the generated formula must be a valid SMT formula, especially if there are parentheses in the generated formula, the left and right parentheses must match.
 
 2. For each problem, you may need multiple auxiliary lemmas to complete the proof, but not generate too many lemmas (<= 3 is recommended).
-Please output all the lemmas you discovered through equational reasoning, i.e., the lemmas that appear below "; Need unknown lemma :", to the line after "; Output begin", and end with "; Output end".
+Please output all the lemmas you discovered through equational reasoning, i.e., the lemmas that appear below "; Need unknown lemma :", inside XML tags:
+
+<output>
+<lemma>(forall ...)</lemma>
+<lemma>(forall ...)</lemma>
+</output>
+
+If you output no lemmas, still emit an empty <output></output> block.
 
 3. Please generate *SIMPLE* and *EFFECTIVE* lemmas, and avoid generating complex or redundant lemmas. 1 or 2 lemmas may be enough to prove the goal.
 Attempt to generate lemmas that are closely related to the proof target but simpler to prove. A lemma that makes a small step towards proving the target is sufficient.
@@ -136,7 +138,7 @@ Example1: if the proof goal is "(forall (x T) (= (F1 x) (F2 x)))", then NEVER ge
 Example2: if the proof goal is "(forall ((n Nat) (m Nat)) (= (mult n m) (mult m n))", 
 then NEVER generate needed lemma "(forall ((n Nat) (m Nat)) (= (mult n m) (mult m n)))", or "(forall ((a Nat) (b Nat)) (= (mult b a) (mult a b)))".
 
-6. When you are tend to output empty lemma between "; Output begin" and "; Output end", it means you think the reasoning in "; Equational reasoning :" is obviously valid, but it may not be verified by the solver.
+5. When you tend to output an empty <output></output> block, it means you think the reasoning in "; Equational reasoning :" is obviously valid, but it may not be verified by the solver.
 In this case, try to generate more simple and trivial lemmas, for example:
 
 ```
@@ -153,13 +155,11 @@ You may need to add the commutative law of addition as a lemma to , i.e.
 succ (plus x (succ x)) ==:| unknown lemma |:
 succ (succ (plus x x))
 ;Need unknown lemma :
-; Output begin
-(forall ((n Nat) (m Nat)) (= (plus m n) (plus m n)))
-
-; Output end
+<output>
+<lemma>(forall ((n Nat) (m Nat)) (= (plus m n) (plus n m)))</lemma>
+</output>
 ```
 
-7. Each Lemma between "; Output begin" and "; Output end" should be written in a SINGLE line, do not wrap lines inside a lemma, and wrap lines between different lemms. 
-And do not write any comments at the end of the line.
+6. Put exactly one SMT-LIB forall formula inside each <lemma> tag. Prefer a single line per lemma, and do not write comments inside the tag.
 
 

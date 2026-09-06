@@ -25,14 +25,17 @@ from lemma_gates import (
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
     lemmas_known_invalid,
+    llm_parse_retries,
     node_attempt_plan,
     parse_final_diagnosis,
+    parse_llm_lemmas,
     parse_llm_reason,
     repair_hint_for_prompt,
     should_append_diagnosis_suffix,
     should_run_final_diagnosis,
     undefined_symbols_in_lemma,
     tree_status_from_child_data,
+    with_parse_retry_hint,
 )
 
 P2_SMT = (ROOT / "experiments" / "cases" / "p2_len_rev" / "template.smt2").read_text(
@@ -123,6 +126,51 @@ def test_parse_llm_reason() -> None:
         assert should_run_final_diagnosis(1) is False
 
 
+def test_parse_llm_lemmas_xml_and_legacy() -> None:
+    snoc = "(forall ((x Nat) (y Lst)) (= (len (append y (cons x nil))) (succ (len y))))"
+    plus = "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
+    xml = (
+        "<output>\n"
+        f"<lemma>{snoc}</lemma>\n"
+        f"<lemma>{plus}</lemma>\n"
+        "</output>"
+    )
+    assert parse_llm_lemmas(xml) == [snoc, plus]
+    assert parse_llm_lemmas(
+        f"thinking\n<lemma>\n{snoc}\n</lemma>\n"
+    ) == [snoc]
+    multiline = (
+        "<output>\n<lemma>\n"
+        "(forall ((x Nat))\n"
+        "  (= (plus x zero) x))\n"
+        "</lemma>\n</output>"
+    )
+    assert parse_llm_lemmas(multiline) == [
+        "(forall ((x Nat))\n  (= (plus x zero) x))",
+    ]
+    assert parse_llm_lemmas("<output>\n</output>") == []
+    assert parse_llm_lemmas(
+        "<output></output>\n; INVALID_GOAL: plus has no axioms\n"
+    ) == []
+    assert parse_llm_lemmas(
+        f"<lemmas>\n<lemma>{snoc}</lemma>\n</lemmas>"
+    ) == [snoc]
+    assert parse_llm_lemmas(
+        f"<output>\n<lemma>(assert {snoc})</lemma>\n</output>"
+    ) == [snoc]
+    legacy = f"; Output begin\n{snoc}\n; Output end"
+    assert parse_llm_lemmas(legacy) == [snoc]
+    wrapped = f"; Output begin\n(assert {snoc})\n; Output end"
+    assert parse_llm_lemmas(wrapped) == [snoc]
+    raised = False
+    try:
+        parse_llm_lemmas("no tags here")
+    except ValueError as exc:
+        raised = True
+        assert "输出标记" in str(exc)
+    assert raised
+
+
 def test_repair_header_lists_usefulness_lemmas() -> None:
     lemma = "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
     initial = format_repair_header("Vampire", [{
@@ -161,6 +209,27 @@ def test_node_attempt_plan_child_cap() -> None:
         assert node_attempt_plan(1, pack) == (6, 3)
     with patch.dict(os.environ, {"CHILD_LLM_ATTEMPTS": "2"}):
         assert node_attempt_plan(0, pack) == (6, 3)
+
+
+def test_llm_parse_retries_env() -> None:
+    with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "2"}):
+        assert llm_parse_retries() == 2
+    with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "0"}):
+        assert llm_parse_retries() == 0
+    with patch.dict(os.environ, {"LLM_PARSE_RETRIES": ""}):
+        assert llm_parse_retries() == 2
+    with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "nope"}):
+        assert llm_parse_retries() == 2
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+    ]
+    hinted = with_parse_retry_hint(msgs, "forgot the tags")
+    assert hinted[-2]["role"] == "assistant"
+    assert "forgot the tags" in hinted[-2]["content"]
+    assert hinted[-1]["role"] == "user"
+    assert "<output>" in hinted[-1]["content"]
+    assert hinted[0] is not msgs[0]
 
 
 def test_tree_status_sat_is_invalid() -> None:
@@ -342,12 +411,14 @@ def test_diagnosis_suffix_flag() -> None:
             )
         assert "INVALID_GOAL: <short explanation>" not in root[1]["content"]
         assert DIAGNOSIS_PROMPT_SUFFIX.strip() in child[1]["content"]
+        assert "emit <output></output>" in child[1]["content"]
         assert "previously proposed child lemma is marked invalid" in child[1]["content"]
         final, _ = mate.create_prompt(
             _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
             "./prompts_ours", depth=1, diagnosis_only=True,
         )
         assert FINAL_DIAGNOSIS_PROMPT_SUFFIX.strip() in final[1]["content"]
+        assert "do not use <lemma> tags" in final[1]["content"]
         assert "FINAL CHECK" in final[1]["content"]
         assert "propose different lemmas" not in final[1]["content"]
         assert "Using the obligation tree" in final[1]["content"]
@@ -413,6 +484,42 @@ class _CotReasonOnlyReply:
     )
 
 
+def _run_generate_lemmas(
+    fake_llm,
+    *,
+    retries: str = "2",
+    diagnosis_only: bool = False,
+    mod_name: str = "Mate_new",
+    depth: int = 1,
+):
+    mate = __import__(mod_name)
+    with tempfile.TemporaryDirectory() as tmp:
+        smt = Path(tmp) / "template.smt2"
+        smt.write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_PARSE_RETRIES": retries,
+        }), patch(
+            f"{mod_name}.create_prompt",
+            return_value=(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+                {},
+            ),
+        ), patch(f"{mod_name}.llm", fake_llm):
+            lemmas = mate.generate_lemmas_with_llm(
+                _GOAL,
+                "p",
+                smt,
+                tmp,
+                "template",
+                "./prompts_ours",
+                depth=depth,
+                diagnosis_only=diagnosis_only,
+            )
+            stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
+    return lemmas, stored
+
+
 def test_generate_reason_without_markers_stores_reason() -> None:
     for mod_name in ("Mate_new", "Mate_new_vampire"):
         mate = __import__(mod_name)
@@ -420,7 +527,7 @@ def test_generate_reason_without_markers_stores_reason() -> None:
         fake_llm.invoke.return_value = _InvalidGoalOnlyReply()
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-            with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+            with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
                 f"{mod_name}.create_prompt",
                 return_value=(
                     [
@@ -454,7 +561,7 @@ def test_generate_unmarked_without_reason_still_raises() -> None:
     fake_llm.invoke.return_value = Fake()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -478,6 +585,202 @@ def test_generate_unmarked_without_reason_still_raises() -> None:
             assert raised
 
 
+def test_parse_retry_recovers_on_second_call() -> None:
+    class Unmarked:
+        content = "I will propose lemmas but forgot the markers."
+
+    class Fixed:
+        content = f"<output>\n<lemma>{SNOC_LEMMA}</lemma>\n</output>\n"
+
+    for mod_name in ("Mate_new", "Mate_new_vampire"):
+        mate = __import__(mod_name)
+        fake_llm = MagicMock()
+        fake_llm.invoke.side_effect = [Unmarked(), Fixed()]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+            with patch.dict(os.environ, {
+                "LLM_LEMMA_DIAGNOSIS": "on",
+                "LLM_PARSE_RETRIES": "1",
+            }), patch(
+                f"{mod_name}.create_prompt",
+                return_value=(
+                    [
+                        {"role": "system", "content": "s"},
+                        {"role": "user", "content": "u"},
+                    ],
+                    {},
+                ),
+            ), patch(f"{mod_name}.llm", fake_llm):
+                lemmas = mate.generate_lemmas_with_llm(
+                    _GOAL,
+                    "p",
+                    Path(tmp) / "template.smt2",
+                    tmp,
+                    "template",
+                    "./prompts_ours",
+                    depth=1,
+                )
+        assert lemmas == [SNOC_LEMMA], mod_name
+        assert fake_llm.invoke.call_count == 2, mod_name
+        retry_messages = fake_llm.invoke.call_args_list[1][0][0]
+        assert retry_messages[-2]["role"] == "assistant"
+        assert "forgot the markers" in retry_messages[-2]["content"]
+        assert retry_messages[-1]["role"] == "user"
+        assert "<output>" in retry_messages[-1]["content"]
+
+
+def test_parse_retry_exhausted_still_raises() -> None:
+    class Unmarked:
+        content = "I will propose lemmas but forgot the markers."
+
+    for mod_name in ("Mate_new", "Mate_new_vampire"):
+        fake_llm = MagicMock()
+        fake_llm.invoke.return_value = Unmarked()
+        raised = False
+        try:
+            _run_generate_lemmas(fake_llm, retries="1", mod_name=mod_name)
+        except ValueError as exc:
+            raised = True
+            assert "输出标记" in str(exc)
+        assert raised, mod_name
+        assert fake_llm.invoke.call_count == 2, mod_name
+
+
+def test_parse_retry_default_budget_is_three_calls() -> None:
+    class Unmarked:
+        content = "I will propose lemmas but forgot the markers."
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = Unmarked()
+    raised = False
+    try:
+        _run_generate_lemmas(fake_llm, retries="2")
+    except ValueError:
+        raised = True
+    assert raised
+    assert fake_llm.invoke.call_count == 3
+
+
+def test_empty_output_does_not_parse_retry() -> None:
+    class Empty:
+        content = "<output></output>\n"
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = Empty()
+    lemmas, stored = _run_generate_lemmas(fake_llm, retries="2")
+    assert lemmas == []
+    assert stored == ""
+    assert fake_llm.invoke.call_count == 1
+
+
+def test_empty_output_with_invalid_goal_stores_reason() -> None:
+    class TaggedInvalid:
+        content = (
+            "<output></output>\n"
+            "; INVALID_GOAL: plus has no axioms\n"
+        )
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = TaggedInvalid()
+    lemmas, stored = _run_generate_lemmas(fake_llm, retries="2")
+    assert lemmas == []
+    assert "plus" in stored
+    assert fake_llm.invoke.call_count == 1
+
+
+def test_api_error_does_not_parse_retry() -> None:
+    fake_llm = MagicMock()
+    fake_llm.invoke.side_effect = RuntimeError("api down")
+    raised = False
+    try:
+        _run_generate_lemmas(fake_llm, retries="2")
+    except RuntimeError as exc:
+        raised = True
+        assert "api down" in str(exc)
+    assert raised
+    assert fake_llm.invoke.call_count == 1
+
+
+def test_final_diagnosis_does_not_parse_retry() -> None:
+    class Prose:
+        content = "not a structured verdict"
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = Prose()
+    lemmas, stored = _run_generate_lemmas(
+        fake_llm, retries="2", diagnosis_only=True,
+    )
+    assert lemmas == []
+    assert stored == "failed"
+    assert fake_llm.invoke.call_count == 1
+
+
+def test_parse_retry_does_not_consume_extra_attempt() -> None:
+    import Mate_new as mate
+    from cvc5_runner import CvcResult
+
+    class Unmarked:
+        content = "I will propose lemmas but forgot the markers."
+
+    class TaggedInvalid:
+        content = (
+            "<output></output>\n"
+            "; INVALID_GOAL: plus has no axioms\n"
+        )
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.side_effect = [Unmarked(), TaggedInvalid()]
+    real_gen = mate.generate_lemmas_with_llm
+    gen_calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        gen_calls["n"] += 1
+        return real_gen(*args, **kwargs)
+
+    timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_PARSE_RETRIES": "1",
+            "CHILD_LLM_ATTEMPTS": "2",
+            "SUBGOAL_SAT_ABORT": "off",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY": "off",
+        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+            "Mate_new.llm", fake_llm
+        ), patch("Mate_new.generate_lemmas_with_llm", counting):
+            ok = mate.prove_run(tmp, "template", depth=1)
+        outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
+    assert ok is False
+    assert gen_calls["n"] == 1
+    assert fake_llm.invoke.call_count == 2
+    assert outcome.get("kind") == "invalid"
+    assert "plus" in outcome.get("reason", "")
+
+
+def test_lemma_prompt_xml_contract() -> None:
+    packs = [
+        ROOT / "prompts_ours" / "prove_prompt_equational_reasoning",
+        ROOT / "prompts_ours" / "prove_prompt_term_rewrite",
+        ROOT / "prompts_naive" / "prompt_naive",
+    ]
+    for folder in packs:
+        system = (folder / "system_prompt.txt").read_text(encoding="utf-8")
+        user = (folder / "user_prompt.txt").read_text(encoding="utf-8")
+        assert "<output>" in system, folder.name
+        assert "<lemma>" in system, folder.name
+        assert "<output></output>" in system, folder.name
+        assert "wrapped in <input></input>" in system, folder.name
+        assert "; Output begin" not in system, folder.name
+        assert "; Input begin" not in system, folder.name
+        assert "fill the content between comments" not in system, folder.name
+        assert "<input>" in user, folder.name
+        assert "</input>" in user, folder.name
+        assert "; Input begin" not in user, folder.name
+        assert "; Output begin" not in user, folder.name
+
+
 def test_generate_cot_reason_without_tag_still_raises() -> None:
     import Mate_new as mate
 
@@ -485,7 +788,7 @@ def test_generate_cot_reason_without_tag_still_raises() -> None:
     fake_llm.invoke.return_value = _CotReasonOnlyReply()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -524,7 +827,7 @@ def test_empty_output_cot_reason_does_not_store_invalid() -> None:
     fake_llm.invoke.return_value = Fake()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}), patch(
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -933,8 +1236,10 @@ def test_final_diagnosis_skipped_at_root() -> None:
 def main() -> int:
     test_undefined_plus_and_defined_snoc()
     test_parse_llm_reason()
+    test_parse_llm_lemmas_xml_and_legacy()
     test_repair_header_lists_usefulness_lemmas()
     test_node_attempt_plan_child_cap()
+    test_llm_parse_retries_env()
     test_tree_status_sat_is_invalid()
     test_tree_status_nested_invalid_does_not_mark_parent()
     test_repair_hint_for_prompt_drops_subgoal_atp()
@@ -945,6 +1250,15 @@ def main() -> int:
     test_child_empty_reason_stops_attempts()
     test_generate_reason_without_markers_stores_reason()
     test_generate_unmarked_without_reason_still_raises()
+    test_parse_retry_recovers_on_second_call()
+    test_parse_retry_exhausted_still_raises()
+    test_parse_retry_default_budget_is_three_calls()
+    test_empty_output_does_not_parse_retry()
+    test_empty_output_with_invalid_goal_stores_reason()
+    test_api_error_does_not_parse_retry()
+    test_final_diagnosis_does_not_parse_retry()
+    test_parse_retry_does_not_consume_extra_attempt()
+    test_lemma_prompt_xml_contract()
     test_generate_cot_reason_without_tag_still_raises()
     test_empty_output_cot_reason_does_not_store_invalid()
     test_root_tree_prompt_does_not_ask_to_judge_goal_invalid()

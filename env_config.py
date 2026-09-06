@@ -72,6 +72,7 @@ def setup_environment():
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
     llm_lemma_diagnosis = os.getenv('LLM_LEMMA_DIAGNOSIS', 'on')
     child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '2')
+    llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')
     raw_llm_timeout = os.getenv('LLM_TIMEOUT')
     llm_timeout = float(raw_llm_timeout) if raw_llm_timeout else None
     raw_llm_retries = os.getenv('LLM_MAX_RETRIES')
@@ -130,6 +131,7 @@ def setup_environment():
         'LEMMA_DEFINED_SYMBOLS': lemma_defined_symbols,
         'LLM_LEMMA_DIAGNOSIS': llm_lemma_diagnosis,
         'CHILD_LLM_ATTEMPTS': child_llm_attempts,
+        'LLM_PARSE_RETRIES': llm_parse_retries,
         'LLM_TIMEOUT': llm_timeout,
         'LLM_MAX_RETRIES': llm_max_retries,
         'ENABLE_THINKING': enable_thinking,

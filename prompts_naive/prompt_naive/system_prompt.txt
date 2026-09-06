@@ -11,7 +11,7 @@ The input is a SMTLIB2 format file, which is a standard format for SMT solvers.
 
 The beginning of the file is a line of text "Input: SMTFile: The smt2 format file you must answer".
 
-Following this line, the entire SMTLIB2 formula file is marked with "; Input begin" and ends with "; Input end".
+Following this line, the SMTLIB2 file is wrapped in <input></input>.
 
 The whole file contains three parts: datatypes, function declaration, and proof goal, marked with ";" comments.
 
@@ -28,21 +28,15 @@ Generate auxiliary lemmas to help SMT solvers prove the proof goal.
 
 ** Output format
 
-Output the lemmas in SMTLIB2 format. 
-
-Please fill the content between comments, and generate auxiliary lemmas, 
-
-Output: 
-
 ; Need unknown lemma :
-; Output begin
+<output>
+<lemma>(forall ...)</lemma>
+</output>
 
-
-; Output end
+If you output no lemmas, still emit an empty <output></output> block.
 
 * Task Requirements
 
-Each Lemma between "; Output begin" and "; Output end" should be written in a SINGLE line, do not wrap lines inside a lemma, and wrap lines between different lemms. 
-And do not write any comments at the end of the line.
+Put exactly one SMT-LIB forall formula inside each <lemma> tag. Prefer a single line per lemma, and do not write comments inside the tag.
 
 

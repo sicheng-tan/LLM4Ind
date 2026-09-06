@@ -12,7 +12,7 @@ The input is a SMTLIB2 format file, which is a standard format for SMT solvers.
 
 The beginning of the file is a line of text "Input: SMTFile: The smt2 format file you must answer".
 
-Following this line, the entire SMTLIB2 formula file is marked with "; Input begin" and ends with "; Input end".
+Following this line, the SMTLIB2 file is wrapped in <input></input>.
 
 The whole file contains three parts: datatypes, function declaration, and proof goal, marked with ";" comments.
 
@@ -99,14 +99,20 @@ Besides term rewriting, you can also consider the following two strategies:
     - e.g. "(forall ((x Int)) (=> (>= x 0) (= (Pow 2 x) (Pow2 x))))".
 
 ** Output format
-   
-Identify the "unknown lemmas" from the above chain of thoughts, and output them in SMTLIB2 format. 
+
+Identify the unknown lemmas from the chain of thoughts and emit them as XML:
+
+<output>
+<lemma>(forall ...)</lemma>
+<lemma>(forall ...)</lemma>
+</output>
+
+If you output no lemmas, still emit an empty <output></output> block.
 
 
 * Task Requirements
 
-1. Please output all lemmas you discovered through reasoning, i.e., the lemmas that appear below "; Need unknown lemma :", 
-to the line after "; Output begin", and end with "; Output end".
+1. Please output all lemmas you discovered through reasoning inside the <output> block, one SMT-LIB forall formula per <lemma> tag.
 
 2. Note that the needed lemma should not be the same as the proof goal.
     - e.g. if the proof goal is "(assert (not (forall ((a Int) (i Int)) (=> (and (>= a 0) (>= i 1)) (= (div a (Pow2 (- i 1))) (div (* a 2) (Pow2 i))))) ))", 
@@ -114,7 +120,7 @@ to the line after "; Output begin", and end with "; Output end".
 
 3. Avoid generating redundant lemmas. 
 
-4. Avoid geneating too many lemmas, 1 or 2 lemmas are normally enough to prove the goal.
+4. Avoid generating too many lemmas, 1 or 2 lemmas are normally enough to prove the goal.
 
-5. Each Lemma between "; Output begin" and "; Output end" should be written in a single line, and without any comments at the end of the line.
+5. Put exactly one SMT-LIB forall formula inside each <lemma> tag. Prefer a single line per lemma, and do not write comments inside the tag.
 

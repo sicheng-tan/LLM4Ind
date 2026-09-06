@@ -7,6 +7,8 @@ After a child node's attempts are exhausted, one extra diagnosis-only LLM call
 judges whether the CURRENT goal is invalid from the last well-formed obligation
 tree only (no invalid/unproved/repair/progress/routing blocks). Skip the extra
 call when that tree does not exist.
+LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
+same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ DIAGNOSIS_PROMPT_SUFFIX = (
     "\nIf the CURRENT goal is invalid (not a theorem of the given axioms, "
     "for example it is missing hypotheses, it contradicts existing axioms or lemmas, "
     "or a used function is only declared with no defining assert), "
-    "output no lemmas and write one line:\n"
+    "emit <output></output> and write one line:\n"
     "; INVALID_GOAL: <short explanation>\n"
     "If a previously proposed child lemma is marked invalid, use that invalid mark "
     "and its reason to decide whether the CURRENT goal is also invalid "
@@ -54,7 +56,7 @@ DIAGNOSIS_PROMPT_SUFFIX = (
 )
 
 FINAL_DIAGNOSIS_PROMPT_SUFFIX = (
-    "\nFINAL CHECK (do not propose new lemmas).\n"
+    "\nFINAL CHECK (do not propose lemmas; do not use <lemma> tags).\n"
     "Using the obligation tree "
     "(especially child lemmas marked invalid and their reasons), "
     "decide whether the CURRENT goal is a theorem of the given axioms.\n"
@@ -75,6 +77,17 @@ _VERDICT_LINE = re.compile(
 
 MAX_REASON_CHARS = 200
 MAX_MIX_SOURCE_LEMMAS = 6
+MAX_PARSE_RETRY_SNIPPET = 1500
+PARSE_RETRY_USER = (
+    "FORMAT ERROR: the previous reply could not be parsed because it was "
+    "missing the required output tags. Reply again using exactly:\n"
+    "<output>\n"
+    "<lemma>(forall ...)</lemma>\n"
+    "</output>\n"
+    "If you have no lemmas, output <output></output>. "
+    "You may still write ; INVALID_GOAL: <short explanation> on its own line "
+    "outside the tags. Do not omit the tags."
+)
 
 
 def subgoal_sat_abort_enabled() -> bool:
@@ -94,6 +107,36 @@ def should_append_diagnosis_suffix(depth: int = 0) -> bool:
     if int(depth or 0) <= 0:
         return False
     return llm_lemma_diagnosis_enabled()
+
+
+def llm_parse_retries() -> int:
+    """Extra LLM calls after a format parse failure, same prove-run attempt.
+
+    Default 2 (first call + two retries, 3 total). 0 disables. Does not consume
+    another attempt unless those extra calls also fail to parse. Distinct from
+    ``LLM_MAX_RETRIES`` (HTTP transport).
+    """
+    raw = os.getenv("LLM_PARSE_RETRIES")
+    if raw is None or str(raw).strip() == "":
+        return 2
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 2
+
+
+def with_parse_retry_hint(
+    messages: Sequence[Dict[str, Any]], previous_raw: str
+) -> List[Dict[str, Any]]:
+    """Append the failed reply and a format-correction user turn."""
+    snippet = (previous_raw or "").strip()
+    if len(snippet) > MAX_PARSE_RETRY_SNIPPET:
+        snippet = snippet[:MAX_PARSE_RETRY_SNIPPET] + "\n..."
+    out = [dict(item) for item in messages]
+    if snippet:
+        out.append({"role": "assistant", "content": snippet})
+    out.append({"role": "user", "content": PARSE_RETRY_USER})
+    return out
 
 
 def child_llm_attempts() -> int:
@@ -153,7 +196,7 @@ def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
 def allow_unmarked_lemma_output(
     raw: Optional[str], *, diagnosis_only: bool = False
 ) -> bool:
-    """True when missing ``; Output begin/end`` should not abort the attempt.
+    """True when missing lemma output tags should not abort the attempt.
 
     Final diagnosis never wraps lemmas. Child generation may also emit only
     ``; INVALID_GOAL:`` (the diagnosis suffix) instead of a lemma block.
@@ -163,6 +206,89 @@ def allow_unmarked_lemma_output(
     if not llm_lemma_diagnosis_enabled():
         return False
     return bool(parse_llm_reason(raw))
+
+
+_OUTPUT_TAG = re.compile(
+    r"<\s*(?:output|lemmas)\s*>(.*?)</\s*(?:output|lemmas)\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_LEMMA_TAG = re.compile(
+    r"<\s*lemma\s*>(.*?)</\s*lemma\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_LEGACY_OUTPUT = re.compile(
+    r";\s*Output\s+begin(.*?);\s*Output\s+end",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_FORALL_START = re.compile(r"\(\s*forall")
+
+
+def extract_balanced_forall(text: str) -> Optional[str]:
+    """Return the first balanced ``(forall ...)`` in ``text``, or None."""
+    start_match = _FORALL_START.search(text or "")
+    if not start_match:
+        return None
+    start_pos = start_match.start()
+    balance = 0
+    for i, ch in enumerate(text[start_pos:]):
+        if ch == "(":
+            balance += 1
+        elif ch == ")":
+            balance -= 1
+            if balance == 0:
+                return text[start_pos:start_pos + i + 1]
+    return None
+
+
+def _foralls_from_text(text: str) -> List[str]:
+    tagged = _LEMMA_TAG.findall(text or "")
+    if tagged:
+        found: List[str] = []
+        for body in tagged:
+            formula = extract_balanced_forall(body.strip())
+            if formula:
+                found.append(formula)
+        return found
+    found = []
+    pos = 0
+    blob = text or ""
+    while True:
+        match = _FORALL_START.search(blob, pos)
+        if not match:
+            break
+        formula = extract_balanced_forall(blob[match.start():])
+        if not formula:
+            break
+        found.append(formula)
+        pos = match.start() + len(formula)
+    return found
+
+
+def parse_llm_lemmas(response: Optional[str]) -> List[str]:
+    """Extract SMT lemmas from an LLM reply.
+
+    Preferred shape::
+
+        <output>
+        <lemma>(forall ...)</lemma>
+        </output>
+
+    Also accepts ``<lemmas>``, bare ``<lemma>`` tags, and the legacy
+    ``; Output begin`` / ``; Output end`` block.
+    """
+    text = response or ""
+    match = _OUTPUT_TAG.search(text)
+    if match:
+        return _foralls_from_text(match.group(1))
+    tagged = _LEMMA_TAG.findall(text)
+    if tagged:
+        return _foralls_from_text(
+            "".join(f"<lemma>{body}</lemma>" for body in tagged)
+        )
+    legacy = _LEGACY_OUTPUT.search(text)
+    if legacy:
+        return _foralls_from_text(legacy.group(1))
+    raise ValueError("响应格式错误，缺少输出标记")
 
 
 def parse_final_diagnosis(raw: Optional[str]) -> Tuple[str, Optional[str]]:

@@ -3,8 +3,6 @@
 Please imitate the given example to prove the following specific problem
 
 Input: SMTFile: The smt2 format file you must answer
-; Input begin
-
+<input>
 {smt_file_content}
-
-; Intput end
+</input>
