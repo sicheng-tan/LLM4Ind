@@ -50,6 +50,7 @@ DIAGNOSIS_PROMPT_SUFFIX = (
     "or a used function is only declared with no defining assert), "
     "emit <output></output> and write one line:\n"
     "; INVALID_GOAL: <short explanation>\n"
+    "INVALID_GOAL means the CURRENT goal is not a theorem, not that no helper lemma is needed.\n"
     "If a previously proposed child lemma is marked invalid, use that invalid mark "
     "and its reason to decide whether the CURRENT goal is also invalid "
     "(e.g. it depends on the same missing definition or contradiction).\n"
@@ -79,15 +80,19 @@ MAX_REASON_CHARS = 200
 MAX_MIX_SOURCE_LEMMAS = 6
 MAX_PARSE_RETRY_SNIPPET = 1500
 PARSE_RETRY_USER = (
-    "FORMAT ERROR: the previous reply could not be parsed because it was "
-    "missing the required output tags. Reply again using exactly:\n"
+    "FORMAT ERROR: no usable lemma (missing tags, empty <output>, or unmatched "
+    "parentheses). Reply with at least one balanced formula:\n"
     "<output>\n"
     "<lemma>(forall ...)</lemma>\n"
     "</output>\n"
-    "If you have no lemmas, output <output></output>. "
-    "You may still write ; INVALID_GOAL: <short explanation> on its own line "
-    "outside the tags. Do not omit the tags."
+    "Child only, if the CURRENT goal is not a theorem:\n"
+    "<output></output>\n"
+    "; INVALID_GOAL: <short explanation>"
 )
+PARSE_ERR_EMPTY = "空引理输出"
+PARSE_ERR_UNMATCHED = "引理括号不配平"
+PARSE_ERR_MISSING_TAGS = "响应格式错误，缺少输出标记"
+MAX_FORALL_CLOSE_REPAIR = 2
 
 
 def subgoal_sat_abort_enabled() -> bool:
@@ -194,15 +199,17 @@ def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
 
 
 def allow_unmarked_lemma_output(
-    raw: Optional[str], *, diagnosis_only: bool = False
+    raw: Optional[str], *, diagnosis_only: bool = False, depth: int = 0
 ) -> bool:
     """True when missing lemma output tags should not abort the attempt.
 
     Final diagnosis never wraps lemmas. Child generation may also emit only
-    ``; INVALID_GOAL:`` (the diagnosis suffix) instead of a lemma block.
+    ``; INVALID_GOAL:`` instead of a lemma block. Root must still produce lemmas.
     """
     if diagnosis_only:
         return True
+    if int(depth or 0) <= 0:
+        return False
     if not llm_lemma_diagnosis_enabled():
         return False
     return bool(parse_llm_reason(raw))
@@ -221,6 +228,10 @@ _LEGACY_OUTPUT = re.compile(
     flags=re.DOTALL | re.IGNORECASE,
 )
 _FORALL_START = re.compile(r"\(\s*forall")
+_NEED_UNKNOWN = re.compile(
+    r";\s*Need\s+unknown\s+lemma\s*:?(.*)$",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 
 def extract_balanced_forall(text: str) -> Optional[str]:
@@ -240,31 +251,109 @@ def extract_balanced_forall(text: str) -> Optional[str]:
     return None
 
 
-def _foralls_from_text(text: str) -> List[str]:
-    tagged = _LEMMA_TAG.findall(text or "")
+def _paren_balance(text: str) -> int:
+    bal = 0
+    for ch in text or "":
+        if ch == "(":
+            bal += 1
+        elif ch == ")":
+            bal -= 1
+    return bal
+
+
+def try_repair_unbalanced_forall(
+    text: str, max_close: int = MAX_FORALL_CLOSE_REPAIR
+) -> Optional[str]:
+    """Append 1–2 ``)`` if a ``(forall`` prefix is short of a matching close."""
+    start = _FORALL_START.search(text or "")
+    if not start:
+        return None
+    chunk = text[start.start():]
+    bal = _paren_balance(chunk)
+    if 1 <= bal <= max_close:
+        return extract_balanced_forall(chunk.rstrip() + (")" * bal))
+    return None
+
+
+def extract_forall_repaired(text: str) -> Tuple[Optional[str], bool]:
+    """Return ``(formula, unmatched)``. unmatched means a forall could not be closed."""
+    formula = extract_balanced_forall(text)
+    if formula:
+        return formula, False
+    if not _FORALL_START.search(text or ""):
+        return None, False
+    repaired = try_repair_unbalanced_forall(text)
+    if repaired:
+        return repaired, False
+    return None, True
+
+
+def _formulas_from_blob(text: str) -> Tuple[List[str], bool]:
+    """Extract foralls from lemma tags if present, else scan untagged foralls."""
+    tagged = [body.strip() for body in _LEMMA_TAG.findall(text or "") if body.strip()]
+    found: List[str] = []
+    unmatched = False
     if tagged:
-        found: List[str] = []
         for body in tagged:
-            formula = extract_balanced_forall(body.strip())
+            formula, bad = extract_forall_repaired(body)
             if formula:
                 found.append(formula)
-        return found
-    found = []
+            elif bad:
+                unmatched = True
+        return found, unmatched
     pos = 0
     blob = text or ""
     while True:
         match = _FORALL_START.search(blob, pos)
         if not match:
             break
-        formula = extract_balanced_forall(blob[match.start():])
-        if not formula:
-            break
-        found.append(formula)
-        pos = match.start() + len(formula)
-    return found
+        formula, bad = extract_forall_repaired(blob[match.start():])
+        if formula:
+            found.append(formula)
+            pos = match.start() + len(formula)
+            continue
+        unmatched = unmatched or bad
+        break
+    return found, unmatched
 
 
-def parse_llm_lemmas(response: Optional[str]) -> List[str]:
+def collect_lemmas(text: str) -> Tuple[List[str], bool]:
+    """Salvage lemmas from tags, ``; Need unknown lemma``, then the output block."""
+    found: List[str] = []
+    unmatched = False
+    for body in _LEMMA_TAG.findall(text or ""):
+        formula, bad = extract_forall_repaired((body or "").strip())
+        if formula:
+            found.append(formula)
+        elif bad:
+            unmatched = True
+    if found:
+        return found, unmatched
+    need = _NEED_UNKNOWN.search(text or "")
+    if need:
+        extra, bad = _formulas_from_blob(need.group(1))
+        found.extend(extra)
+        unmatched = unmatched or bad
+        if found:
+            return found, unmatched
+    match = _OUTPUT_TAG.search(text or "")
+    blob = match.group(1) if match else None
+    if blob is None:
+        legacy = _LEGACY_OUTPUT.search(text or "")
+        blob = legacy.group(1) if legacy else None
+    if blob:
+        extra, bad = _formulas_from_blob(blob)
+        found.extend(extra)
+        unmatched = unmatched or bad
+    return found, unmatched
+
+
+def parse_llm_lemmas(
+    response: Optional[str],
+    *,
+    depth: int = 0,
+    diagnosis_only: bool = False,
+) -> List[str]:
     """Extract SMT lemmas from an LLM reply.
 
     Preferred shape::
@@ -273,22 +362,27 @@ def parse_llm_lemmas(response: Optional[str]) -> List[str]:
         <lemma>(forall ...)</lemma>
         </output>
 
-    Also accepts ``<lemmas>``, bare ``<lemma>`` tags, and the legacy
-    ``; Output begin`` / ``; Output end`` block.
+    Also accepts ``<lemmas>``, bare ``<lemma>`` tags, ``; Need unknown lemma``
+    foralls, and the legacy ``; Output begin`` / ``; Output end`` block.
+    Empty tagged output is a parse error unless this is a child ``INVALID_GOAL``
+    or a diagnosis-only call. Foralls missing 1–2 ``)`` are repaired.
     """
     text = response or ""
-    match = _OUTPUT_TAG.search(text)
-    if match:
-        return _foralls_from_text(match.group(1))
-    tagged = _LEMMA_TAG.findall(text)
-    if tagged:
-        return _foralls_from_text(
-            "".join(f"<lemma>{body}</lemma>" for body in tagged)
-        )
-    legacy = _LEGACY_OUTPUT.search(text)
-    if legacy:
-        return _foralls_from_text(legacy.group(1))
-    raise ValueError("响应格式错误，缺少输出标记")
+    lemmas, unmatched = collect_lemmas(text)
+    if lemmas:
+        return lemmas
+    if diagnosis_only:
+        return []
+    has_wrapper = bool(
+        _OUTPUT_TAG.search(text) or _LEMMA_TAG.search(text) or _LEGACY_OUTPUT.search(text)
+    )
+    if unmatched:
+        raise ValueError(PARSE_ERR_UNMATCHED)
+    if not has_wrapper:
+        raise ValueError(PARSE_ERR_MISSING_TAGS)
+    if int(depth or 0) >= 1 and parse_llm_reason(text):
+        return []
+    raise ValueError(PARSE_ERR_EMPTY)
 
 
 def parse_final_diagnosis(raw: Optional[str]) -> Tuple[str, Optional[str]]:

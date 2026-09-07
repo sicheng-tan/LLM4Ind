@@ -19,6 +19,8 @@ from exp_flags import resolve_prompt_pack
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    PARSE_ERR_EMPTY,
+    PARSE_ERR_UNMATCHED,
     allow_unmarked_lemma_output,
     attach_source_lemmas,
     format_repair_header,
@@ -95,23 +97,32 @@ def test_parse_llm_reason() -> None:
     assert parse_final_diagnosis("") == ("failed", None)
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
         assert allow_unmarked_lemma_output(
-            "thinking\n; INVALID_GOAL: plus has no axioms\n", diagnosis_only=False,
+            "thinking\n; INVALID_GOAL: plus has no axioms\n",
+            diagnosis_only=False,
+            depth=1,
         )
         assert not allow_unmarked_lemma_output(
-            "thinking with no diagnosis line", diagnosis_only=False,
+            "thinking\n; INVALID_GOAL: plus has no axioms\n",
+            diagnosis_only=False,
+            depth=0,
         )
         assert not allow_unmarked_lemma_output(
-            "thinking\nreason: the IH does not match\n", diagnosis_only=False,
+            "thinking with no diagnosis line", diagnosis_only=False, depth=1,
         )
         assert not allow_unmarked_lemma_output(
-            "; reason: plus has no axioms", diagnosis_only=False,
+            "thinking\nreason: the IH does not match\n",
+            diagnosis_only=False,
+            depth=1,
+        )
+        assert not allow_unmarked_lemma_output(
+            "; reason: plus has no axioms", diagnosis_only=False, depth=1,
         )
         assert allow_unmarked_lemma_output(
             "thinking with no diagnosis line", diagnosis_only=True,
         )
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert not allow_unmarked_lemma_output(
-            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False,
+            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=1,
         )
     assert is_invalid_diagnosis_reason("plus has no axioms")
     assert is_invalid_diagnosis_reason("invalid")
@@ -148,10 +159,28 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
     assert parse_llm_lemmas(multiline) == [
         "(forall ((x Nat))\n  (= (plus x zero) x))",
     ]
-    assert parse_llm_lemmas("<output>\n</output>") == []
+    empty_raised = False
+    try:
+        parse_llm_lemmas("<output>\n</output>")
+    except ValueError as exc:
+        empty_raised = True
+        assert str(exc) == PARSE_ERR_EMPTY
+    assert empty_raised
     assert parse_llm_lemmas(
-        "<output></output>\n; INVALID_GOAL: plus has no axioms\n"
+        "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
+        depth=1,
     ) == []
+    root_invalid_raised = False
+    try:
+        parse_llm_lemmas(
+            "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
+            depth=0,
+        )
+    except ValueError as exc:
+        root_invalid_raised = True
+        assert str(exc) == PARSE_ERR_EMPTY
+    assert root_invalid_raised
+    assert parse_llm_lemmas("<output>\n</output>", diagnosis_only=True) == []
     assert parse_llm_lemmas(
         f"<lemmas>\n<lemma>{snoc}</lemma>\n</lemmas>"
     ) == [snoc]
@@ -169,6 +198,32 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
         raised = True
         assert "输出标记" in str(exc)
     assert raised
+
+
+def test_parse_llm_lemmas_salvage_and_paren_repair() -> None:
+    plus = "(forall ((n Nat) (m Nat)) (= (plus m n) (plus n m)))"
+    salvaged = (
+        "thinking\n; Need unknown lemma :\n"
+        f"{plus}\n"
+        "<output></output>\n"
+    )
+    assert parse_llm_lemmas(salvaged) == [plus]
+    missing_one = "<output>\n<lemma>(forall ((x Nat)) (= (plus x zero) x)</lemma>\n</output>"
+    assert parse_llm_lemmas(missing_one) == [
+        "(forall ((x Nat)) (= (plus x zero) x))",
+    ]
+    missing_two = "<output>\n<lemma>(forall ((x Nat)) (= (plus x zero) x</lemma>\n</output>"
+    assert parse_llm_lemmas(missing_two) == [
+        "(forall ((x Nat)) (= (plus x zero) x))",
+    ]
+    too_open = "<output>\n<lemma>(forall ((x Nat)) (= (plus x zero</lemma>\n</output>"
+    unmatched_raised = False
+    try:
+        parse_llm_lemmas(too_open)
+    except ValueError as exc:
+        unmatched_raised = True
+        assert str(exc) == PARSE_ERR_UNMATCHED
+    assert unmatched_raised
 
 
 def test_repair_header_lists_usefulness_lemmas() -> None:
@@ -661,16 +716,20 @@ def test_parse_retry_default_budget_is_three_calls() -> None:
     assert fake_llm.invoke.call_count == 3
 
 
-def test_empty_output_does_not_parse_retry() -> None:
+def test_empty_output_does_parse_retry() -> None:
     class Empty:
         content = "<output></output>\n"
 
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = Empty()
-    lemmas, stored = _run_generate_lemmas(fake_llm, retries="2")
-    assert lemmas == []
-    assert stored == ""
-    assert fake_llm.invoke.call_count == 1
+    raised = False
+    try:
+        _run_generate_lemmas(fake_llm, retries="2")
+    except ValueError as exc:
+        raised = True
+        assert str(exc) == PARSE_ERR_EMPTY
+    assert raised
+    assert fake_llm.invoke.call_count == 3
 
 
 def test_empty_output_with_invalid_goal_stores_reason() -> None:
@@ -770,7 +829,7 @@ def test_lemma_prompt_xml_contract() -> None:
         user = (folder / "user_prompt.txt").read_text(encoding="utf-8")
         assert "<output>" in system, folder.name
         assert "<lemma>" in system, folder.name
-        assert "<output></output>" in system, folder.name
+        assert "If you output no lemmas, still emit" not in system, folder.name
         assert "wrapped in <input></input>" in system, folder.name
         assert "; Output begin" not in system, folder.name
         assert "; Input begin" not in system, folder.name
@@ -834,16 +893,21 @@ def test_empty_output_cot_reason_does_not_store_invalid() -> None:
                 {},
             ),
         ), patch("Mate_new.llm", fake_llm):
-            lemmas = mate.generate_lemmas_with_llm(
-                _GOAL,
-                "p",
-                Path(tmp) / "template.smt2",
-                tmp,
-                "template",
-                "./prompts_ours",
-                depth=1,
-            )
-        assert lemmas == []
+            raised = False
+            try:
+                mate.generate_lemmas_with_llm(
+                    _GOAL,
+                    "p",
+                    Path(tmp) / "template.smt2",
+                    tmp,
+                    "template",
+                    "./prompts_ours",
+                    depth=1,
+                )
+            except ValueError as exc:
+                raised = True
+                assert str(exc) == PARSE_ERR_EMPTY
+            assert raised
         stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
         assert stored == ""
 
@@ -1237,6 +1301,7 @@ def main() -> int:
     test_undefined_plus_and_defined_snoc()
     test_parse_llm_reason()
     test_parse_llm_lemmas_xml_and_legacy()
+    test_parse_llm_lemmas_salvage_and_paren_repair()
     test_repair_header_lists_usefulness_lemmas()
     test_node_attempt_plan_child_cap()
     test_llm_parse_retries_env()
@@ -1253,7 +1318,7 @@ def main() -> int:
     test_parse_retry_recovers_on_second_call()
     test_parse_retry_exhausted_still_raises()
     test_parse_retry_default_budget_is_three_calls()
-    test_empty_output_does_not_parse_retry()
+    test_empty_output_does_parse_retry()
     test_empty_output_with_invalid_goal_stores_reason()
     test_api_error_does_not_parse_retry()
     test_final_diagnosis_does_not_parse_retry()

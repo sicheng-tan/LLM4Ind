@@ -33,7 +33,7 @@ Generate auxiliary lemmas to help SMT solvers prove the proof goal.
 <lemma>(forall ...)</lemma>
 </output>
 
-If you output no lemmas, still emit an empty <output></output> block.
+Do not emit an empty <output> block. Child only, if the CURRENT goal is not a theorem: empty <output> plus `; INVALID_GOAL: ...`.
 
 * Task Requirements
 

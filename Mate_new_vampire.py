@@ -784,9 +784,11 @@ def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
     
     return assert_not_content[start_pos:end_pos]
 
-def parse_llm_response(response: str) -> List[str]:
+def parse_llm_response(
+    response: str, *, depth: int = 0, diagnosis_only: bool = False
+) -> List[str]:
     """解析LLM输出，提取有效断言。"""
-    return parse_llm_lemmas(response)
+    return parse_llm_lemmas(response, depth=depth, diagnosis_only=diagnosis_only)
 
 def _write_combined_smt(
     original_assert: re.Match,
@@ -1443,9 +1445,13 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
             response = llm.invoke(call_messages)
             raw = getattr(response, "content", "") or ""
             try:
-                extracted_asserts = parse_llm_response(raw)
+                extracted_asserts = parse_llm_response(
+                    raw, depth=depth, diagnosis_only=diagnosis_only
+                )
             except ValueError as exc:
-                if allow_unmarked_lemma_output(raw, diagnosis_only=diagnosis_only):
+                if allow_unmarked_lemma_output(
+                    raw, diagnosis_only=diagnosis_only, depth=depth
+                ):
                     extracted_asserts = []
                 else:
                     parse_error = str(exc)
