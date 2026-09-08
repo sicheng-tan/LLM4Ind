@@ -147,6 +147,8 @@ def test_flags_compact_includes_ablation_keys() -> None:
     compact = flags_compact()
     assert "SOLVER_ROUTING=" in compact
     assert "LEMMA_LIBRARY=" in compact
+    assert "LEMMA_LIBRARY_LOCAL=" in compact
+    assert "USEFULNESS_HARVEST_DELAY_S=" in compact
     assert "PROMPT_RETARGET=" in compact
     assert "MODEL_TYPE=" in compact
     assert "OPENAI_MODEL=" in compact

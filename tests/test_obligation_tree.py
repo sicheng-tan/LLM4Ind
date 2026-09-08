@@ -24,13 +24,16 @@ from obligation_tree import (
     last_normal_tree,
     lemma_library_enabled,
     lemma_library_path,
+    lemma_library_role,
     load_lemma_library,
+    local_lemma_harvest_enabled,
     make_child_node,
     make_goal_tree,
     materialize_smt_with_library,
     obligation_tree_enabled,
     render_obligation_tree,
     solver_smt_content,
+    MAX_LIBRARY_LEMMAS,
 )
 
 
@@ -298,7 +301,99 @@ def _patch_flags(library: str, tree: str):
     return patch.dict(os.environ, {
         "LEMMA_LIBRARY": library,
         "OBLIGATION_TREE": tree,
+        "LEMMA_LIBRARY_LOCAL": "on",
     })
+
+
+def _formula(i: int) -> str:
+    return f"(forall ((x Nat)) (= (f{i} x) x))"
+
+
+def test_library_local_cannot_evict_pins(tmp_path: Path) -> None:
+    with _patch_flags("on", "on"):
+        ids = [
+            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
+            for i in range(MAX_LIBRARY_LEMMAS)
+        ]
+        assert all(ids)
+        rejected = add_proved_lemma(str(tmp_path), _formula(99), role="local")
+        assert rejected is None
+        stored = load_lemma_library(str(tmp_path))
+        assert len(stored) == MAX_LIBRARY_LEMMAS
+        assert all(lemma_library_role(item) == "pin" for item in stored)
+
+
+def test_library_new_local_evicts_oldest_local(tmp_path: Path) -> None:
+    with _patch_flags("on", "on"):
+        for i in range(8):
+            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
+        local_ids = [
+            add_proved_lemma(str(tmp_path), _formula(20 + i), role="local")
+            for i in range(4)
+        ]
+        oldest_local = local_ids[0]
+        newest = add_proved_lemma(str(tmp_path), _formula(30), role="local")
+        stored = load_lemma_library(str(tmp_path))
+        roles = [lemma_library_role(item) for item in stored]
+        assert roles.count("pin") == 8
+        assert roles.count("local") == 4
+        ids = [item["id"] for item in stored]
+        assert oldest_local not in ids
+        assert newest in ids
+
+
+def test_library_new_pin_evicts_local(tmp_path: Path) -> None:
+    with _patch_flags("on", "on"):
+        for i in range(8):
+            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
+        local_ids = [
+            add_proved_lemma(str(tmp_path), _formula(20 + i), role="local")
+            for i in range(4)
+        ]
+        new_pin = add_proved_lemma(str(tmp_path), _formula(40), role="pin")
+        stored = load_lemma_library(str(tmp_path))
+        roles = [lemma_library_role(item) for item in stored]
+        assert roles.count("pin") == 9
+        assert roles.count("local") == 3
+        ids = [item["id"] for item in stored]
+        assert local_ids[0] not in ids
+        assert new_pin in ids
+
+
+def test_library_promote_local_to_pin_keeps_id(tmp_path: Path) -> None:
+    formula = _formula(1)
+    with _patch_flags("on", "on"):
+        local_id = add_proved_lemma(str(tmp_path), formula, role="local")
+        pin_id = add_proved_lemma(str(tmp_path), formula, role="pin")
+        assert local_id == pin_id == "lib_1"
+        stored = load_lemma_library(str(tmp_path))
+        assert len(stored) == 1
+        assert lemma_library_role(stored[0]) == "pin"
+
+
+def test_library_missing_role_is_pin(tmp_path: Path) -> None:
+    import json
+    path = lemma_library_path(str(tmp_path))
+    lemmas = [
+        {"id": f"lib_{i}", "formula": _formula(i), "status": "proved"}
+        for i in range(1, MAX_LIBRARY_LEMMAS + 1)
+    ]
+    path.write_text(json.dumps({"lemmas": lemmas}), encoding="utf-8")
+    with _patch_flags("on", "on"):
+        assert add_proved_lemma(str(tmp_path), _formula(99), role="local") is None
+        stored = load_lemma_library(str(tmp_path))
+        assert len(stored) == MAX_LIBRARY_LEMMAS
+        assert all(lemma_library_role(item) == "pin" for item in stored)
+
+
+def test_local_harvest_flag_blocks_local_insert(tmp_path: Path) -> None:
+    with patch.dict(os.environ, {
+        "LEMMA_LIBRARY": "on",
+        "LEMMA_LIBRARY_LOCAL": "off",
+    }):
+        assert local_lemma_harvest_enabled() is False
+        assert add_proved_lemma(str(tmp_path), _formula(1), role="local") is None
+        assert add_proved_lemma(str(tmp_path), _formula(1), role="pin") == "lib_1"
 
 
 def _sample_obligation():
@@ -466,7 +561,19 @@ def test_mate_feedback_and_recording_respect_flags() -> None:
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
-        test_library_dedup_and_ids(Path(tmp))
+        root = Path(tmp)
+        for i, fn in enumerate((
+            test_library_dedup_and_ids,
+            test_library_local_cannot_evict_pins,
+            test_library_new_local_evicts_oldest_local,
+            test_library_new_pin_evicts_local,
+            test_library_promote_local_to_pin_keeps_id,
+            test_library_missing_role_is_pin,
+            test_local_harvest_flag_blocks_local_insert,
+        )):
+            d = root / str(i)
+            d.mkdir()
+            fn(d)
     test_last_normal_tree_skips_empty_invalid_useless()
     test_classify_failed_attempt()
     test_inject_library_axioms_before_proof_goal()

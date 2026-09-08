@@ -3,8 +3,8 @@
 Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
-These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``, and
-``OBLIGATION_TREE``.
+These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
+``LEMMA_LIBRARY_LOCAL``, and ``OBLIGATION_TREE``.
 """
 
 from __future__ import annotations

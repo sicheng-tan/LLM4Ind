@@ -7,7 +7,7 @@ import time
 import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Tuple, Optional, Any, Dict
+from typing import List, Tuple, Optional, Any, Dict, Sequence, Set
 from logger_config import setup_colored_logger
 from env_config import setup_environment, setup_model
 from cvc5_runner import (
@@ -63,6 +63,10 @@ from obligation_tree import (
     materialize_smt_with_library,
     obligation_tree_enabled,
     solver_smt_content,
+    HARVEST_CVC_PROFILES,
+    HARVEST_DISPATCH_KEY,
+    local_lemma_harvest_enabled,
+    usefulness_harvest_delay_s,
 )
 from exp_flags import (
     paper_schedule_prompt,
@@ -71,6 +75,11 @@ from exp_flags import (
     repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
+)
+from lemma_harvest import (
+    harvest_slot_kind,
+    make_harvest_slots,
+    run_usefulness_with_delayed_harvest,
 )
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
@@ -407,7 +416,8 @@ def _child_obligation_node(
     tree_reason = None
     if status == "proved" and formula:
         lib_id = add_proved_lemma(
-            base_path, formula, origin=subgoal, attempt=attempt, depth=depth
+            base_path, formula, origin=subgoal, attempt=attempt, depth=depth,
+            role="pin",
         )
         nested = last_normal_tree(load_failed_lemmas(base_path, subgoal).get("obligation"))
         if nested:
@@ -1121,6 +1131,7 @@ def perform_initial_verification(
     *,
     base_path: Optional[str] = None,
     goal_name: Optional[str] = None,
+    log_event: str = "initial_prove",
 ) -> bool:
     """执行初始验证检查"""
     default_timeout = config['DEFAULT_CVC_TIMEOUT']
@@ -1129,7 +1140,7 @@ def perform_initial_verification(
     smt_path = goal_smt_file
     if base_path and lemma_library_enabled():
         n_lib = len(load_lemma_library(base_path))
-        log_library_inject(base_path, goal_name, n_lib, "initial_prove")
+        log_library_inject(base_path, goal_name, n_lib, log_event)
         smt_path = materialize_smt_with_library(goal_smt_file, base_path)
     result = run_cvc_routed(
         smt_path,
@@ -1138,7 +1149,7 @@ def perform_initial_verification(
         collect_stats=True,
         collect_difficulty=True,
     )
-    if routing_enabled() and base_path and goal_name:
+    if log_event == "initial_prove" and routing_enabled() and base_path and goal_name:
         record_solver_attempt(
             base_path,
             goal_name,
@@ -1146,7 +1157,7 @@ def perform_initial_verification(
             selected_profile=routing_state.active_profile,
             result=result,
         )
-    elif base_path:
+    elif log_event == "initial_prove" and base_path:
         add_solver_time(base_path, result.elapsed)
         log_exp(
             "solver_run",
@@ -1158,8 +1169,10 @@ def perform_initial_verification(
             fallback=False,
             prompt="initial_prove",
         )
+    elif base_path:
+        add_solver_time(base_path, result.elapsed)
     log_exp(
-        "initial_prove",
+        log_event,
         goal=goal_name or goal_smt_file.stem,
         proved=result.proved,
         status=result.status,
@@ -1171,12 +1184,17 @@ def perform_initial_verification(
         logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
 
-    if base_path and goal_name:
+    if log_event == "initial_prove" and base_path and goal_name:
         _record_failed_prove_diagnostics(base_path, goal_name, result)
-    logging.error(
-        "CVC5验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
-        result.status, result.elapsed, result.strategy,
-    )
+        logging.error(
+            "CVC5验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
+            result.status, result.elapsed, result.strategy,
+        )
+    else:
+        logging.info(
+            "再证当前目标未通过 (status=%s elapsed=%.2fs)",
+            result.status, result.elapsed,
+        )
     return False
 
 
@@ -1819,6 +1837,132 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
     return generated_files
 
 
+def _harvest_direct_prove(smt_path: Path, base_path: str) -> CvcResult:
+    result = run_cvc(
+        smt_path,
+        config["DEFAULT_CVC_TIMEOUT"],
+        profiles=list(HARVEST_CVC_PROFILES),
+    )
+    add_solver_time(base_path, result.elapsed)
+    log_exp(
+        "direct_prove",
+        goal=Path(smt_path).stem,
+        proved=result.proved,
+        status=result.status,
+        elapsed=result.elapsed,
+        strategy=result.strategy,
+    )
+    return result
+
+
+def _store_harvest_dispatch(base_path: str, goal_name: str, payload: dict) -> None:
+    data = load_failed_lemmas(base_path, goal_name)
+    data[HARVEST_DISPATCH_KEY] = payload
+    save_failed_lemmas(base_path, goal_name, data)
+
+
+def _pop_harvest_dispatch(base_path: str, goal_name: str) -> dict:
+    data = load_failed_lemmas(base_path, goal_name)
+    payload = data.pop(HARVEST_DISPATCH_KEY, None) or {}
+    save_failed_lemmas(base_path, goal_name, data)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _log_harvest_lemma(slot, role: str) -> None:
+    result = slot.result
+    log_exp(
+        "harvest_lemma",
+        goal=slot.name,
+        index=slot.index,
+        proved=bool(getattr(result, "proved", False)),
+        status=getattr(result, "status", None),
+        elapsed=getattr(result, "elapsed", None),
+        role=role,
+    )
+
+
+def _finish_usefulness_unsat(
+    *,
+    selected_lemmas: List[str],
+    slots,
+    extracted_asserts: List[str],
+    smt_content: str,
+    smt_file_path: Path,
+    goal_smt_name: str,
+    base_path: str,
+    depth: int,
+) -> Tuple[bool, List[str], List[str]]:
+    generated = generate_formal_proof_files(
+        selected_lemmas, smt_content, smt_file_path, goal_smt_name
+    )
+    slot_by_index = {slot.index: slot for slot in slots}
+    skip_initial: List[str] = []
+    pre_proved: Dict[str, dict] = {}
+    recurse: List[str] = []
+    order: List[str] = []
+    for i, formula in enumerate(selected_lemmas, 1):
+        name = generated[i - 1] if i <= len(generated) else f"{goal_smt_name}_{i}"
+        order.append(name)
+        slot = slot_by_index.get(i)
+        kind = harvest_slot_kind(slot) if slot is not None else "not_started"
+        if kind == "proved":
+            lib_id = add_proved_lemma(
+                base_path, formula, origin=name, attempt=0, depth=depth + 1,
+                role="pin",
+            )
+            _log_harvest_lemma(slot, "pin")
+            pre_proved[name] = {"formula": formula, "lib": lib_id}
+        elif kind == "exhausted":
+            recurse.append(name)
+            skip_initial.append(name)
+        else:
+            recurse.append(name)
+    _store_harvest_dispatch(base_path, goal_smt_name, {
+        "order": order,
+        "pre_proved": pre_proved,
+        "skip_initial": skip_initial,
+    })
+    logging.info(
+        "lemmas有用，保留 %d/%d 条用于子目标生成 (direct_proved=%d recurse=%d)",
+        len(selected_lemmas), len(extracted_asserts),
+        len(pre_proved), len(recurse),
+    )
+    return True, recurse, selected_lemmas
+
+
+def _finish_usefulness_timeout(
+    *,
+    slots,
+    extracted_asserts: List[str],
+    goal_smt_file: Path,
+    base_path: str,
+    goal_smt_name: str,
+    depth: int,
+) -> Tuple[bool, List[str], List[str]]:
+    n_local = 0
+    for slot in slots:
+        if harvest_slot_kind(slot) != "proved":
+            continue
+        add_proved_lemma(
+            base_path, slot.formula, origin=slot.name, attempt=0, depth=depth + 1,
+            role="local",
+        )
+        _log_harvest_lemma(slot, "local")
+        n_local += 1
+    if n_local:
+        ok = perform_initial_verification(
+            goal_smt_file, base_path=base_path, goal_name=goal_smt_name,
+            log_event="harvest_retry",
+        )
+        if ok:
+            logging.info("timeout 收获 %d 条 local 后证出当前目标", n_local)
+            return True, [], extracted_asserts
+        logging.info("timeout 收获 %d 条 local 后仍未证出当前目标", n_local)
+    else:
+        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    return False, [], extracted_asserts
+
+
 def quick_run(
     base_path: str,
     goal_smt_name: str,
@@ -1835,6 +1979,7 @@ def quick_run(
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
     smt_content = goal_smt_file.read_text()
     solver_content = solver_smt_content(smt_content, base_path)
+    _store_harvest_dispatch(base_path, goal_smt_name, {})
     if base_path and lemma_library_enabled():
         log_library_inject(
             base_path, goal_smt_name, len(load_lemma_library(base_path)), "attempt_smt"
@@ -1937,32 +2082,58 @@ def quick_run(
 
     # 步骤6: 一次整组有用性检查；失败则用 60s A∧C→P 写 mix（可选 sidecar 只打 progress）
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
-    useful, selected_lemmas, _cres = verify_combined_lemmas(
-        original_assert,
-        extracted_asserts,
-        solver_content,
-        combined_path,
-        base_path=base_path,
-        goal_name=goal_smt_name,
-        prompt_strategy=prompt_strategy,
-        solver_profile=solver_profile,
-        decision_source=decision_source,
-    )
-    if not useful:
-        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
-        return False, [], extracted_asserts
+    harvest_on = local_lemma_harvest_enabled()
+    slots = []
+    if harvest_on:
+        slots = make_harvest_slots(
+            extracted_asserts, solver_content, smt_file_path, goal_smt_name,
+        )
 
-    logging.info(
-        "lemmas有用，保留 %d/%d 条用于子目标生成",
-        len(selected_lemmas), len(extracted_asserts),
-    )
+    def _usefulness():
+        return verify_combined_lemmas(
+            original_assert,
+            extracted_asserts,
+            solver_content,
+            combined_path,
+            base_path=base_path,
+            goal_name=goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            solver_profile=solver_profile,
+            decision_source=decision_source,
+        )
 
-    # 步骤7: 生成正式验证文件
-    generated_files = generate_formal_proof_files(
-        selected_lemmas, smt_content, smt_file_path, goal_smt_name
+    useful, selected_lemmas, cres = run_usefulness_with_delayed_harvest(
+        usefulness_fn=_usefulness,
+        slots=slots,
+        prove_fn=lambda path: _harvest_direct_prove(path, base_path),
+        goal=goal_smt_name,
+        delay_s=usefulness_harvest_delay_s(),
+        enabled=harvest_on,
+        profiles=HARVEST_CVC_PROFILES,
     )
-    
-    return True, generated_files, selected_lemmas
+    if useful:
+        return _finish_usefulness_unsat(
+            selected_lemmas=selected_lemmas or list(extracted_asserts),
+            slots=slots,
+            extracted_asserts=extracted_asserts,
+            smt_content=smt_content,
+            smt_file_path=smt_file_path,
+            goal_smt_name=goal_smt_name,
+            base_path=base_path,
+            depth=depth,
+        )
+    status = str(getattr(cres, "status", "") or "").lower()
+    if harvest_on and status == "timeout":
+        return _finish_usefulness_timeout(
+            slots=slots,
+            extracted_asserts=extracted_asserts,
+            goal_smt_file=goal_smt_file,
+            base_path=base_path,
+            goal_smt_name=goal_smt_name,
+            depth=depth,
+        )
+    logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    return False, [], extracted_asserts
 
 def prove_subgoals_parallel(
     base_path: str,
@@ -1973,6 +2144,7 @@ def prove_subgoals_parallel(
     parent_lemmas: List[str] = None,
     parent_goal_name: str = None,
     attempt: int = 0,
+    skip_initial_for: Optional[Set[str]] = None,
 ) -> Tuple[bool, List[dict]]:
     """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
     if not subgoals:
@@ -1980,6 +2152,7 @@ def prove_subgoals_parallel(
 
     logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
     parent_lemmas = parent_lemmas or []
+    skip_initial_for = skip_initial_for or set()
     snapshots: Dict[str, dict] = {}
 
     def _formula(sg: str) -> Optional[str]:
@@ -2026,7 +2199,14 @@ def prove_subgoals_parallel(
     with ThreadPoolExecutor(max_workers=min(len(subgoals), 4)) as executor:
         future_to_subgoal = {
             executor.submit(
-                prove_run, base_path, subgoal, depth + 1, strategy_mode, baseline_only, parent_goal_name
+                prove_run,
+                base_path,
+                subgoal,
+                depth + 1,
+                strategy_mode,
+                baseline_only,
+                parent_goal_name,
+                skip_initial=subgoal in skip_initial_for,
             ): subgoal
             for subgoal in subgoals
         }
@@ -2124,7 +2304,7 @@ def _run_final_goal_diagnosis(
     return True
 
 
-def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None) -> bool:
+def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None, skip_initial: bool = False) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     outcome = {"proved": False, "reason": "attempts_exhausted"}
 
@@ -2136,7 +2316,7 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
     try:
         return _prove_run_body(
             base_path, base_name, depth, strategy_mode, baseline_only,
-            parent_goal_name, _done,
+            parent_goal_name, skip_initial, _done,
         )
     finally:
         if depth == 0:
@@ -2159,6 +2339,7 @@ def _prove_run_body(
     strategy_mode: str,
     baseline_only: bool,
     parent_goal_name: Optional[str],
+    skip_initial: bool,
     _done,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口"""
@@ -2199,12 +2380,15 @@ def _prove_run_body(
         )
 
     # 执行初始验证检查
-    if perform_initial_verification(
+    if skip_initial:
+        log_exp("skip_initial_prove", goal=base_name, because="harvest_exhausted")
+    elif perform_initial_verification(
         goal_smt_file, base_path=base_path, goal_name=base_name
     ):
         return _done(True, "direct_prove")
     if (
-        depth >= 1
+        not skip_initial
+        and depth >= 1
         and subgoal_sat_abort_enabled()
     ):
         diag = _load_cached_diag(base_path, base_name, "baseline_diag")
@@ -2308,29 +2492,64 @@ def _prove_run_body(
             if ret:
                 consecutive_no_help = 0
                 logging.info(f"🎯 策略 {prompt_strategy} 第{attempt+1}次尝试搜寻可能有用的引理成功！")
+                dispatch = _pop_harvest_dispatch(base_path, base_name)
+                pre_proved = dispatch.get("pre_proved") or {}
+                order = list(dispatch.get("order") or new_subgoals)
+                skip_for = set(dispatch.get("skip_initial") or [])
 
                 # 成功证明的情况，没有subgoal了
                 if not new_subgoals:
+                    if pre_proved:
+                        children = [
+                            make_child_node(
+                                node_id=name,
+                                formula=(pre_proved.get(name) or {}).get("formula"),
+                                status="proved",
+                                lib=(pre_proved.get(name) or {}).get("lib"),
+                            )
+                            for name in order
+                            if name in pre_proved
+                        ]
+                        _record_obligation_attempt(
+                            base_path,
+                            base_name,
+                            "obligation_tree",
+                            tree=make_goal_tree(base_name, children, proved=True),
+                        )
                     logging.info(f"🏆 子目标 {base_name} 完成证明！")
                     return _done(True, "llm_no_subgoals")
 
                 # 处理子目标 - 使用并行执行
                 logging.info(f"🔍 发现子目标: {new_subgoals}")
-                # 传递当前生成的引理和目标名称
                 current_lemmas = extracted_asserts
                 subgoal_result = prove_subgoals_parallel(
                     base_path, new_subgoals, depth, strategy_mode, baseline_only,
                     current_lemmas, base_name, attempt=attempt + 1,
+                    skip_initial_for=skip_for,
                 )
                 if isinstance(subgoal_result, tuple):
-                    ok, child_nodes = subgoal_result
+                    ok, rec_nodes = subgoal_result
                 else:
-                    ok, child_nodes = bool(subgoal_result), []
+                    ok, rec_nodes = bool(subgoal_result), []
+                rec_map = {node.get("id"): node for node in rec_nodes}
+                children = []
+                for name in order:
+                    if name in pre_proved:
+                        children.append(make_child_node(
+                            node_id=name,
+                            formula=(pre_proved.get(name) or {}).get("formula"),
+                            status="proved",
+                            lib=(pre_proved.get(name) or {}).get("lib"),
+                        ))
+                    elif name in rec_map:
+                        children.append(rec_map[name])
+                if not children:
+                    children = rec_nodes
                 _record_obligation_attempt(
                     base_path,
                     base_name,
                     "obligation_tree",
-                    tree=make_goal_tree(base_name, child_nodes, proved=ok),
+                    tree=make_goal_tree(base_name, children, proved=ok),
                 )
                 if ok:
                     logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")

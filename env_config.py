@@ -64,6 +64,8 @@ def setup_environment():
     )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
+    lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
+    usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
     feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
@@ -123,6 +125,8 @@ def setup_environment():
         'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
         'LEMMA_LIBRARY': lemma_library,
         'OBLIGATION_TREE': obligation_tree,
+        'LEMMA_LIBRARY_LOCAL': lemma_library_local,
+        'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
         'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROMPT_RETARGET': prompt_retarget,
