@@ -660,9 +660,10 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
 
     if failed_data.get("useless_lemma_groups"):
         parts.append(
-            "\nUSELESS GROUPS: The following lemma GROUPS (combinations) did not prove "
-            "the original goal. Do not emit the exact same combination again. "
-            "Individual members may still be useful if refined or paired differently:"
+            "\nPREVIOUS COMBINATIONS: each set below was tried with the axioms and did "
+            "not prove the CURRENT goal within 60s. Some of these lemmas may still "
+            "help, but this set was not enough. Do not emit the exact same set "
+            "unchanged. You may keep any of these lemmas and add new ones:"
         )
         for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
             lemmas = group if isinstance(group, list) else group.get("lemmas", [])
@@ -670,7 +671,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
                 f" [vampire_status={group.get('status', '?')}; "
                 f"hint={group.get('hint_kind', '')}]"
             )
-            parts.append(f"  Useless group {i}{meta}:")
+            parts.append(f"  Combination {i}{meta}:")
             for j, lemma in enumerate(lemmas, 1):
                 parts.append(f"    {j}. {lemma}")
 
@@ -685,7 +686,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
             profile = record.get("best_profile")
             profile_bit = f", profile={profile}" if profile else ""
             in_group = (
-                ", in_failed_group: refine this lemma, do not resend the whole group"
+                ", in a previous combination: you may keep it"
                 if record.get("lemma") in useless_members else ""
             )
             parts.append(
@@ -1101,7 +1102,7 @@ def verify_combined_lemmas(
                 "suggested_actions": [
                     "Build on progress lemmas if any are listed above",
                     "Target induction focus terms reported by Vampire",
-                    "Do not repeat the same useless lemma group",
+                    "Do not emit the exact same set unchanged; you may keep members and add lemmas.",
                 ],
             }], asserts, context="usefulness_check"))
         add_useless_lemma_group(

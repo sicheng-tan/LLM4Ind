@@ -358,7 +358,7 @@ def log_prompt_blocks(
     text = feedback_text or ""
     inv = {
         "has_invalid": "INVALID or CANNOT" in text,
-        "has_useless": "lemma GROUPS" in text,
+        "has_useless": "PREVIOUS COMBINATIONS" in text,
         "has_progress": "SOLVER PROGRESS SIGNALS" in text,
         "has_unproved": "USEFUL BUT UNPROVED" in text,
         "has_routing": "SOLVER ROUTING" in text,

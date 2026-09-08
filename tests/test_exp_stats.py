@@ -183,7 +183,7 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
     folder = str(tmp_path)
     feedback = (
         "INVALID: The following lemmas are INVALID or CANNOT be verified.\n"
-        "The following lemma GROUPS (combinations) did not prove\n"
+        "PREVIOUS COMBINATIONS: each set below was tried with the axioms and did\n"
         "SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty)\n"
         "USEFUL BUT UNPROVED: these lemmas helped\n"
         "SOLVER ROUTING (feedback-guided theory portfolio):\n"

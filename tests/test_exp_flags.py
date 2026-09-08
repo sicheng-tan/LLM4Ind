@@ -173,7 +173,7 @@ def test_prompt_hides_disabled_feedback_sections() -> None:
     assert "USEFUL BUT UNPROVED" in on_txt
     assert "SOLVER-GUIDED REPAIR" in on_txt
     assert "SOLVER ROUTING" in on_txt
-    assert "Useless group" in on_txt
+    assert "Combination" in on_txt
 
     with patch.dict(os.environ, {
         "FEEDBACK_REPAIR_HINTS": "off",
@@ -186,7 +186,7 @@ def test_prompt_hides_disabled_feedback_sections() -> None:
     assert "USEFUL BUT UNPROVED" not in off_txt
     assert "SOLVER-GUIDED REPAIR" not in off_txt
     assert "SOLVER ROUTING" not in off_txt
-    assert "Useless group" in off_txt
+    assert "Combination" in off_txt
 
 
 def test_add_repair_and_progress_respect_flags() -> None:

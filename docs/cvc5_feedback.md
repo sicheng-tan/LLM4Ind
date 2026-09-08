@@ -617,7 +617,7 @@ signals=[
       "suggested_actions": [
         "Build on progress lemmas",
         "Target high-difficulty recursive definitions",
-        "Do not repeat the same useless lemma group"
+        "Do not emit the exact same set unchanged; you may keep members and add lemmas."
       ]
     }
   ]

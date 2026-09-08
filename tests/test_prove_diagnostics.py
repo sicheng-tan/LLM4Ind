@@ -547,8 +547,8 @@ def test_progress_prompt_does_not_fight_useless_group() -> None:
             "unproved_lemmas": [],
             "routing": {},
         })
-    assert "GROUPS (combinations)" in txt
-    assert "in_failed_group" in txt
+    assert "PREVIOUS COMBINATIONS" in txt
+    assert "in a previous combination: you may keep it" in txt
     assert "NOT proof of usefulness" in txt
 
 
