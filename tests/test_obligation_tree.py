@@ -21,6 +21,7 @@ from obligation_tree import (
     format_obligation_prompt,
     inject_library_axioms,
     first_invalid_reason,
+    harvest_retry_timeout_s,
     last_normal_tree,
     lemma_library_enabled,
     lemma_library_path,
@@ -33,7 +34,6 @@ from obligation_tree import (
     obligation_tree_enabled,
     render_obligation_tree,
     solver_smt_content,
-    MAX_LIBRARY_LEMMAS,
 )
 
 
@@ -309,55 +309,40 @@ def _formula(i: int) -> str:
     return f"(forall ((x Nat)) (= (f{i} x) x))"
 
 
-def test_library_local_cannot_evict_pins(tmp_path: Path) -> None:
+def test_library_has_no_size_cap(tmp_path: Path) -> None:
     with _patch_flags("on", "on"):
+        pin_ids = [
+            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
+            for i in range(12)
+        ]
+        local_id = add_proved_lemma(str(tmp_path), _formula(99), role="local")
+        extra_local = add_proved_lemma(str(tmp_path), _formula(100), role="local")
+        extra_pin = add_proved_lemma(str(tmp_path), _formula(101), role="pin")
+        assert all(pin_ids)
+        assert local_id and extra_local and extra_pin
+        stored = load_lemma_library(str(tmp_path))
+        assert len(stored) == 15
+        roles = [lemma_library_role(item) for item in stored]
+        assert roles.count("pin") == 13
+        assert roles.count("local") == 2
+        ids = [item["id"] for item in stored]
+        assert local_id in ids and extra_local in ids and extra_pin in ids
+
+
+def test_library_no_fifo_when_harvest_off(tmp_path: Path) -> None:
+    with patch.dict(os.environ, {
+        "LEMMA_LIBRARY": "on",
+        "OBLIGATION_TREE": "on",
+        "LEMMA_LIBRARY_LOCAL": "off",
+    }):
         ids = [
             add_proved_lemma(str(tmp_path), _formula(i), role="pin")
-            for i in range(MAX_LIBRARY_LEMMAS)
+            for i in range(15)
         ]
         assert all(ids)
-        rejected = add_proved_lemma(str(tmp_path), _formula(99), role="local")
-        assert rejected is None
         stored = load_lemma_library(str(tmp_path))
-        assert len(stored) == MAX_LIBRARY_LEMMAS
-        assert all(lemma_library_role(item) == "pin" for item in stored)
-
-
-def test_library_new_local_evicts_oldest_local(tmp_path: Path) -> None:
-    with _patch_flags("on", "on"):
-        for i in range(8):
-            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
-        local_ids = [
-            add_proved_lemma(str(tmp_path), _formula(20 + i), role="local")
-            for i in range(4)
-        ]
-        oldest_local = local_ids[0]
-        newest = add_proved_lemma(str(tmp_path), _formula(30), role="local")
-        stored = load_lemma_library(str(tmp_path))
-        roles = [lemma_library_role(item) for item in stored]
-        assert roles.count("pin") == 8
-        assert roles.count("local") == 4
-        ids = [item["id"] for item in stored]
-        assert oldest_local not in ids
-        assert newest in ids
-
-
-def test_library_new_pin_evicts_local(tmp_path: Path) -> None:
-    with _patch_flags("on", "on"):
-        for i in range(8):
-            add_proved_lemma(str(tmp_path), _formula(i), role="pin")
-        local_ids = [
-            add_proved_lemma(str(tmp_path), _formula(20 + i), role="local")
-            for i in range(4)
-        ]
-        new_pin = add_proved_lemma(str(tmp_path), _formula(40), role="pin")
-        stored = load_lemma_library(str(tmp_path))
-        roles = [lemma_library_role(item) for item in stored]
-        assert roles.count("pin") == 9
-        assert roles.count("local") == 3
-        ids = [item["id"] for item in stored]
-        assert local_ids[0] not in ids
-        assert new_pin in ids
+        assert len(stored) == 15
+        assert [item["id"] for item in stored] == [f"lib_{i}" for i in range(1, 16)]
 
 
 def test_library_promote_local_to_pin_keeps_id(tmp_path: Path) -> None:
@@ -376,14 +361,16 @@ def test_library_missing_role_is_pin(tmp_path: Path) -> None:
     path = lemma_library_path(str(tmp_path))
     lemmas = [
         {"id": f"lib_{i}", "formula": _formula(i), "status": "proved"}
-        for i in range(1, MAX_LIBRARY_LEMMAS + 1)
+        for i in range(1, 13)
     ]
     path.write_text(json.dumps({"lemmas": lemmas}), encoding="utf-8")
     with _patch_flags("on", "on"):
-        assert add_proved_lemma(str(tmp_path), _formula(99), role="local") is None
+        local_id = add_proved_lemma(str(tmp_path), _formula(99), role="local")
         stored = load_lemma_library(str(tmp_path))
-        assert len(stored) == MAX_LIBRARY_LEMMAS
-        assert all(lemma_library_role(item) == "pin" for item in stored)
+        assert local_id == "lib_13"
+        assert len(stored) == 13
+        assert all(lemma_library_role(item) == "pin" for item in stored[:12])
+        assert lemma_library_role(stored[-1]) == "local"
 
 
 def test_local_harvest_flag_blocks_local_insert(tmp_path: Path) -> None:
@@ -559,14 +546,25 @@ def test_mate_feedback_and_recording_respect_flags() -> None:
             assert any(item["formula"] == "(forall ((z Nat)) (= z z))" for item in load_lemma_library(tmp))
 
 
+def test_harvest_retry_timeout_s_default_and_override() -> None:
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HARVEST_RETRY_TIMEOUT", None)
+        assert harvest_retry_timeout_s() == 2
+    with patch.dict(os.environ, {"HARVEST_RETRY_TIMEOUT": "5"}):
+        assert harvest_retry_timeout_s() == 5
+    with patch.dict(os.environ, {"HARVEST_RETRY_TIMEOUT": "0"}):
+        assert harvest_retry_timeout_s() == 1
+    with patch.dict(os.environ, {"HARVEST_RETRY_TIMEOUT": "bogus"}):
+        assert harvest_retry_timeout_s() == 2
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         for i, fn in enumerate((
             test_library_dedup_and_ids,
-            test_library_local_cannot_evict_pins,
-            test_library_new_local_evicts_oldest_local,
-            test_library_new_pin_evicts_local,
+            test_library_has_no_size_cap,
+            test_library_no_fifo_when_harvest_off,
             test_library_promote_local_to_pin_keeps_id,
             test_library_missing_role_is_pin,
             test_local_harvest_flag_blocks_local_insert,
@@ -582,6 +580,7 @@ def main() -> int:
     test_invalid_node_shows_reason_not_atp_hints()
     test_diagnosis_tree_prompt_omits_library_and_generation_legend()
     test_compact_atp_keeps_actionable_hints()
+    test_harvest_retry_timeout_s_default_and_override()
     test_flags_default_on_and_off_synonyms()
     test_library_flag_controls_persist_and_inject()
     test_prompt_flags_distinguish_library_and_tree()

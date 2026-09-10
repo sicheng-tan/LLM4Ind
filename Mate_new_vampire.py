@@ -47,6 +47,13 @@ from profile_selector import (
     llm_selector_enabled,
 )
 from theory_features import analyze_smt
+from llm_time_budget import (
+    arm_task_deadline,
+    invoke_configured_chat,
+    remaining_task_s,
+    set_task_deadline,
+    usefulness_timeout_s,
+)
 from obligation_tree import (
     add_proved_lemma,
     append_attempt,
@@ -64,6 +71,7 @@ from obligation_tree import (
     HARVEST_CVC_PROFILES,
     HARVEST_DISPATCH_KEY,
     local_lemma_harvest_enabled,
+    harvest_retry_timeout_s,
     usefulness_harvest_delay_s,
 )
 from exp_flags import (
@@ -1021,7 +1029,7 @@ def verify_combined_lemmas(
     成功时保留全部引理（不做 ucore 剪枝）。
     失败后用这次满超时 prove 的统计写 mix hint；不二次满超时、不枚举子集。
     """
-    combined_timeout = config['COMBINED_CVC_TIMEOUT']
+    combined_timeout = usefulness_timeout_s(int(config['COMBINED_CVC_TIMEOUT']))
     work_dir = output_path.parent
     gname = goal_name or output_path.stem
 
@@ -1121,9 +1129,10 @@ def perform_initial_verification(
     base_path: Optional[str] = None,
     goal_name: Optional[str] = None,
     log_event: str = "initial_prove",
+    timeout: Optional[int] = None,
 ) -> bool:
-    """执行初始验证检查"""
-    default_timeout = config['DEFAULT_CVC_TIMEOUT']
+    """执行初始验证检查。timeout 仅覆盖本次调用，默认仍是 DEFAULT_CVC_TIMEOUT。"""
+    default_timeout = config['DEFAULT_CVC_TIMEOUT'] if timeout is None else int(timeout)
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
     routing_state = load_routing_state(str(goal_smt_file.parent), goal_smt_file.stem)
     smt_path = goal_smt_file
@@ -1461,7 +1470,16 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
             if str(item.get("role") or "") == "user"
         )
         try:
-            response = llm.invoke(call_messages)
+            response, budget = invoke_configured_chat(llm, call_messages, config)
+            if budget.apply:
+                log_exp(
+                    "llm_budget",
+                    goal=goal_name,
+                    timeout_s=budget.timeout_s,
+                    http_retries=budget.max_retries,
+                    usefulness_reserve_s=budget.usefulness_reserve_s,
+                    remaining_s=remaining_task_s(),
+                )
             raw = getattr(response, "content", "") or ""
             try:
                 extracted_asserts = parse_llm_response(
@@ -1944,6 +1962,7 @@ def _finish_usefulness_timeout(
         ok = perform_initial_verification(
             goal_smt_file, base_path=base_path, goal_name=goal_smt_name,
             log_event="harvest_retry",
+            timeout=harvest_retry_timeout_s(),
         )
         if ok:
             logging.info("timeout 收获 %d 条 local 后证出当前目标", n_local)
@@ -2321,6 +2340,7 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
                 )
             except Exception as exc:
                 logging.warning("failed to write experiment summary: %s", exc)
+            set_task_deadline(None)
 
 
 def _prove_run_body(
@@ -2340,6 +2360,8 @@ def _prove_run_body(
         logging.warning(f"🚫 达到最大递归深度 {max_depth}，停止处理 {base_name}")
         log_exp("max_depth", goal=base_name, depth=depth, max_depth=max_depth)
         return _done(False, "max_depth")
+
+    arm_task_deadline(depth, config.get("TASK_TIMEOUT"))
     
     if depth == 0:
         log_run_config(

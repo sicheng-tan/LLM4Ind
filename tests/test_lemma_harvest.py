@@ -118,6 +118,7 @@ def test_timeout_harvest_local_retries_goal_without_prove_run() -> None:
         prove.assert_not_called()
         assert harvest.call_count >= 1
         assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+        assert retry.call_args.kwargs.get("timeout") == 2
 
 
 def test_slow_unsat_proved_harvest_skips_prove_run_and_initial() -> None:

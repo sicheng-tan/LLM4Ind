@@ -66,6 +66,7 @@ def setup_environment():
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
     lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
     usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
+    harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
     feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
@@ -127,6 +128,7 @@ def setup_environment():
         'OBLIGATION_TREE': obligation_tree,
         'LEMMA_LIBRARY_LOCAL': lemma_library_local,
         'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
+        'HARVEST_RETRY_TIMEOUT': harvest_retry_timeout,
         'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROMPT_RETARGET': prompt_retarget,

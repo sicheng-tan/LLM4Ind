@@ -36,7 +36,6 @@ GUIDANCE_HINT_KINDS = (
     "high_difficulty_assertions",
 )
 
-MAX_LIBRARY_LEMMAS = 12
 HARVEST_CVC_PROFILES = ("cvc5_inductive", "cvc4_default")
 HARVEST_DISPATCH_KEY = "harvest_dispatch"
 MAX_FORMULA_CHARS = 200
@@ -76,6 +75,17 @@ def usefulness_harvest_delay_s() -> float:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return 2.0
+
+
+def harvest_retry_timeout_s() -> int:
+    """Timeout for proving G after local harvest; does not change the 60s usefulness budget."""
+    raw = os.getenv("HARVEST_RETRY_TIMEOUT")
+    if raw is None or str(raw).strip() == "":
+        return 2
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        return 2
 
 
 def obligation_tree_enabled() -> bool:
@@ -125,8 +135,6 @@ def load_lemma_library(base_path: str) -> List[dict]:
 def save_lemma_library(base_path: str, lemmas: Sequence[dict]) -> None:
     path = lemma_library_path(base_path)
     items = list(lemmas)
-    if not local_lemma_harvest_enabled():
-        items = items[-MAX_LIBRARY_LEMMAS:]
     payload = {"lemmas": items}
     tmp_file = None
     try:
@@ -160,13 +168,6 @@ def _next_library_id(lemmas: Sequence[dict]) -> str:
     return f"lib_{next_n}"
 
 
-def _drop_oldest_local(lemmas: List[dict]) -> Optional[dict]:
-    for i, item in enumerate(lemmas):
-        if lemma_library_role(item) == "local":
-            return lemmas.pop(i)
-    return None
-
-
 def add_proved_lemma(
     base_path: str,
     formula: str,
@@ -178,8 +179,9 @@ def add_proved_lemma(
 ) -> Optional[str]:
     """Record a discharged lemma. ``role`` is pin (useful split) or local (timeout harvest).
 
-    Returns its library id, or None if empty / local rejected. Missing ``role`` on
-    existing records is treated as pin. Local cannot evict pin.
+    Returns its library id, or None if empty / local harvest is off. Duplicate
+    formulas keep the existing id; a later pin promotes local in place. There is
+    no size cap: pins and locals both append.
     """
     if not lemma_library_enabled():
         return None
@@ -207,28 +209,6 @@ def add_proved_lemma(
                 log_exp("library_promote", id=lib_id, role="pin")
                 logging.info("lemma library promote %s local→pin", lib_id)
             return lib_id or None
-
-        harvest = local_lemma_harvest_enabled()
-        if harvest and want == "local":
-            if len(lemmas) >= MAX_LIBRARY_LEMMAS:
-                dropped = _drop_oldest_local(lemmas)
-                if dropped is None:
-                    return None
-                log_exp(
-                    "library_evict",
-                    id=str(dropped.get("id") or ""),
-                    role="local",
-                )
-        elif harvest and want == "pin":
-            while len(lemmas) >= MAX_LIBRARY_LEMMAS:
-                dropped = _drop_oldest_local(lemmas)
-                if dropped is None:
-                    break
-                log_exp(
-                    "library_evict",
-                    id=str(dropped.get("id") or ""),
-                    role="local",
-                )
 
         lib_id = _next_library_id(lemmas)
         lemmas.append({
