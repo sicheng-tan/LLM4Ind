@@ -2,6 +2,8 @@
 
 Boolean flags default on (current method). Set them off in paper.env to restore
 the original loop. CHILD_LLM_ATTEMPTS=0 keeps the root 2N budget at every depth.
+LEMMA_FILTER_DROP keeps remaining members after screening and continues
+usefulness; paper.env sets it off so any failing member aborts the group.
 The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
 judges whether the CURRENT goal is invalid from the last well-formed obligation
@@ -15,10 +17,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import _flag_enabled
-from obligation_tree import compact_formula, normalize_lemma_formula
+from obligation_tree import compact_formula, lemmas_equivalent, normalize_lemma_formula
 
 _DECLARE_FUN = re.compile(
     r"\(declare-fun\s+([A-Za-z_][A-Za-z0-9_+*/<>=!?-]*)"
@@ -101,6 +103,14 @@ def subgoal_sat_abort_enabled() -> bool:
 
 def defined_symbols_enabled() -> bool:
     return _flag_enabled("LEMMA_DEFINED_SYMBOLS")
+
+
+def lemma_filter_drop_enabled() -> bool:
+    """Drop failing members and continue usefulness on the rest (default on).
+
+    paper.env sets this off: any failing member aborts the whole group.
+    """
+    return _flag_enabled("LEMMA_FILTER_DROP")
 
 
 def llm_lemma_diagnosis_enabled() -> bool:
@@ -478,6 +488,110 @@ def lemmas_known_invalid(
     lemmas: Sequence[str], invalid_lemmas: Sequence[Any]
 ) -> List[str]:
     return [lemma for lemma in lemmas if lemma_known_invalid(lemma, invalid_lemmas)]
+
+
+BENIGN_SCREEN_GATES = frozenset({"known_invalid", "same_as_library"})
+
+
+def lemma_same_as_goal(lemma: str, goal: str) -> bool:
+    """True if *lemma* is the goal after whitespace collapse or α-normalization."""
+    return lemmas_equivalent(lemma, goal)
+
+
+def drop_failing_members(
+    lemmas: Sequence[str],
+    reason_for: Callable[[str], Optional[str]],
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Partition *lemmas* by *reason_for*.
+
+    With ``LEMMA_FILTER_DROP`` on, keep the members that have no reason.
+    With it off, any failing member discards the whole group (kept is empty).
+    """
+    dropped: List[Tuple[str, str]] = []
+    kept: List[str] = []
+    for lemma in lemmas:
+        reason = reason_for(lemma)
+        if reason:
+            dropped.append((lemma, reason))
+        else:
+            kept.append(lemma)
+    if dropped and not lemma_filter_drop_enabled():
+        return [], dropped
+    return kept, dropped
+
+
+def apply_static_lemma_screen(
+    lemmas: Sequence[str],
+    *,
+    original_forall: str,
+    smt: str,
+    invalid_records: Sequence[Any],
+    same_as_goal: Callable[[str, str], bool],
+    library_items: Sequence[Any] = (),
+) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    """Drop known-invalid / same-as-goal / library-duplicate / undefined-symbol members.
+
+    Returns ``(kept, dropped)`` where each dropped item is
+    ``(lemma, reason, gate)``. ``gate`` is ``known_invalid``, ``same_as_goal``,
+    ``same_as_library``, or ``undefined_symbol``. Known-invalid and library
+    duplicates are not recorded as invalid by the caller. Library matches always
+    drop only that member (they are theorems, not failed screens).
+    """
+    current = list(lemmas)
+    dropped: List[Tuple[str, str, str]] = []
+
+    def _stage(gate: str, reason_for: Callable[[str], Optional[str]]) -> bool:
+        nonlocal current
+        kept, drop = drop_failing_members(current, reason_for)
+        for lemma, reason in drop:
+            dropped.append((lemma, reason, gate))
+        current = kept
+        return bool(current)
+
+    if not _stage(
+        "known_invalid",
+        lambda lemma: "known_invalid" if lemma_known_invalid(lemma, invalid_records) else None,
+    ):
+        return [], dropped
+    if not _stage(
+        "same_as_goal",
+        lambda lemma: (
+            "Same as original goal" if same_as_goal(lemma, original_forall) else None
+        ),
+    ):
+        return [], dropped
+    if library_items:
+        kept_lib: List[str] = []
+        for lemma in current:
+            matched_id = None
+            for item in library_items:
+                if not isinstance(item, dict):
+                    continue
+                formula = str(item.get("formula") or "")
+                if formula and same_as_goal(lemma, formula):
+                    matched_id = str(item.get("id") or "lib")
+                    break
+            if matched_id:
+                dropped.append(
+                    (lemma, f"already_in_library:{matched_id}", "same_as_library")
+                )
+            else:
+                kept_lib.append(lemma)
+        current = kept_lib
+        if not current:
+            return [], dropped
+    if defined_symbols_enabled():
+        undef_map = lemmas_undefined_symbols(current, smt)
+
+        def _undef_reason(lemma: str) -> Optional[str]:
+            names = undef_map.get(lemma)
+            if not names:
+                return None
+            return "undefined_symbol:" + ",".join(names)
+
+        if not _stage("undefined_symbol", _undef_reason):
+            return [], dropped
+    return current, dropped
 
 
 def repair_hint_for_prompt(hint: dict) -> bool:

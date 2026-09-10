@@ -22,10 +22,13 @@ from lemma_gates import (
     PARSE_ERR_EMPTY,
     PARSE_ERR_UNMATCHED,
     allow_unmarked_lemma_output,
+    apply_static_lemma_screen,
     attach_source_lemmas,
+    drop_failing_members,
     format_repair_header,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
+    lemma_same_as_goal,
     lemmas_known_invalid,
     llm_parse_retries,
     node_attempt_plan,
@@ -61,6 +64,71 @@ _GOAL = """(set-logic ALL)
 def test_undefined_plus_and_defined_snoc() -> None:
     assert undefined_symbols_in_lemma(PLUS_LEMMA, P2_SMT) == ["plus"]
     assert undefined_symbols_in_lemma(SNOC_LEMMA, P2_SMT) == []
+
+
+def test_lemma_same_as_goal_alpha() -> None:
+    goal = "(forall ((x Int)) (P x))"
+    renamed = "(forall ((y Int)) (P y))"
+    other = "(forall ((x Int)) (P (s x)))"
+    assert lemma_same_as_goal(goal, goal)
+    assert lemma_same_as_goal(renamed, goal)
+    assert not lemma_same_as_goal(other, goal)
+
+
+def test_drop_failing_members_keeps_rest() -> None:
+    lemmas = [PLUS_LEMMA, SNOC_LEMMA]
+    with patch.dict(os.environ, {"LEMMA_FILTER_DROP": "on"}):
+        kept, dropped = drop_failing_members(
+            lemmas, lambda lemma: "bad" if lemma == PLUS_LEMMA else None
+        )
+    assert kept == [SNOC_LEMMA]
+    assert dropped == [(PLUS_LEMMA, "bad")]
+    with patch.dict(os.environ, {"LEMMA_FILTER_DROP": "off"}):
+        kept, dropped = drop_failing_members(
+            lemmas, lambda lemma: "bad" if lemma == PLUS_LEMMA else None
+        )
+    assert kept == []
+    assert dropped == [(PLUS_LEMMA, "bad")]
+
+
+def test_static_screen_drops_undefined_keeps_defined() -> None:
+    with patch.dict(os.environ, {
+        "LEMMA_FILTER_DROP": "on",
+        "LEMMA_DEFINED_SYMBOLS": "on",
+    }):
+        kept, dropped = apply_static_lemma_screen(
+            [PLUS_LEMMA, SNOC_LEMMA],
+            original_forall="(forall ((x Lst)) (= (len (rev x)) (len x)))",
+            smt=P2_SMT,
+            invalid_records=[],
+            same_as_goal=lambda _lemma, _goal: False,
+        )
+    assert kept == [SNOC_LEMMA]
+    assert len(dropped) == 1
+    assert dropped[0][2] == "undefined_symbol"
+    assert "plus" in dropped[0][1]
+
+
+def test_static_screen_drops_library_alpha_keeps_rest() -> None:
+    snoc_alpha = (
+        "(forall ((xs Lst) (n Nat)) (= (len (append xs (cons n nil))) (succ (len xs))))"
+    )
+    with patch.dict(os.environ, {
+        "LEMMA_FILTER_DROP": "off",
+        "LEMMA_DEFINED_SYMBOLS": "off",
+    }):
+        kept, dropped = apply_static_lemma_screen(
+            [snoc_alpha, PLUS_LEMMA],
+            original_forall="(forall ((x Lst)) (= (len (rev x)) (len x)))",
+            smt=P2_SMT,
+            invalid_records=[],
+            same_as_goal=lemma_same_as_goal,
+            library_items=[{"id": "lib_1", "formula": SNOC_LEMMA}],
+        )
+    assert kept == [PLUS_LEMMA]
+    assert len(dropped) == 1
+    assert dropped[0][2] == "same_as_library"
+    assert dropped[0][1] == "already_in_library:lib_1"
 
 
 def test_known_invalid_match_whitespace_not_substring() -> None:
@@ -354,6 +422,7 @@ def test_quick_run_rejects_undefined_plus() -> None:
         (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "on",
             "SOLVER_ROUTING": "off",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", return_value=[PLUS_LEMMA]
@@ -369,6 +438,105 @@ def test_quick_run_rejects_undefined_plus() -> None:
         assert any("undefined_symbol:plus" in str(item.get("reason")) for item in invalid)
 
 
+def test_quick_run_drops_undefined_keeps_snoc() -> None:
+    import Mate_new_vampire as mate
+    from vampire_runner import VampireResult
+
+    timeout = VampireResult(status="timeout", proved=False, elapsed=0.01)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "on",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY_LOCAL": "off",
+        }), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm",
+            return_value=[PLUS_LEMMA, SNOC_LEMMA],
+        ), patch("Mate_new_vampire.run_vampire", return_value=timeout), patch(
+            "Mate_new_vampire.verify_combined_lemmas",
+            return_value=(False, [], timeout),
+        ) as useful:
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+        assert proved is False
+        assert subgoals == []
+        assert lemmas == [SNOC_LEMMA]
+        useful.assert_called()
+        useful_lemmas = useful.call_args.args[1]
+        assert useful_lemmas == [SNOC_LEMMA]
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert any("undefined_symbol:plus" in str(item.get("reason")) for item in invalid)
+        assert all("snoc" not in str(item.get("lemma") or "").lower() for item in invalid)
+
+
+def test_quick_run_library_duplicate_retries_goal_not_invalid() -> None:
+    import Mate_new_vampire as mate
+    from obligation_tree import add_proved_lemma
+
+    snoc_alpha = (
+        "(forall ((xs Lst) (n Nat)) (= (len (append xs (cons n nil))) (succ (len xs))))"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LEMMA_LIBRARY": "on",
+            "LEMMA_LIBRARY_LOCAL": "off",
+            "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "on",
+            "SOLVER_ROUTING": "off",
+        }):
+            add_proved_lemma(tmp, SNOC_LEMMA, origin="seed")
+            with patch(
+                "Mate_new_vampire.generate_lemmas_with_llm",
+                return_value=[snoc_alpha],
+            ), patch(
+                "Mate_new_vampire.perform_initial_verification", return_value=False
+            ) as retry, patch(
+                "Mate_new_vampire.verify_combined_lemmas"
+            ) as useful, patch("Mate_new_vampire.run_vampire") as vampire:
+                proved, subgoals, lemmas = mate.quick_run(
+                    tmp, "template", "p", "./prompts_ours"
+                )
+        assert proved is False
+        assert subgoals == []
+        assert lemmas == [snoc_alpha]
+        useful.assert_not_called()
+        vampire.assert_not_called()
+        retry.assert_called()
+        assert retry.call_args.kwargs.get("log_event") == "library_retry"
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert invalid == []
+
+
+def test_quick_run_filter_drop_off_aborts_whole_group() -> None:
+    import Mate_new_vampire as mate
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "off",
+            "SOLVER_ROUTING": "off",
+        }), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm",
+            return_value=[PLUS_LEMMA, SNOC_LEMMA],
+        ), patch("Mate_new_vampire.run_vampire") as vampire, patch(
+            "Mate_new_vampire.verify_combined_lemmas"
+        ) as useful:
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+        assert proved is False
+        assert subgoals == []
+        assert lemmas == [PLUS_LEMMA, SNOC_LEMMA]
+        vampire.assert_not_called()
+        useful.assert_not_called()
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert any("undefined_symbol:plus" in str(item.get("reason")) for item in invalid)
+
+
 def test_quick_run_skips_known_invalid_without_solver() -> None:
     import Mate_new_vampire as mate
 
@@ -378,7 +546,10 @@ def test_quick_run_skips_known_invalid_without_solver() -> None:
         data = mate.load_failed_lemmas(tmp, "template")
         data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
         mate.save_failed_lemmas(tmp, "template", data)
-        with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}), patch(
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "LEMMA_FILTER_DROP": "off",
+        }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
             return_value=[spaced, SNOC_LEMMA],
         ), patch("Mate_new_vampire.run_vampire") as vampire:
@@ -391,6 +562,40 @@ def test_quick_run_skips_known_invalid_without_solver() -> None:
         vampire.assert_not_called()
         invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
         assert invalid == [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+
+
+def test_quick_run_drops_known_invalid_keeps_other() -> None:
+    import Mate_new_vampire as mate
+    from vampire_runner import VampireResult
+
+    timeout = VampireResult(status="timeout", proved=False, elapsed=0.01)
+    spaced = "  " + PLUS_LEMMA.replace(" ", "  ") + "\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        data = mate.load_failed_lemmas(tmp, "template")
+        data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
+        mate.save_failed_lemmas(tmp, "template", data)
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "on",
+            "LEMMA_LIBRARY_LOCAL": "off",
+        }), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm",
+            return_value=[spaced, SNOC_LEMMA],
+        ), patch("Mate_new_vampire.run_vampire", return_value=timeout), patch(
+            "Mate_new_vampire.verify_combined_lemmas",
+            return_value=(False, [], timeout),
+        ) as useful:
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+        assert proved is False
+        assert lemmas == [SNOC_LEMMA]
+        useful.assert_called()
+        assert useful.call_args.args[1] == [SNOC_LEMMA]
+        invalid = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
+        assert invalid[0]["reason"] == "plus has no axioms"
 
 
 def test_quick_run_does_not_skip_unrelated_lemma() -> None:
@@ -1299,6 +1504,11 @@ def test_final_diagnosis_skipped_at_root() -> None:
 
 def main() -> int:
     test_undefined_plus_and_defined_snoc()
+    test_lemma_same_as_goal_alpha()
+    test_drop_failing_members_keeps_rest()
+    test_static_screen_drops_undefined_keeps_defined()
+    test_static_screen_drops_library_alpha_keeps_rest()
+    test_known_invalid_match_whitespace_not_substring()
     test_parse_llm_reason()
     test_parse_llm_lemmas_xml_and_legacy()
     test_parse_llm_lemmas_salvage_and_paren_repair()
@@ -1309,6 +1519,11 @@ def main() -> int:
     test_tree_status_nested_invalid_does_not_mark_parent()
     test_repair_hint_for_prompt_drops_subgoal_atp()
     test_quick_run_rejects_undefined_plus()
+    test_quick_run_drops_undefined_keeps_snoc()
+    test_quick_run_library_duplicate_retries_goal_not_invalid()
+    test_quick_run_filter_drop_off_aborts_whole_group()
+    test_quick_run_skips_known_invalid_without_solver()
+    test_quick_run_drops_known_invalid_keeps_other()
     test_sat_aborts_child_without_llm()
     test_diagnosis_suffix_flag()
     test_should_append_diagnosis_by_depth()

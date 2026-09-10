@@ -90,20 +90,22 @@ from lemma_harvest import (
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    allow_unmarked_lemma_output,
+    apply_static_lemma_screen,
     attach_source_lemmas,
-    defined_symbols_enabled,
+    BENIGN_SCREEN_GATES,
+    drop_failing_members,
     format_repair_header,
     is_invalid_diagnosis_reason,
+    lemma_filter_drop_enabled,
     lemma_known_invalid,
-    lemmas_known_invalid,
-    lemmas_undefined_symbols,
+    lemma_same_as_goal,
     llm_lemma_diagnosis_enabled,
     llm_parse_retries,
     node_attempt_plan,
-    parse_llm_reason,
-    parse_llm_lemmas,
     parse_final_diagnosis,
-    allow_unmarked_lemma_output,
+    parse_llm_lemmas,
+    parse_llm_reason,
     repair_hint_for_prompt,
     should_append_diagnosis_suffix,
     should_run_final_diagnosis,
@@ -1728,21 +1730,38 @@ def are_formulas_equivalent(formula1: str, formula2: str) -> bool:
         norm1 = normalize_equality_order(norm1)
         norm2 = normalize_equality_order(norm2)
         
-        # 3. 比较标准化后的公式
-        return norm1 == norm2
+        # 3. 比较标准化后的公式（含 α 换元）
+        return norm1 == norm2 or lemma_same_as_goal(norm1, norm2)
         
     except Exception as e:
         print(f"标准化过程出错: {e}，回退到简单比较")
-        return formula1.strip() == formula2.strip()
+        return formula1.strip() == formula2.strip() or lemma_same_as_goal(
+            formula1, formula2
+        )
 
-def validate_lemmas_against_original(extracted_asserts: List[str], original_forall: str, base_path: str, goal_name: str) -> bool:
-    """增强的引理验证函数"""
-    for i, assert_stmt in enumerate(extracted_asserts, 1):
-        if are_formulas_equivalent(assert_stmt, original_forall):
-            logging.error(f"引理 {i} 与原目标相同，生成失败")
-            add_invalid_lemma(base_path, goal_name, assert_stmt, "Same as original goal")
-            return False
-    return True
+
+def validate_lemmas_against_original(extracted_asserts: List[str], original_forall: str, base_path: str, goal_name: str) -> List[str]:
+    """Drop members that restated the goal. Empty means the group cannot continue."""
+    kept, dropped = drop_failing_members(
+        extracted_asserts,
+        lambda lemma: (
+            "Same as original goal"
+            if are_formulas_equivalent(lemma, original_forall)
+            else None
+        ),
+    )
+    for assert_stmt, _reason in dropped:
+        logging.error("引理与原目标相同，已排除: %s", assert_stmt[:80])
+        add_invalid_lemma(base_path, goal_name, assert_stmt, "Same as original goal")
+    if dropped and kept:
+        log_exp(
+            "lemma_filter_drop",
+            goal=goal_name,
+            gate="same_as_goal",
+            dropped=len(dropped),
+            kept=len(kept),
+        )
+    return kept
 
 
 def create_validation_files(extracted_asserts: List[str], smt_content: str, 
@@ -1773,10 +1792,21 @@ def verify_single_lemma(valid_path: Path) -> Tuple[Path, VampireResult]:
     return valid_path, result
 
 
-def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal_name: str) -> bool:
-    """并行验证引理有效性"""
-    invalid_lemmas = []
-    max_workers = min(len(valid_check_paths), 4)
+def validate_lemmas_parallel(
+    valid_check_paths: List[Path],
+    lemmas: Sequence[str],
+    base_path: str,
+    goal_name: str,
+) -> List[str]:
+    """1s 有效性：与公理矛盾 / error 的成员记 invalid 并丢掉。
+
+    ``LEMMA_FILTER_DROP`` 开启时返回其余成员；关闭时任一失败则返回空列表。
+    """
+    lemma_by_path = {
+        path: lemma for path, lemma in zip(valid_check_paths, lemmas)
+    }
+    bad = set()
+    max_workers = min(len(valid_check_paths), 4) if valid_check_paths else 1
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_path = {executor.submit(verify_single_lemma, path): path 
@@ -1785,10 +1815,10 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
         for future in as_completed(future_to_path):
             try:
                 valid_path, result = future.result()
+                lemma_content = lemma_by_path.get(valid_path) or extract_lemma_from_file(valid_path)
                 if result.proved:
                     logging.warning(f"发现无效引理: {valid_path.name}")
-                    invalid_lemmas.append(valid_path)
-                    lemma_content = extract_lemma_from_file(valid_path)
+                    bad.add(valid_path)
                     if lemma_content:
                         add_invalid_lemma(
                             base_path, goal_name, lemma_content,
@@ -1796,8 +1826,7 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
                         )
                 elif result.status == "error":
                     logging.error(f"引理检查出错: {valid_path.name}: {result.error}")
-                    invalid_lemmas.append(valid_path)
-                    lemma_content = extract_lemma_from_file(valid_path)
+                    bad.add(valid_path)
                     if lemma_content:
                         add_invalid_lemma(
                             base_path, goal_name, lemma_content,
@@ -1810,15 +1839,24 @@ def validate_lemmas_parallel(valid_check_paths: List[Path], base_path: str, goal
             except Exception as e:
                 path = future_to_path[future]
                 logging.error(f"验证引理 {path.name} 时发生异常: {e}")
-                invalid_lemmas.append(path)
-                lemma_content = extract_lemma_from_file(path)
+                bad.add(path)
+                lemma_content = lemma_by_path.get(path) or extract_lemma_from_file(path)
                 if lemma_content:
                     add_invalid_lemma(base_path, goal_name, lemma_content, f"验证异常: {e}")
     
-    if invalid_lemmas:
+    if bad and not lemma_filter_drop_enabled():
         logging.error("存在不合法引理，需要重新生成")
-        return False
-    return True
+        return []
+    kept = [lemma_by_path[path] for path in valid_check_paths if path not in bad]
+    if bad and kept:
+        log_exp(
+            "lemma_filter_drop",
+            goal=goal_name,
+            gate="validity_1s",
+            dropped=len(bad),
+            kept=len(kept),
+        )
+    return kept
 
 def extract_lemma_from_file(file_path: Path) -> str:
     """从验证文件中提取引理内容"""
@@ -1952,6 +1990,8 @@ def _finish_usefulness_timeout(
     for slot in slots:
         if harvest_slot_kind(slot) != "proved":
             continue
+        # Reloads the live library under the lock (siblings may have pinned
+        # during the 60s usefulness window) and α-dedups before inserting.
         add_proved_lemma(
             base_path, slot.formula, origin=slot.name, attempt=0, depth=depth + 1,
             role="local",
@@ -2035,17 +2075,49 @@ def quick_run(
         logging.info("大模型未返回引理，跳过本 attempt（不加时）")
         return False, [], []
 
-    known_invalid = lemmas_known_invalid(
-        extracted_asserts, failed_data.get("invalid_lemmas") or []
+    generated_asserts = list(extracted_asserts)
+    library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
+    extracted_asserts, dropped = apply_static_lemma_screen(
+        extracted_asserts,
+        original_forall=original_forall,
+        smt=solver_content,
+        invalid_records=failed_data.get("invalid_lemmas") or [],
+        same_as_goal=are_formulas_equivalent,
+        library_items=library_items,
     )
-    if known_invalid:
-        logging.info("已记录的无效引理被再次生成，跳过: %s", [item[:80] for item in known_invalid])
-        log_exp("known_invalid", goal=goal_smt_name, n=len(known_invalid))
-        return False, [], extracted_asserts
-
-    # TODO: 去掉这一部分做消融实验↓
-    # 步骤4: 验证引理是否与原目标相同
-    if not validate_lemmas_against_original(extracted_asserts, original_forall, base_path, goal_smt_name):
+    for lemma, reason, gate in dropped:
+        if gate in BENIGN_SCREEN_GATES:
+            continue
+        add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
+    if dropped:
+        known_n = sum(1 for _lemma, _reason, gate in dropped if gate == "known_invalid")
+        if known_n:
+            log_exp("known_invalid", goal=goal_smt_name, n=known_n, kept=len(extracted_asserts))
+        logging.info(
+            "筛选排除 %d 条 (gates=%s)，保留 %d 条",
+            len(dropped),
+            [gate for _lemma, _reason, gate in dropped],
+            len(extracted_asserts),
+        )
+        log_exp(
+            "lemma_filter_drop",
+            goal=goal_smt_name,
+            dropped=len(dropped),
+            kept=len(extracted_asserts),
+            gates=",".join(gate for _lemma, _reason, gate in dropped),
+        )
+    if not extracted_asserts:
+        if dropped and all(gate in BENIGN_SCREEN_GATES for _lemma, _reason, gate in dropped):
+            if any(gate == "same_as_library" for _lemma, _reason, gate in dropped):
+                ok = perform_initial_verification(
+                    goal_smt_file, base_path=base_path, goal_name=goal_smt_name,
+                    log_event="library_retry",
+                    timeout=harvest_retry_timeout_s(),
+                )
+                if ok:
+                    logging.info("筛选后引理已在库中，用当前库证出当前目标")
+                    return True, [], generated_asserts
+            return False, [], generated_asserts
         record_solver_attempt(
             base_path,
             goal_smt_name,
@@ -2058,23 +2130,14 @@ def quick_run(
                 strategy=solver_profile or "",
             ),
         )
-        return False, [], extracted_asserts
-
-    if defined_symbols_enabled():
-        undef_map = lemmas_undefined_symbols(extracted_asserts, solver_content)
-        if undef_map:
-            for lemma, names in undef_map.items():
-                add_invalid_lemma(
-                    base_path, goal_smt_name, lemma,
-                    "undefined_symbol:" + ",".join(names),
-                )
-            logging.info("引理使用未定义函数，跳过: %s", list(undef_map.values()))
-            return False, [], extracted_asserts
+        return False, [], generated_asserts
 
     # 步骤5: 创建验证文件并并行验证引理有效性
     valid_check_paths = create_validation_files(extracted_asserts, solver_content, smt_file_path, goal_smt_name)
-    
-    if not validate_lemmas_parallel(valid_check_paths, base_path, goal_smt_name):
+    extracted_asserts = validate_lemmas_parallel(
+        valid_check_paths, extracted_asserts, base_path, goal_smt_name,
+    )
+    if not extracted_asserts:
         record_solver_attempt(
             base_path,
             goal_smt_name,
@@ -2087,7 +2150,7 @@ def quick_run(
                 strategy=solver_profile or "",
             ),
         )
-        return False, [], extracted_asserts
+        return False, [], generated_asserts
 
 
     # 步骤6: 一次整组有用性检查；失败则用 60s A∧C→P 写 mix（可选 sidecar 只打 progress）

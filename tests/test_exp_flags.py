@@ -26,6 +26,7 @@ from exp_flags import (
 )
 from lemma_gates import (
     defined_symbols_enabled,
+    lemma_filter_drop_enabled,
     llm_lemma_diagnosis_enabled,
     subgoal_sat_abort_enabled,
 )
@@ -37,6 +38,7 @@ _FLAG_NAMES = (
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
     "LEMMA_DEFINED_SYMBOLS",
+    "LEMMA_FILTER_DROP",
     "LLM_LEMMA_DIAGNOSIS",
 )
 
@@ -85,6 +87,7 @@ def test_flags_default_on() -> None:
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
         assert defined_symbols_enabled() is True
+        assert lemma_filter_drop_enabled() is True
         assert llm_lemma_diagnosis_enabled() is True
     finally:
         _restore_flags(saved)
@@ -101,6 +104,8 @@ def test_flags_default_on() -> None:
             assert subgoal_sat_abort_enabled() is False
         with patch.dict(os.environ, {"LEMMA_DEFINED_SYMBOLS": val}):
             assert defined_symbols_enabled() is False
+        with patch.dict(os.environ, {"LEMMA_FILTER_DROP": val}):
+            assert lemma_filter_drop_enabled() is False
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": val}):
             assert llm_lemma_diagnosis_enabled() is False
     with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):

@@ -57,7 +57,7 @@ def _run_quick(tmp: str, *, delay: str, usefulness, harvest, retry=None):
     patches = [
         patch.dict(os.environ, env),
         patch("Mate_new.generate_lemmas_with_llm", return_value=[_LEMMA]),
-        patch("Mate_new.validate_lemmas_parallel", return_value=True),
+        patch("Mate_new.validate_lemmas_parallel", side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas)),
         patch("Mate_new.verify_combined_lemmas", side_effect=usefulness),
         patch("Mate_new.run_cvc", side_effect=harvest),
     ]
@@ -199,7 +199,8 @@ def test_library_off_disables_harvest() -> None:
             "LEMMA_DEFINED_SYMBOLS": "off",
             "USEFULNESS_HARVEST_DELAY_S": "0.03",
         }), patch("Mate_new.generate_lemmas_with_llm", return_value=[_LEMMA]), patch(
-            "Mate_new.validate_lemmas_parallel", return_value=True
+            "Mate_new.validate_lemmas_parallel",
+            side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
         ), patch("Mate_new.verify_combined_lemmas", side_effect=usefulness), patch(
             "Mate_new.run_cvc", harvest
         ), patch("Mate_new.perform_initial_verification", return_value=True):

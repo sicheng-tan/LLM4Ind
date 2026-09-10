@@ -103,6 +103,21 @@ def normalize_lemma_formula(formula: str) -> str:
     return re.sub(r"\s+", " ", (formula or "").strip())
 
 
+def lemmas_equivalent(left: str, right: str) -> bool:
+    """Whitespace collapse or α-normalization; not a fuzzy similarity check."""
+    a = normalize_lemma_formula(left)
+    b = normalize_lemma_formula(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        from cvc5_runner import canonical_smt_term
+        return canonical_smt_term(a) == canonical_smt_term(b)
+    except Exception:
+        return False
+
+
 def compact_formula(formula: Optional[str], limit: int = MAX_FORMULA_CHARS) -> str:
     text = normalize_lemma_formula(formula or "")
     if len(text) <= limit:
@@ -180,8 +195,8 @@ def add_proved_lemma(
     """Record a discharged lemma. ``role`` is pin (useful split) or local (timeout harvest).
 
     Returns its library id, or None if empty / local harvest is off. Duplicate
-    formulas keep the existing id; a later pin promotes local in place. There is
-    no size cap: pins and locals both append.
+    formulas (whitespace or α-equivalent) keep the existing id; a later pin
+    promotes local in place. There is no size cap: pins and locals both append.
     """
     if not lemma_library_enabled():
         return None
@@ -196,11 +211,12 @@ def add_proved_lemma(
     with _LIB_LOCK:
         lemmas = load_lemma_library(base_path)
         for item in lemmas:
-            if normalize_lemma_formula(str(item.get("formula") or "")) != formula:
+            stored = str(item.get("formula") or "")
+            if not lemmas_equivalent(stored, formula):
                 continue
             lib_id = str(item.get("id") or "")
-            existing = lemma_library_role(item)
-            if existing == "local" and want == "pin":
+            existing_role = lemma_library_role(item)
+            if existing_role == "local" and want == "pin":
                 item["role"] = "pin"
                 item["origin"] = origin or item.get("origin") or ""
                 item["attempt"] = attempt
@@ -208,6 +224,9 @@ def add_proved_lemma(
                 save_lemma_library(base_path, lemmas)
                 log_exp("library_promote", id=lib_id, role="pin")
                 logging.info("lemma library promote %s local→pin", lib_id)
+            elif normalize_lemma_formula(stored) != formula:
+                log_exp("library_alpha_dup", id=lib_id, role=existing_role)
+                logging.info("lemma library skip α-dup %s", lib_id)
             return lib_id or None
 
         lib_id = _next_library_id(lemmas)

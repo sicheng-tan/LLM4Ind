@@ -73,6 +73,7 @@ def setup_environment():
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
     subgoal_sat_abort = os.getenv('SUBGOAL_SAT_ABORT', 'on')
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
+    lemma_filter_drop = os.getenv('LEMMA_FILTER_DROP', 'on')
     llm_lemma_diagnosis = os.getenv('LLM_LEMMA_DIAGNOSIS', 'on')
     child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '2')
     llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')
@@ -135,6 +136,7 @@ def setup_environment():
         'UNPROVED_NOT_INVALID': unproved_not_invalid,
         'SUBGOAL_SAT_ABORT': subgoal_sat_abort,
         'LEMMA_DEFINED_SYMBOLS': lemma_defined_symbols,
+        'LEMMA_FILTER_DROP': lemma_filter_drop,
         'LLM_LEMMA_DIAGNOSIS': llm_lemma_diagnosis,
         'CHILD_LLM_ATTEMPTS': child_llm_attempts,
         'LLM_PARSE_RETRIES': llm_parse_retries,

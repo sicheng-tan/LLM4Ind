@@ -62,6 +62,23 @@ def test_library_dedup_and_ids(tmp_path: Path) -> None:
         assert [item["id"] for item in stored] == ["lib_1", "lib_2"]
 
 
+def test_library_dedup_alpha_renaming(tmp_path: Path) -> None:
+    with _patch_flags("on", "on"):
+        first = add_proved_lemma(
+            str(tmp_path),
+            "(forall ((x Nat)) (= (plus x zero) x))",
+            origin="template_1",
+        )
+        second = add_proved_lemma(
+            str(tmp_path),
+            "(forall ((y Nat)) (= (plus y zero) y))",
+            origin="template_2",
+        )
+        assert first == "lib_1"
+        assert second == "lib_1"
+        assert len(load_lemma_library(str(tmp_path))) == 1
+
+
 def test_last_normal_tree_skips_empty_invalid_useless() -> None:
     state = {}
     state = append_attempt(state, "empty")
@@ -563,6 +580,7 @@ def main() -> int:
         root = Path(tmp)
         for i, fn in enumerate((
             test_library_dedup_and_ids,
+            test_library_dedup_alpha_renaming,
             test_library_has_no_size_cap,
             test_library_no_fifo_when_harvest_off,
             test_library_promote_local_to_pin_keeps_id,
