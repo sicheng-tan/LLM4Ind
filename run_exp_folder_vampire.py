@@ -22,6 +22,12 @@ from exp_stats import (
     print_batch_stats,
     write_results_csv,
 )
+from skip_problems import (
+    add_skip_file_argument,
+    filter_skipped_folders,
+    report_skipped_folders,
+    resolve_skip_file,
+)
 prove_run = mate_solver.prove_run
 
 # 加载配置
@@ -239,6 +245,7 @@ if __name__ == "__main__":
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')
+    add_skip_file_argument(parser)
     args = parser.parse_args()
     
     # 设置多进程启动方法（在某些系统上需要）
@@ -264,8 +271,13 @@ if __name__ == "__main__":
 
     template_name = "template"
     folders = find_template_folders(root_path, template_name + ".smt2")
-    
-    print(f"找到 {len(folders)} 个待求解任务")
+    found = len(folders)
+    skip_file = resolve_skip_file(args.skip_file)
+    folders, skipped, _patterns = filter_skipped_folders(folders, skip_file)
+    print(f"找到 {found} 个待求解任务")
+    if skip_file:
+        report_skipped_folders(skipped, skip_file)
+        print(f"排除后剩余 {len(folders)} 个任务")
     
     # 显示运行模式
     if args.baseline:
@@ -285,52 +297,51 @@ if __name__ == "__main__":
     
     # 使用进程池并行执行，最多MAX_PARALLEL_TASKS个并行进程
     max_parallel_tasks = config['MAX_PARALLEL_TASKS']
-    max_workers = min(max_parallel_tasks, len(folders), multiprocessing.cpu_count())
-    print(f"使用 {max_workers} 个并行进程处理 {len(folders)} 个任务")
-    
-    # 添加unsat任务计数器
     unsat_count = 0
     total_tasks = len(folders)
-    
-    # 使用进度条和进程池
-    with tqdm(total=len(folders), desc=f"处理任务 (unsat: {unsat_count}/{total_tasks})", unit="task") as pbar:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务
-            future_to_folder = {executor.submit(process_single_task, task): task[0] 
-                              for task in task_list}
-            
-            # 收集结果
-            for future in as_completed(future_to_folder):
-                folder_path = future_to_folder[future]
-                try:
-                    folder, final_status, duration, error = future.result()
-                    
-                    if error:
-                        print(f"\n任务执行出错: {os.path.basename(folder)} - 错误: {error}")
-                        ensure_task_summary(folder, proved=False, error=str(error))
-                        results.append((folder, False, duration, error))
-                    else:
-                        results.append((folder, final_status, duration, None))
-                        
-                        # 如果是unsat结果，更新计数器
-                        if final_status:
-                            unsat_count += 1
-                        
-                        # 显示任务完成反馈
-                        result_text = "unsat" if final_status else "失败"
-                        print(f"\n任务完成: {os.path.basename(folder)} - {result_text} - 用时: {duration:.2f}秒")
-                        
-                except Exception as e:
-                    print(f"\n任务执行出错: {os.path.basename(folder_path)} - 错误: {str(e)}")
-                    try:
-                        ensure_task_summary(folder_path, proved=False, error=str(e))
-                    except Exception:
-                        pass
-                    results.append((folder_path, False, -1, str(e)))
+    if folders:
+        max_workers = min(max_parallel_tasks, len(folders), multiprocessing.cpu_count())
+        print(f"使用 {max_workers} 个并行进程处理 {len(folders)} 个任务")
+        with tqdm(total=len(folders), desc=f"处理任务 (unsat: {unsat_count}/{total_tasks})", unit="task") as pbar:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_folder = {executor.submit(process_single_task, task): task[0] 
+                                  for task in task_list}
                 
-                # 更新进度条描述和进度
-                pbar.set_description(f"处理任务 (unsat: {unsat_count}/{total_tasks})")
-                pbar.update(1)
+                # 收集结果
+                for future in as_completed(future_to_folder):
+                    folder_path = future_to_folder[future]
+                    try:
+                        folder, final_status, duration, error = future.result()
+                        
+                        if error:
+                            print(f"\n任务执行出错: {os.path.basename(folder)} - 错误: {error}")
+                            ensure_task_summary(folder, proved=False, error=str(error))
+                            results.append((folder, False, duration, error))
+                        else:
+                            results.append((folder, final_status, duration, None))
+                            
+                            # 如果是unsat结果，更新计数器
+                            if final_status:
+                                unsat_count += 1
+                            
+                            # 显示任务完成反馈
+                            result_text = "unsat" if final_status else "失败"
+                            print(f"\n任务完成: {os.path.basename(folder)} - {result_text} - 用时: {duration:.2f}秒")
+                            
+                    except Exception as e:
+                        print(f"\n任务执行出错: {os.path.basename(folder_path)} - 错误: {str(e)}")
+                        try:
+                            ensure_task_summary(folder_path, proved=False, error=str(e))
+                        except Exception:
+                            pass
+                        results.append((folder_path, False, -1, str(e)))
+                    
+                    # 更新进度条描述和进度
+                    pbar.set_description(f"处理任务 (unsat: {unsat_count}/{total_tasks})")
+                    pbar.update(1)
+    else:
+        print("没有待求解任务（可能全部被 skip-file 排除）")
     
     total_end_time = time.time()
     total_duration = total_end_time - total_start_time

@@ -2,6 +2,7 @@
 # CVC5 全量 706：DeepSeek-v4-flash + local harvest。
 # MAX_PARALLEL_TASKS=20（原 40；ProcessPoolExecutor 读 env，不必改 run_exp_folder.py）。
 # LLM_TIMEOUT=180、LLM_MAX_RETRIES=1、HARVEST_RETRY_TIMEOUT=2。
+# 排除已知错误定理：在 env 里设 SKIP_PROBLEMS_FILE=experiments/configs/skip_nontheorems.txt
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

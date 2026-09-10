@@ -1,0 +1,26 @@
+# Known non-theorems under the current SMT axioms.
+# One task directory per line. Blank lines and # comments are ignored.
+# Paths are matched as suffixes, so these still apply after the experiment
+# runner copies a dataset to result_dir/<timestamp>_<dataset>/.
+#
+# Source: docs/root-invalid-goal-counterexamples.md
+# Usage:
+#   python3 run_exp_folder.py --root-path ... --skip-file experiments/configs/skip_nontheorems.txt
+#   SKIP_PROBLEMS_FILE=experiments/configs/skip_nontheorems.txt python3 run_exp_folder.py ...
+
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/2
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/3
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/6
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/15
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/17
+benchmarks/preprocessed/ind-ben/list/crafted_assorted/19
+benchmarks/preprocessed/ind-ben/tree/crafted_rotate/10
+benchmarks/preprocessed/ind-ben/tree/crafted_rotate/11
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal4
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal5
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal8
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal11
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal14
+benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal17
+benchmarks/preprocessed/vmcai15-dt/leon/heap-goal11
+benchmarks/preprocessed/vmcai15-dt/isa/goal75
