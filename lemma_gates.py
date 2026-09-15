@@ -490,7 +490,11 @@ def lemmas_known_invalid(
     return [lemma for lemma in lemmas if lemma_known_invalid(lemma, invalid_lemmas)]
 
 
-BENIGN_SCREEN_GATES = frozenset({"known_invalid", "same_as_library"})
+BENIGN_SCREEN_GATES = frozenset({
+    "known_invalid",
+    "same_as_library",
+    "same_as_ancestor",
+})
 
 
 def lemma_same_as_goal(lemma: str, goal: str) -> bool:
@@ -528,15 +532,20 @@ def apply_static_lemma_screen(
     invalid_records: Sequence[Any],
     same_as_goal: Callable[[str, str], bool],
     library_items: Sequence[Any] = (),
+    ancestor_stack: Sequence[Any] = (),
 ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
-    """Drop known-invalid / same-as-goal / library-duplicate / undefined-symbol members.
+    """Drop known-invalid / same-as-goal / ancestor-cycle / library / undefined members.
 
     Returns ``(kept, dropped)`` where each dropped item is
     ``(lemma, reason, gate)``. ``gate`` is ``known_invalid``, ``same_as_goal``,
-    ``same_as_library``, or ``undefined_symbol``. Known-invalid and library
-    duplicates are not recorded as invalid by the caller. Library matches always
-    drop only that member (they are theorems, not failed screens).
+    ``same_as_ancestor``, ``same_as_library``, or ``undefined_symbol``.
+    Known-invalid, library duplicates, and ancestor cycles are not recorded as
+    invalid by the caller (ancestor hits are path cycles, often still theorems).
+    Library matches always drop only that member.
     """
+    from ancestor_stack import lemma_matches_ancestor
+    from exp_flags import ancestor_cycle_filter_enabled
+
     current = list(lemmas)
     dropped: List[Tuple[str, str, str]] = []
 
@@ -560,6 +569,19 @@ def apply_static_lemma_screen(
         ),
     ):
         return [], dropped
+    if ancestor_cycle_filter_enabled() and ancestor_stack:
+        def _ancestor_reason(lemma: str) -> Optional[str]:
+            hit = lemma_matches_ancestor(
+                lemma, ancestor_stack, equivalent=same_as_goal
+            )
+            if not hit:
+                return None
+            gid = str(hit.get("goal_id") or "")
+            depth = hit.get("depth", "?")
+            return f"cycle_detected:ancestor={gid}:depth={depth}"
+
+        if not _stage("same_as_ancestor", _ancestor_reason):
+            return [], dropped
     if library_items:
         kept_lib: List[str] = []
         for lemma in current:

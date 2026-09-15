@@ -5,6 +5,9 @@ Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
 ``LEMMA_LIBRARY_LOCAL``, and ``OBLIGATION_TREE``.
+
+``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
+ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
 """
 
 from __future__ import annotations
@@ -46,6 +49,16 @@ def prompt_retarget_enabled() -> bool:
 def unproved_not_invalid_enabled() -> bool:
     """When on, a useful-but-unproved subgoal stays off invalid_lemmas (tree-only)."""
     return _flag_enabled("UNPROVED_NOT_INVALID")
+
+
+def ancestor_cycle_filter_enabled() -> bool:
+    """Drop candidates α/eq-equivalent to a strict ancestor (path cycle)."""
+    return _flag_enabled("ANCESTOR_CYCLE_FILTER")
+
+
+def ancestor_prompt_enabled() -> bool:
+    """Inject PROOF PATH GOALS (CURRENT + strict ancestors) into the user prompt."""
+    return _flag_enabled("ANCESTOR_PROMPT")
 
 
 # Fail-fast / child-budget switches live in lemma_gates.py (same default-on

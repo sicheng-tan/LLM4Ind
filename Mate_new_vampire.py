@@ -75,12 +75,19 @@ from obligation_tree import (
     usefulness_harvest_delay_s,
 )
 from exp_flags import (
+    ancestor_prompt_enabled,
     paper_schedule_prompt,
     progress_feedback_enabled,
     prompt_retarget_active,
     repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
+)
+from ancestor_stack import (
+    AncestorStack,
+    empty_ancestor_stack,
+    extend_ancestors,
+    format_proof_path_goals_for_prompt,
 )
 from lemma_harvest import (
     harvest_slot_kind,
@@ -747,7 +754,18 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
 
     return "\n".join(parts)
 
-def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None, goal_name: str = None, folder_path: str = None, depth: int = 0, diagnosis_only: bool = False) -> Tuple[list, str]:
+def create_prompt(
+    smt_file_content: str,
+    prompt_mode: str,
+    base_path: str = None,
+    goal_name: str = None,
+    folder_path: str = None,
+    depth: int = 0,
+    diagnosis_only: bool = False,
+    *,
+    ancestor_stack: AncestorStack = (),
+    current_formula: Optional[str] = None,
+) -> Tuple[list, str]:
     """创建用于 LLM 的结构化消息列表。返回 (messages, 本轮追加的反馈文本)。"""
     if folder_path is None:
         raise ValueError("folder path of prompts must be provided")
@@ -758,12 +776,21 @@ def create_prompt(smt_file_content: str, prompt_mode: str, base_path: str = None
         user_prompt_content = file.read()
     # 添加失败引理 + Vampire solver-guided 反馈
     failed_info = ""
+    if not diagnosis_only and ancestor_prompt_enabled():
+        path_txt = format_proof_path_goals_for_prompt(
+            current_id=goal_name or "",
+            current_depth=depth,
+            current_formula=current_formula or "",
+            stack=ancestor_stack,
+        )
+        if path_txt:
+            failed_info += path_txt
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
         if diagnosis_only:
             failed_info = format_diagnosis_tree_prompt(failed_data.get("obligation"))
         else:
-            failed_info = format_solver_feedback_for_prompt(
+            failed_info += format_solver_feedback_for_prompt(
                 failed_data, base_path=base_path, depth=depth,
             )
         log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
@@ -1437,7 +1464,19 @@ def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
     logging.info(f"提取到原始目标: {original_assert.group(1)}, forall 表达式: {original_forall}")
     return original_assert, original_forall
 
-def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_file: Path, base_path: str, goal_name: str, folder_path: str, depth: int = 0, diagnosis_only: bool = False) -> List[str]:
+def generate_lemmas_with_llm(
+    smt_content: str,
+    prompt_strategy: str,
+    goal_smt_file: Path,
+    base_path: str,
+    goal_name: str,
+    folder_path: str,
+    depth: int = 0,
+    diagnosis_only: bool = False,
+    *,
+    ancestor_stack: AncestorStack = (),
+    current_formula: Optional[str] = None,
+) -> List[str]:
     """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。
 
     格式解析失败时在同一次 attempt 内按 LLM_PARSE_RETRIES 再请求，不立刻消耗下一轮 attempt。
@@ -1448,9 +1487,17 @@ def generate_lemmas_with_llm(smt_content: str, prompt_strategy: str, goal_smt_fi
         goal_smt_file,
         prompt_strategy,
     )
+    formula = current_formula
+    if formula is None and not diagnosis_only:
+        try:
+            _assert, formula = extract_original_goal(smt_content)
+        except Exception:
+            formula = None
     messages, feedback = create_prompt(
         smt_content, prompt_strategy, base_path, goal_name, folder_path,
         depth=depth, diagnosis_only=diagnosis_only,
+        ancestor_stack=ancestor_stack,
+        current_formula=formula,
     )
     system_text = (messages[0].get("content") if messages else "") or ""
     extra_retries = 0 if diagnosis_only else llm_parse_retries()
@@ -2023,6 +2070,7 @@ def quick_run(
     solver_profile: Optional[str] = None,
     decision_source: Optional[str] = None,
     depth: int = 0,
+    ancestor_stack: AncestorStack = (),
 ) -> Tuple[bool, List[str], List[str]]:
     """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
     smt_file_path = Path(base_path)
@@ -2068,7 +2116,12 @@ def quick_run(
         save_routing_state(base_path, goal_smt_name, state)
     
     # 步骤3: 使用LLM生成引理
-    extracted_asserts = generate_lemmas_with_llm(smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name, folder_path, depth=depth)
+    extracted_asserts = generate_lemmas_with_llm(
+        smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name,
+        folder_path, depth=depth,
+        ancestor_stack=ancestor_stack,
+        current_formula=original_forall,
+    )
 
     # 如果没有生成引理，与调用失败一样进入下一 attempt，不加时。
     if not extracted_asserts:
@@ -2084,8 +2137,17 @@ def quick_run(
         invalid_records=failed_data.get("invalid_lemmas") or [],
         same_as_goal=are_formulas_equivalent,
         library_items=library_items,
+        ancestor_stack=ancestor_stack,
     )
     for lemma, reason, gate in dropped:
+        if gate == "same_as_ancestor":
+            log_exp(
+                "ancestor_cycle",
+                goal=goal_smt_name,
+                reason=reason,
+                lemma=(lemma or "")[:160],
+            )
+            continue
         if gate in BENIGN_SCREEN_GATES:
             continue
         add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
@@ -2218,6 +2280,9 @@ def prove_subgoals_parallel(
     parent_goal_name: str = None,
     attempt: int = 0,
     skip_initial_for: Optional[Set[str]] = None,
+    *,
+    ancestor_stack: AncestorStack = (),
+    parent_formula: Optional[str] = None,
 ) -> Tuple[bool, List[dict]]:
     """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
     if not subgoals:
@@ -2227,6 +2292,22 @@ def prove_subgoals_parallel(
     parent_lemmas = parent_lemmas or []
     skip_initial_for = skip_initial_for or set()
     snapshots: Dict[str, dict] = {}
+    formula = parent_formula
+    if formula is None and parent_goal_name:
+        parent_path = Path(base_path) / f"{parent_goal_name}.smt2"
+        if parent_path.exists():
+            try:
+                _a, formula = extract_original_goal(
+                    solver_smt_content(parent_path.read_text(encoding="utf-8"), base_path)
+                )
+            except Exception:
+                formula = None
+    child_stack = extend_ancestors(
+        ancestor_stack,
+        parent_goal_name or "",
+        depth,
+        formula or "",
+    )
 
     def _formula(sg: str) -> Optional[str]:
         if parent_goal_name:
@@ -2280,6 +2361,7 @@ def prove_subgoals_parallel(
                 baseline_only,
                 parent_goal_name,
                 skip_initial=subgoal in skip_initial_for,
+                ancestor_stack=child_stack,
             ): subgoal
             for subgoal in subgoals
         }
@@ -2377,7 +2459,16 @@ def _run_final_goal_diagnosis(
     return True
 
 
-def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str = "default", baseline_only: bool = False, parent_goal_name: Optional[str] = None, skip_initial: bool = False) -> bool:
+def prove_run(
+    base_path: str,
+    base_name: str,
+    depth: int = 0,
+    strategy_mode: str = "default",
+    baseline_only: bool = False,
+    parent_goal_name: Optional[str] = None,
+    skip_initial: bool = False,
+    ancestor_stack: AncestorStack = (),
+) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     outcome = {"proved": False, "reason": "attempts_exhausted"}
 
@@ -2390,6 +2481,7 @@ def prove_run(base_path: str, base_name: str, depth: int = 0, strategy_mode: str
         return _prove_run_body(
             base_path, base_name, depth, strategy_mode, baseline_only,
             parent_goal_name, skip_initial, _done,
+            ancestor_stack=ancestor_stack or empty_ancestor_stack(),
         )
     finally:
         if depth == 0:
@@ -2415,6 +2507,8 @@ def _prove_run_body(
     parent_goal_name: Optional[str],
     skip_initial: bool,
     _done,
+    *,
+    ancestor_stack: AncestorStack = (),
 ) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     # 检查递归深度限制
@@ -2450,6 +2544,13 @@ def _prove_run_body(
     log_exp("node_enter", goal=base_name, depth=depth, parent=parent_goal_name)
 
     goal_smt_file = Path(base_path) / f"{base_name}.smt2"
+    current_formula: Optional[str] = None
+    try:
+        _a, current_formula = extract_original_goal(
+            solver_smt_content(goal_smt_file.read_text(encoding="utf-8"), base_path)
+        )
+    except Exception:
+        current_formula = None
     if routing_enabled() and not load_failed_lemmas(base_path, base_name).get("routing"):
         seed_baseline_repair_hints(
             base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
@@ -2547,6 +2648,7 @@ def _prove_run_body(
                 solver_profile=solver_profile,
                 decision_source=decision_source,
                 depth=depth,
+                ancestor_stack=ancestor_stack,
             )
             if (
                 not ret
@@ -2602,6 +2704,8 @@ def _prove_run_body(
                     base_path, new_subgoals, depth, strategy_mode, baseline_only,
                     current_lemmas, base_name, attempt=attempt + 1,
                     skip_initial_for=skip_for,
+                    ancestor_stack=ancestor_stack,
+                    parent_formula=current_formula,
                 )
                 if isinstance(subgoal_result, tuple):
                     ok, rec_nodes = subgoal_result

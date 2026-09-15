@@ -114,9 +114,10 @@ Do not emit an empty <output> block. Child only, if the CURRENT goal is not a th
 
 1. Please output all lemmas you discovered through reasoning inside the <output> block, one SMT-LIB forall formula per <lemma> tag.
 
-2. Note that the needed lemma should not be the same as the proof goal.
+2. Note that the needed lemma should not be the same as the CURRENT proof goal, and not the same as any STRICT ANCESTOR goal listed under PROOF PATH GOALS in the user message (including variable renaming or swapping equality sides).
     - e.g. if the proof goal is "(assert (not (forall ((a Int) (i Int)) (=> (and (>= a 0) (>= i 1)) (= (div a (Pow2 (- i 1))) (div (* a 2) (Pow2 i))))) ))", 
     then do not generate "(forall ((a Int) (i Int)) (=> (and (>= a 0) (>= i 1)) (= (div a (Pow2 (- i 1))) (div (* a 2) (Pow2 i))))))".
+    - If PROOF PATH GOALS lists an ancestor forall, NEVER regenerate that ancestor as a lemma for the CURRENT goal.
 
 3. Avoid generating redundant lemmas. 
 

@@ -133,10 +133,11 @@ Do not emit an empty <output> block. Child only, if the CURRENT goal is not a th
 3. Please generate *SIMPLE* and *EFFECTIVE* lemmas, and avoid generating complex or redundant lemmas. 1 or 2 lemmas may be enough to prove the goal.
 Attempt to generate lemmas that are closely related to the proof target but simpler to prove. A lemma that makes a small step towards proving the target is sufficient.
 
-4. Please ensure the formula represented by "forall" statements in needed lemmas are not the same as the "forall" statement in the proof goal. 
+4. Please ensure the formula represented by "forall" statements in needed lemmas are not the same as the CURRENT proof goal, and not the same as any STRICT ANCESTOR goal listed under PROOF PATH GOALS in the user message (including variable renaming or swapping equality sides).
 Example1: if the proof goal is "(forall (x T) (= (F1 x) (F2 x)))", then NEVER generate needed lemma "(forall (x T) (= (F1 x) (F2 x)))" or  "(forall (x T) (= (F2 x) (F1 x)))", where T is any datatyeps, e.g., Nat, Lst, Tree, etc.
 Example2: if the proof goal is "(forall ((n Nat) (m Nat)) (= (mult n m) (mult m n))", 
 then NEVER generate needed lemma "(forall ((n Nat) (m Nat)) (= (mult n m) (mult m n)))", or "(forall ((a Nat) (b Nat)) (= (mult b a) (mult a b)))".
+Example3: if PROOF PATH GOALS lists an ancestor "(forall ((x Bin) (y Bin) (z Bin)) (= (times x (plus y z)) (plus (times x y) (times x z))))", then NEVER regenerate that ancestor forall as a lemma for the CURRENT goal.
 
 5. If the equational reasoning already looks complete, still output the missing step as a simple lemma. Do not emit an empty <output> block.
 For example:
