@@ -110,6 +110,13 @@ _EXPLOSION_HINTS = {"search_explosion", "timeout"}
 EQUATIONAL_PROMPT = "prove_prompt_equational_reasoning"
 TERM_REWRITE_PROMPT = "prove_prompt_term_rewrite"
 
+# v2 pack (prompts_v2): start on lemma_general; HD bit drives deterministic retarget.
+V2_LEMMA_GENERAL = "lemma_general"
+V2_INDUCTION_STEP = "induction_step"
+_HD_HINT_KIND = "high_difficulty_assertions"
+# Sentinel so the first post-failure retarget always compares against a fresh HD bit.
+V2_START_SIGNATURE = "start"
+
 
 @dataclass
 class GoalSearchState:
@@ -697,6 +704,90 @@ def reset_prompt_mode_rng() -> None:
     _prompt_mode_rng = None
 
 
+def _pool_is_v2(strategies: Sequence[str]) -> bool:
+    pool = {s for s in strategies if s}
+    return V2_LEMMA_GENERAL in pool or V2_INDUCTION_STEP in pool
+
+
+def hints_have_high_difficulty(hints: Sequence[dict]) -> bool:
+    """True if CVC/Vampire repair hints include high_difficulty_assertions."""
+    for hint in hints or ():
+        if isinstance(hint, dict) and hint.get("kind") == _HD_HINT_KIND:
+            return True
+    return False
+
+
+def v2_hd_signature(hints: Sequence[dict]) -> str:
+    """Coarse signature for v2 feedback retarget: hd vs no_hd only."""
+    return "hd" if hints_have_high_difficulty(hints) else "no_hd"
+
+
+def v2_mode_from_hd(hints: Sequence[dict]) -> str:
+    """Deterministic map: HD → induction_step, else lemma_general."""
+    if hints_have_high_difficulty(hints):
+        return V2_INDUCTION_STEP
+    return V2_LEMMA_GENERAL
+
+
+def select_v2_generation_prompt(
+    strategies: Sequence[str],
+    hints: Sequence[dict],
+    *,
+    rng: Optional[random.Random] = None,
+) -> str:
+    """First template for v2: always ``lemma_general`` (HD applies only on retarget)."""
+    del hints, rng  # first pick ignores HD / RNG
+    pool = [s for s in strategies if s]
+    if not pool:
+        return ""
+    if V2_LEMMA_GENERAL in pool:
+        logging.info("v2 start prompt → %s (default; HD retarget later)", V2_LEMMA_GENERAL)
+        return V2_LEMMA_GENERAL
+    return pool[0]
+
+
+def retarget_v2_generation_prompt(
+    strategies: Sequence[str],
+    hints: Sequence[dict],
+    current: str,
+    consecutive_no_help: int,
+    last_signature: str,
+    *,
+    rng: Optional[random.Random] = None,
+    switch_after: int = NO_HELP_PROMPT_SWITCH,
+) -> Tuple[str, int, str, str]:
+    """v2 retarget: HD bit change → deterministic mode; else consecutive flip.
+
+    - ``hd`` → ``induction_step``, ``no_hd`` → ``lemma_general``
+    - Consecutive flips have **no per-node cap**.
+    Returns (prompt, consecutive_no_help, signature, reason) with reason in
+    ``kind`` / ``consecutive`` / ``keep``.
+    """
+    del rng  # deterministic HD map
+    pool = [s for s in strategies if s]
+    signature = v2_hd_signature(hints)
+    if signature != last_signature:
+        nxt = v2_mode_from_hd(hints)
+        if nxt not in pool:
+            nxt = pool[0] if pool else current
+        if nxt != current:
+            logging.info(
+                "v2 HD feedback %s → %s，切换 prompt %s → %s",
+                last_signature,
+                signature,
+                current,
+                nxt,
+            )
+            return nxt, 0, signature, "kind"
+        return current, consecutive_no_help, signature, "keep"
+    nxt, consecutive_no_help, switched = advance_generation_prompt(
+        strategies, current, consecutive_no_help, switch_after=switch_after
+    )
+    if switched:
+        return nxt, consecutive_no_help, signature, "consecutive"
+    return current, consecutive_no_help, signature, "keep"
+
+
 def select_generation_prompt(
     strategies: Sequence[str],
     hints: Sequence[dict],
@@ -709,10 +800,15 @@ def select_generation_prompt(
     generalize → equational). Both families: sample with
     P(term_rewrite) = rewrite_strength / (generalize + rewrite), using
     mix-gate overshoot stored on each hint. Does not drop a strategy from the pool.
+
+    For the v2 pack (``lemma_general`` / ``induction_step``), always start on
+    ``lemma_general``; HD only affects later retarget.
     """
     pool = [s for s in strategies if s]
     if not pool:
         return ""
+    if _pool_is_v2(pool):
+        return select_v2_generation_prompt(pool, hints, rng=rng)
     p_rewrite = term_rewrite_sample_prob(hints)
     if p_rewrite is None:
         return order_prompt_strategies(pool, hints)[0]
@@ -769,9 +865,22 @@ def retarget_generation_prompt(
     - Kind family set changed: re-run one-family kind pick or both-family sample.
     - Same family set: only consecutive empty/invalid/useless can toggle.
 
+    For v2 packs, HD bit changes map deterministically to induction_step /
+    lemma_general; consecutive no-help still toggles with no per-node flip cap.
+
     Returns (prompt, consecutive_no_help, signature, reason)
     with reason in ``kind`` / ``consecutive`` / ``keep``.
     """
+    if _pool_is_v2(strategies):
+        return retarget_v2_generation_prompt(
+            strategies,
+            hints,
+            current,
+            consecutive_no_help,
+            last_signature,
+            rng=rng,
+            switch_after=switch_after,
+        )
     signature = prompt_kind_signature(hints)
     if signature != last_signature:
         nxt = select_generation_prompt(strategies, hints, rng=rng)

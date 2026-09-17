@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from solver_relative_metrics import (
-    INDUCTION_SHARE_MAX,
     REWRITE_PER_INDUCTION_MAX,
     activity_rate,
     gate_overshoot,
@@ -150,14 +149,14 @@ def test_cvc_difficulty_relative() -> None:
 
 
 def test_cvc_mix_hints_small_problem() -> None:
-    # Original conj>=50 would miss this; relative mix should fire.
+    # need_stronger_lemma emission is disabled (misleading strengthen/generalize text).
     hints = derive_repair_hints(CvcResult(
         status="timeout", elapsed=3.0,
         stats={"CONJ_TOTAL": 8, "QUANTIFIERS_SKOLEMIZE": 0, "INST_TOTAL": 2},
     ))
     _ok(
-        any(h["kind"] == "need_stronger_lemma" for h in hints),
-        f"small conj-heavy mix: {hints}",
+        not any(h["kind"] == "need_stronger_lemma" for h in hints),
+        f"stronger hint must stay disabled: {hints}",
     )
 
     hints_rw = derive_repair_hints(CvcResult(
@@ -183,14 +182,12 @@ def test_cvc_mix_hints_small_problem() -> None:
         stats={"CONJ_TOTAL": 100, "QUANTIFIERS_SKOLEMIZE": 2, "INST_TOTAL": 1},
     ))
     kinds_both = {h["kind"] for h in hints_both}
-    _ok("need_stronger_lemma" in kinds_both and "need_rewrite" in kinds_both,
-        f"both mix hints may fire: {hints_both}")
+    _ok("need_stronger_lemma" not in kinds_both, f"stronger disabled: {hints_both}")
+    _ok("need_rewrite" in kinds_both, f"rewrite mix hint may still fire: {hints_both}")
     by_kind = {h["kind"]: h for h in hints_both}
-    stronger = by_kind["need_stronger_lemma"]["strength"]
     rewrite = by_kind["need_rewrite"]["strength"]
-    _ok(abs(stronger - gate_overshoot(2 / 100, 0.05)) < 1e-4, stronger)
     _ok(abs(rewrite - gate_overshoot(1 / 3, 0.75)) < 1e-4, rewrite)
-    _ok(stronger > 0 and rewrite > 0, (stronger, rewrite))
+    _ok(rewrite > 0, rewrite)
 
 
 def test_gate_overshoot_bounds() -> None:
@@ -223,15 +220,12 @@ def test_vampire_mix_strength_and_both_families() -> None:
         stats={"InductionApplications": 1, "Fw demodulations": 6},
     ))
     kinds = {h["kind"]: h for h in both}
-    _ok("need_rewrite" in kinds and "need_induction_lemma" in kinds, both)
+    _ok("need_rewrite" in kinds, both)
+    _ok("need_induction_lemma" not in kinds, f"induction_lemma disabled: {both}")
     _ok(kinds["induction_stuck"]["strength"] == 0.5, kinds["induction_stuck"])
     _ok(
         abs(kinds["need_rewrite"]["strength"] - gate_overshoot(6 / 1, REWRITE_PER_INDUCTION_MAX)) < 1e-4,
         kinds["need_rewrite"],
-    )
-    _ok(
-        abs(kinds["need_induction_lemma"]["strength"] - gate_overshoot(1 / 7, INDUCTION_SHARE_MAX)) < 1e-4,
-        kinds["need_induction_lemma"],
     )
 
 
@@ -304,16 +298,16 @@ def test_vampire_explosion_and_mix() -> None:
         stats={"InductionApplications": 1, "Fw demodulations": 400},
     ))
     _ok(
-        any(h["kind"] == "need_induction_lemma" for h in hints_ind),
-        f"rewrite-dominated mix: {hints_ind}",
+        not any(h["kind"] == "need_induction_lemma" for h in hints_ind),
+        f"need_induction_lemma disabled: {hints_ind}",
     )
     hints_ind8 = vampire_hints(VampireResult(
         status="timeout", elapsed=elapsed,
         stats={"InductionApplications": 8, "Fw demodulations": 400},
     ))
     _ok(
-        any(h["kind"] == "need_induction_lemma" for h in hints_ind8),
-        f"ind=8 dem=400 should still flag missing induction: {hints_ind8}",
+        not any(h["kind"] == "need_induction_lemma" for h in hints_ind8),
+        f"need_induction_lemma disabled: {hints_ind8}",
     )
 
     hints_int = vampire_hints(VampireResult(
@@ -353,8 +347,8 @@ def test_integer_induction_in_mix_share() -> None:
         stats={"InductionApplications": 1, "Fw demodulations": 400},
     ))
     _ok(
-        any(h["kind"] == "need_induction_lemma" for h in rewrite_dom),
-        f"structural-tiny vs demod still missing induction: {rewrite_dom}",
+        not any(h["kind"] == "need_induction_lemma" for h in rewrite_dom),
+        f"need_induction_lemma disabled: {rewrite_dom}",
     )
 
 
@@ -460,8 +454,8 @@ def test_vampire_directed_rewrite_and_depth() -> None:
         stats={"MaxInductionDepth": 2, "InductionApplications": 4, "Fw demodulations": 10},
     ))
     _ok(
-        any(h["kind"] == "induction_depth_limit" for h in deep),
-        f"depth>=2 with induction: {deep}",
+        not any(h["kind"] == "induction_depth_limit" for h in deep),
+        f"induction_depth_limit disabled: {deep}",
     )
     shallow = vampire_hints(VampireResult(
         status="timeout",

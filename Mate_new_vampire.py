@@ -29,6 +29,7 @@ from solver_routing import (
     select_generation_prompt,
     retarget_generation_prompt,
     prompt_kind_signature,
+    V2_START_SIGNATURE,
     NO_HELP_PROMPT_SWITCH,
     probe_profile_count,
     probe_timeout_s,
@@ -2580,12 +2581,20 @@ def _prove_run_body(
     strategies = pack["strategies"]
     total_attempts, max_attempts_per_prompt = node_attempt_plan(depth, pack)
     retarget = prompt_retarget_active(len(strategies))
+    fixed_no_retarget = pack.get("no_retarget_prompt")
     if retarget:
         hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
         current_prompt = select_generation_prompt(strategies, hint_list)
-        kind_signature = prompt_kind_signature(hint_list)
+        # v2: start signature is sentinel so the first HD/no_hd update can retarget.
+        kind_signature = (
+            V2_START_SIGNATURE
+            if pack.get("mode") == "v2"
+            else prompt_kind_signature(hint_list)
+        )
     else:
-        current_prompt = paper_schedule_prompt(strategies, 0, max_attempts_per_prompt)
+        current_prompt = fixed_no_retarget or paper_schedule_prompt(
+            strategies, 0, max_attempts_per_prompt
+        )
         kind_signature = "none"
     consecutive_no_help = 0
     log_exp(
@@ -2602,10 +2611,10 @@ def _prove_run_body(
     # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
     # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
     # (ours only): hint family picks the template. With retarget off: paper
-    # order, N attempts per template.
+    # order, N attempts per template. v2 + retarget off: always lemma_general.
     for attempt in range(total_attempts):
         if not retarget:
-            current_prompt = paper_schedule_prompt(
+            current_prompt = fixed_no_retarget or paper_schedule_prompt(
                 strategies, attempt, max_attempts_per_prompt
             )
         prompt_strategy = current_prompt

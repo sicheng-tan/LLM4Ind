@@ -1103,7 +1103,7 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         assert kwargs.get("collect_difficulty") is True
         diag.assert_not_called()
         kinds = [h["kind"] for h in mate.load_failed_lemmas(tmp, "template")["repair_hints"]]
-        assert "need_stronger_lemma" in kinds
+        assert "need_stronger_lemma" not in kinds
         assert "high_difficulty_assertions" in kinds
 
 

@@ -22,6 +22,13 @@ OURS_PROMPT_STRATEGIES = (
     "prove_prompt_term_rewrite",
 )
 NAIVE_PROMPT_STRATEGIES = ("prompt_naive",)
+# v2: general small-bridge + induction-step local bridges (no term_rewrite arm).
+V2_PROMPT_STRATEGIES = (
+    "lemma_general",
+    "induction_step",
+)
+V2_LEMMA_GENERAL = "lemma_general"
+V2_INDUCTION_STEP = "induction_step"
 
 
 def _flag_enabled(name: str, default: str = "on") -> bool:
@@ -71,6 +78,8 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
         return "naive"
     if mode in ("zero_shot", "zeroshot"):
         return "zero_shot"
+    if mode in ("v2", "general_ind", "general_induction"):
+        return "v2"
     if mode in ("default", "ours", ""):
         return "default"
     return "default"
@@ -86,6 +95,13 @@ def resolve_prompt_pack(
     on each of two templates (2N total). Naive uses the single ``prompt_naive``
     template 2N times so the LLM-call budget matches. ``zero_shot`` currently
     uses the same ours pack as ``default`` (no separate prompt folder).
+
+    ``v2`` uses ``prompts_v2`` with ``lemma_general`` + ``induction_step``
+    (budget 2N). With ``PROMPT_RETARGET=off``, the loop stays on
+    ``lemma_general`` only (see ``no_retarget_prompt``). With retarget on,
+    the first attempt is always ``lemma_general``; HD then maps
+    deterministically to ``induction_step`` / ``lemma_general``, and
+    consecutive no-help flips the other template.
     """
     n = max(1, int(max_attempts_per_prompt) or 1)
     mode = normalize_strategy_mode(strategy_mode)
@@ -97,6 +113,18 @@ def resolve_prompt_pack(
             "strategies": strategies,
             "max_attempts_per_prompt": n,
             "total_attempts": n * 2,
+            "no_retarget_prompt": None,
+        }
+    if mode == "v2":
+        strategies = list(V2_PROMPT_STRATEGIES)
+        return {
+            "mode": mode,
+            "folder_path": "./prompts_v2",
+            "strategies": strategies,
+            "max_attempts_per_prompt": n,
+            "total_attempts": n * 2,
+            # Retarget off: never rotate onto induction_step via paper schedule.
+            "no_retarget_prompt": V2_LEMMA_GENERAL,
         }
     strategies = list(OURS_PROMPT_STRATEGIES)
     return {
@@ -105,6 +133,7 @@ def resolve_prompt_pack(
         "strategies": strategies,
         "max_attempts_per_prompt": n,
         "total_attempts": n * len(strategies),
+        "no_retarget_prompt": None,
     }
 
 

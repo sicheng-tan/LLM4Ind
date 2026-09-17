@@ -1248,7 +1248,11 @@ def hard_axioms_from_difficulty(
 
 
 def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
-    """Turn cvc5 failure signals into structured repair hints for the LLM."""
+    """Turn cvc5 failure signals into structured repair hints for the LLM.
+
+    Emits high_difficulty_assertions and need_rewrite. need_stronger_lemma and
+    generic timeout are intentionally disabled (commented) as misleading/noisy.
+    """
     if result.proved:
         return []
 
@@ -1298,24 +1302,27 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     q_activity = conj + skol + inst
 
     if q_activity > 0:
-        skol_per_conj = skol / max(conj, 1)
         matching = skol + inst
         inst_of_matching = inst / max(matching, 1)
-        if conj > 0 and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
-            hints.append({
-                "kind": "need_stronger_lemma",
-                "priority": 1,
-                "context": context,
-                "detail": (
-                    "Skolem/induction strengthening is low relative to conjecture-gen "
-                    "(skolem/conj ≤ 0.05). Likely missing a stronger inductive lemma."
-                ),
-                "strength": round(gate_overshoot(skol_per_conj, SKOLEM_PER_CONJ_MAX), 4),
-                "suggested_actions": [
-                    "Strengthen or generalize the goal into an inductive lemma",
-                    "Try associativity/commutativity/distributivity style facts",
-                ],
-            })
+        # Disabled: need_stronger_lemma — skolem/conj low is often "not instantiating"
+        # (bridge already present / needs :pattern), but the prompt text pushes the
+        # LLM to strengthen/generalize the whole goal and misleads retarget.
+        # skol_per_conj = skol / max(conj, 1)
+        # if conj > 0 and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
+        #     hints.append({
+        #         "kind": "need_stronger_lemma",
+        #         "priority": 1,
+        #         "context": context,
+        #         "detail": (
+        #             "Skolem/induction strengthening is low relative to conjecture-gen "
+        #             "(skolem/conj ≤ 0.05). Likely missing a stronger inductive lemma."
+        #         ),
+        #         "strength": round(gate_overshoot(skol_per_conj, SKOLEM_PER_CONJ_MAX), 4),
+        #         "suggested_actions": [
+        #             "Strengthen or generalize the goal into an inductive lemma",
+        #             "Try associativity/commutativity/distributivity style facts",
+        #         ],
+        #     })
         if skol > 0 and inst_of_matching < INST_OF_MATCHING_MAX:
             hints.append({
                 "kind": "need_rewrite",
@@ -1333,16 +1340,17 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                 ],
             })
 
-    if result.status in ("timeout", "unknown") and not hints:
-        hints.append({
-            "kind": "timeout",
-            "context": context,
-            "detail": "cvc5 timed out / returned unknown without clear difficulty signal.",
-            "suggested_actions": [
-                "Generate simpler lemmas close to the recursive definitions",
-                "Split the goal into smaller equational facts",
-            ],
-        })
+    # Disabled: generic timeout hint — low information; success/fail both emit it often.
+    # if result.status in ("timeout", "unknown") and not hints:
+    #     hints.append({
+    #         "kind": "timeout",
+    #         "context": context,
+    #         "detail": "cvc5 timed out / returned unknown without clear difficulty signal.",
+    #         "suggested_actions": [
+    #             "Generate simpler lemmas close to the recursive definitions",
+    #             "Split the goal into smaller equational facts",
+    #         ],
+    #     })
 
     return hints
 

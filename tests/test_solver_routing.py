@@ -261,6 +261,72 @@ def test_kind_signature_change_retargets_before_streak() -> None:
     _ok(why == "consecutive" and nxt == TERM_REWRITE_PROMPT and n == 0, (nxt, n, why))
 
 
+def test_v2_hd_sample_and_retarget() -> None:
+    from solver_routing import (
+        V2_INDUCTION_STEP,
+        V2_LEMMA_GENERAL,
+        V2_START_SIGNATURE,
+        retarget_v2_generation_prompt,
+        select_v2_generation_prompt,
+        v2_hd_signature,
+        v2_mode_from_hd,
+    )
+
+    strats = [V2_LEMMA_GENERAL, V2_INDUCTION_STEP]
+    _ok(v2_hd_signature([]) == "no_hd", "no hd")
+    _ok(
+        v2_hd_signature([{"kind": "high_difficulty_assertions"}]) == "hd",
+        "hd",
+    )
+    _ok(v2_mode_from_hd([]) == V2_LEMMA_GENERAL, "mode nohd")
+    _ok(
+        v2_mode_from_hd([{"kind": "high_difficulty_assertions"}]) == V2_INDUCTION_STEP,
+        "mode hd",
+    )
+
+    # First pick always lemma_general, even with HD present
+    hd = [{"kind": "high_difficulty_assertions"}]
+    pick = select_v2_generation_prompt(strats, hd)
+    _ok(pick == V2_LEMMA_GENERAL, pick)
+    pick = select_generation_prompt(strats, hd)
+    _ok(pick == V2_LEMMA_GENERAL, pick)
+
+    # From start sentinel + HD → induction (deterministic feedback)
+    nxt, n, sig, why = retarget_v2_generation_prompt(
+        strats, hd, V2_LEMMA_GENERAL, 1, V2_START_SIGNATURE
+    )
+    _ok(why == "kind" and nxt == V2_INDUCTION_STEP and sig == "hd" and n == 0, (why, nxt, sig, n))
+
+    # HD cleared → back to general
+    nxt, n, sig, why = retarget_v2_generation_prompt(
+        strats, [], V2_INDUCTION_STEP, 1, "hd"
+    )
+    _ok(why == "kind" and nxt == V2_LEMMA_GENERAL and sig == "no_hd", (why, nxt, sig))
+
+    # Same HD signature: consecutive flip
+    nxt, n, sig, why = retarget_v2_generation_prompt(
+        strats, hd, V2_INDUCTION_STEP, 2, "hd"
+    )
+    _ok(why == "consecutive" and nxt == V2_LEMMA_GENERAL and n == 0, (why, nxt, n))
+
+    nxt, n, sig, why = retarget_v2_generation_prompt(
+        strats, hd, V2_LEMMA_GENERAL, 2, "hd"
+    )
+    _ok(why == "consecutive" and nxt == V2_INDUCTION_STEP and n == 0, (why, nxt, n))
+
+    # Ours default pool unchanged
+    ours = [EQUATIONAL_PROMPT, TERM_REWRITE_PROMPT]
+    class _Fixed:
+        def __init__(self, x: float) -> None:
+            self.x = x
+
+        def random(self) -> float:
+            return self.x
+
+    pick = select_generation_prompt(ours, [{"kind": "need_rewrite"}], rng=_Fixed(0.0))
+    _ok(pick == TERM_REWRITE_PROMPT, pick)
+
+
 def test_prompt_mode_seed_replays_first_draw() -> None:
     import os
 
@@ -451,6 +517,7 @@ def main() -> int:
         test_both_kind_families_sample_by_overshoot,
         test_family_scores_floor_legacy_and_sum,
         test_kind_signature_change_retargets_before_streak,
+        test_v2_hd_sample_and_retarget,
         test_prompt_mode_seed_replays_first_draw,
         test_select_top_by_utility,
         test_utility_explosion_penalty,

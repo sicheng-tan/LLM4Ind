@@ -238,10 +238,12 @@ if __name__ == "__main__":
                        default="/home/ssdllm/ProofMate/preprocessed/all-int",
                        help='原始文件夹路径')
     parser.add_argument('--strategy-mode', type=str, 
-                       choices=['default', 'zero_shot', 'naive'],
+                       choices=['default', 'zero_shot', 'naive', 'v2'],
                        default='default',
                        help='提示词包: default/zero_shot 用 prompts_ours（等式+重写各 N 次）; '
-                            'naive 只用 prompt_naive 重复 2N 次，并关闭 prompt 模板选择')
+                            'naive 只用 prompt_naive 重复 2N 次; '
+                            'v2 用 prompts_v2（lemma_general+induction_step；'
+                            'PROMPT_RETARGET=off 时固定 lemma_general）')
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')

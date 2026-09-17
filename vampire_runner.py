@@ -911,6 +911,10 @@ def compute_progress_score(
 def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[dict]:
     """
     Turn Vampire failure signals into structured repair hints for the next LLM prompt.
+
+    Keeps induction_stuck (focus/schemas), need_rewrite, need_arithmetic_lemma,
+    and need_directed_rewrite. need_induction_lemma, induction_depth_limit, and
+    generic timeout are intentionally disabled (commented) as misleading/noisy.
     """
     hints: List[dict] = []
     stats = result.stats
@@ -954,7 +958,6 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
 
     # One mix inequality per hint. Both may fire; rewrite first.
     if mix > 0:
-        ind_share = ind / mix
         rewrite_per_ind = dem / max(ind, 1)
         if ind > 0 and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
             hints.append({
@@ -973,22 +976,25 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                     "Prefer lemmas whose LHS matches a subterm of the proof goal",
                 ],
             })
-        if ind_share < INDUCTION_SHARE_MAX and not arithmetic_dominant:
-            hints.append({
-                "kind": "need_induction_lemma",
-                "priority": 2,
-                "context": context,
-                "detail": (
-                    "Induction (structural and integer-interval) is a small share of "
-                    f"Vampire activity (<{int(INDUCTION_SHARE_MAX * 100)}%). Try a "
-                    "stronger inductive lemma (generalization / strengthen conclusion)."
-                ),
-                "strength": round(gate_overshoot(ind_share, INDUCTION_SHARE_MAX), 4),
-                "suggested_actions": [
-                    "Strengthen or generalize the goal into an inductive lemma",
-                    "Introduce an accumulator / helper-function identity if applicable",
-                ],
-            })
+        # Disabled: need_induction_lemma — same "strengthen/generalize the goal"
+        # narrative as CVC need_stronger_lemma.
+        # ind_share = ind / mix
+        # if ind_share < INDUCTION_SHARE_MAX and not arithmetic_dominant:
+        #     hints.append({
+        #         "kind": "need_induction_lemma",
+        #         "priority": 2,
+        #         "context": context,
+        #         "detail": (
+        #             "Induction (structural and integer-interval) is a small share of "
+        #             f"Vampire activity (<{int(INDUCTION_SHARE_MAX * 100)}%). Try a "
+        #             "stronger inductive lemma (generalization / strengthen conclusion)."
+        #         ),
+        #         "strength": round(gate_overshoot(ind_share, INDUCTION_SHARE_MAX), 4),
+        #         "suggested_actions": [
+        #             "Strengthen or generalize the goal into an inductive lemma",
+        #             "Introduce an accumulator / helper-function identity if applicable",
+        #         ],
+        #     })
 
     if arithmetic_dominant:
         int_share = int_ind / ind
@@ -1030,36 +1036,39 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             ],
         })
 
-    depth = int(stats.get("MaxInductionDepth", 0) or 0)
-    if (
-        depth >= MAX_INDUCTION_DEPTH_HINT
-        and result.status in ("timeout", "incomplete", "unknown")
-        and ind > 0
-    ):
-        hints.append({
-            "kind": "induction_depth_limit",
-            "context": context,
-            "detail": (
-                f"Vampire repeatedly reached induction depth {depth} without finishing. "
-                "Strengthen or generalize the inductive lemma rather than searching deeper."
-            ),
-            "strength": round(min(1.0, depth / 4.0), 4),
-            "suggested_actions": [
-                "Generate a stronger generalized lemma or an auxiliary invariant",
-                "Introduce an accumulator / helper-function identity if applicable",
-            ],
-        })
+    # Disabled: induction_depth_limit — depth signal can later drive scheduling
+    # (stop deepening / invariant), but prompt text again says strengthen/generalize.
+    # depth = int(stats.get("MaxInductionDepth", 0) or 0)
+    # if (
+    #     depth >= MAX_INDUCTION_DEPTH_HINT
+    #     and result.status in ("timeout", "incomplete", "unknown")
+    #     and ind > 0
+    # ):
+    #     hints.append({
+    #         "kind": "induction_depth_limit",
+    #         "context": context,
+    #         "detail": (
+    #             f"Vampire repeatedly reached induction depth {depth} without finishing. "
+    #             "Strengthen or generalize the inductive lemma rather than searching deeper."
+    #         ),
+    #         "strength": round(min(1.0, depth / 4.0), 4),
+    #         "suggested_actions": [
+    #             "Generate a stronger generalized lemma or an auxiliary invariant",
+    #             "Introduce an accumulator / helper-function identity if applicable",
+    #         ],
+    #     })
 
-    if result.status == "timeout" and not hints:
-        hints.append({
-            "kind": "timeout",
-            "context": context,
-            "detail": "Vampire timed out without a clear induction/rewrite signal.",
-            "suggested_actions": [
-                "Generate simpler lemmas closer to the recursive definitions",
-                "Split the goal into smaller equational facts",
-            ],
-        })
+    # Disabled: generic timeout hint — low information noise.
+    # if result.status == "timeout" and not hints:
+    #     hints.append({
+    #         "kind": "timeout",
+    #         "context": context,
+    #         "detail": "Vampire timed out without a clear induction/rewrite signal.",
+    #         "suggested_actions": [
+    #             "Generate simpler lemmas closer to the recursive definitions",
+    #             "Split the goal into smaller equational facts",
+    #         ],
+    #     })
 
     return hints
 
