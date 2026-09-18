@@ -1257,7 +1257,7 @@ def test_prompt_invalid_not_unproved_and_drops_child_atp() -> None:
                 "suggested_actions": ["weaken"],
             },
             {
-                "kind": "need_induction_lemma",
+                "kind": "need_arithmetic_lemma",
                 "context": "subgoal:template_1",
                 "detail": "child induction",
                 "suggested_actions": [],

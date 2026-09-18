@@ -86,11 +86,11 @@ def test_cvc5_static_and_hint_routing() -> None:
     ranked, _ = recommend_cvc5_profiles(adt)
     _ok(ranked[0] == "adt_structural", ranked)
 
-    ranked_e, reasons = recommend_cvc5_profiles(
-        adt, [{"kind": "search_explosion"}]
+    ranked_r, reasons = recommend_cvc5_profiles(
+        adt, [{"kind": "need_rewrite"}]
     )
-    _ok(ranked_e[0] in ("controlled_conjecture", "cvc5_inductive_no_ematching"), ranked_e)
-    _ok(any("explosion" in r for r in reasons), reasons)
+    _ok(ranked_r[0] in ("cvc5_inductive_no_ematching", "cvc5_simple"), ranked_r)
+    _ok(any("need_rewrite" in r for r in reasons), reasons)
 
     for name in (
         "cvc5_simple",
@@ -98,21 +98,26 @@ def test_cvc5_static_and_hint_routing() -> None:
         "cvc5_inductive_no_ematching",
         "cvc4_default",
     ):
-        _ok(name in ranked_e, f"paper fallback missing {name}")
+        _ok(name in ranked_r, f"paper fallback missing {name}")
 
 
 def test_prompt_reorder_keeps_all() -> None:
     strats = ["prove_prompt_equational_reasoning", "prove_prompt_term_rewrite"]
-    out = order_prompt_strategies(strats, [{"kind": "need_stronger_lemma"}])
+    out = order_prompt_strategies(strats, [{"kind": "need_arithmetic_lemma"}])
     _ok(out[0] == "prove_prompt_equational_reasoning", out)
     _ok(set(out) == set(strats), "must not drop prompts")
     out2 = order_prompt_strategies(strats, [{"kind": "need_rewrite"}])
     _ok(out2[0] == "prove_prompt_term_rewrite", out2)
     both = order_prompt_strategies(
         strats,
-        [{"kind": "need_stronger_lemma"}, {"kind": "need_rewrite"}],
+        [{"kind": "need_arithmetic_lemma"}, {"kind": "need_rewrite"}],
     )
     _ok(both == strats, f"both families keep paper order for sampling: {both}")
+    # CVC consecutive-only: hint_guided=False keeps paper order even for rewrite.
+    fixed = order_prompt_strategies(
+        strats, [{"kind": "need_rewrite"}], hint_guided=False
+    )
+    _ok(fixed == strats, fixed)
 
 
 def test_generation_prompt_start_and_switch() -> None:
@@ -122,14 +127,21 @@ def test_generation_prompt_start_and_switch() -> None:
         "no hints keep paper order",
     )
     _ok(
-        select_generation_prompt(strats, [{"kind": "need_stronger_lemma"}])
+        select_generation_prompt(strats, [{"kind": "need_arithmetic_lemma"}])
         == "prove_prompt_equational_reasoning",
-        "stronger/generalize hints start on equational",
+        "arithmetic/generalize hints start on equational",
     )
     _ok(
         select_generation_prompt(strats, [{"kind": "need_rewrite"}])
         == "prove_prompt_term_rewrite",
         "rewrite hints start on term rewrite",
+    )
+    _ok(
+        select_generation_prompt(
+            strats, [{"kind": "need_rewrite"}], hint_guided=False
+        )
+        == "prove_prompt_equational_reasoning",
+        "hint_guided=False ignores rewrite family",
     )
 
     cur, n, switched = advance_generation_prompt(
@@ -153,7 +165,7 @@ def test_both_kind_families_sample_by_overshoot() -> None:
     strats = ["prove_prompt_equational_reasoning", "prove_prompt_term_rewrite"]
     _ok(term_rewrite_sample_prob([{"kind": "need_rewrite", "strength": 0.4}]) is None, "one family")
     hints = [
-        {"kind": "need_stronger_lemma", "strength": 0.9},
+        {"kind": "need_arithmetic_lemma", "strength": 0.9},
         {"kind": "need_rewrite", "strength": 0.1},
     ]
     p = term_rewrite_sample_prob(hints)
@@ -192,33 +204,37 @@ def test_family_scores_floor_legacy_and_sum() -> None:
     _ok(abs(rewrite - 0.05) < 1e-9 and generalize == 0.0, (rewrite, generalize))
 
     rewrite, generalize = prompt_family_scores(
-        [{"kind": "need_rewrite"}, {"kind": "need_stronger_lemma"}]
+        [{"kind": "need_rewrite"}, {"kind": "need_arithmetic_lemma"}]
     )
     _ok(abs(rewrite - 1.0) < 1e-9 and abs(generalize - 1.0) < 1e-9, (rewrite, generalize))
     p = term_rewrite_sample_prob(
-        [{"kind": "need_rewrite"}, {"kind": "need_stronger_lemma"}]
+        [{"kind": "need_rewrite"}, {"kind": "need_arithmetic_lemma"}]
     )
     _ok(p is not None and abs(p - 0.5) < 1e-9, p)
 
     rewrite, generalize = prompt_family_scores([
         {"kind": "need_rewrite", "strength": 0.4},
         {"kind": "induction_stuck", "strength": 0.5},
-        {"kind": "need_induction_lemma", "strength": 0.2},
+        {"kind": "need_arithmetic_lemma", "strength": 0.2},
     ])
     _ok(abs(rewrite - 0.9) < 1e-9, rewrite)
     _ok(abs(generalize - 0.2) < 1e-9, generalize)
     p = term_rewrite_sample_prob([
         {"kind": "need_rewrite", "strength": 0.4},
         {"kind": "induction_stuck", "strength": 0.5},
-        {"kind": "need_induction_lemma", "strength": 0.2},
+        {"kind": "need_arithmetic_lemma", "strength": 0.2},
     ])
     _ok(p is not None and abs(p - 0.9 / 1.1) < 1e-9, p)
 
+    # Disabled kinds (need_induction_lemma / induction_depth_limit) must not
+    # contribute to either prompt family.
     rewrite, generalize = prompt_family_scores([
         {"kind": "need_directed_rewrite", "strength": 0.3},
+        {"kind": "need_induction_lemma", "strength": 0.2},
         {"kind": "induction_depth_limit", "strength": 0.5},
+        {"kind": "need_stronger_lemma", "strength": 0.9},
     ])
-    _ok(abs(rewrite - 0.3) < 1e-9 and abs(generalize - 0.5) < 1e-9, (rewrite, generalize))
+    _ok(abs(rewrite - 0.3) < 1e-9 and generalize == 0.0, (rewrite, generalize))
 
 
 def test_kind_signature_change_retargets_before_streak() -> None:
@@ -226,7 +242,7 @@ def test_kind_signature_change_retargets_before_streak() -> None:
     _ok(prompt_kind_signature([]) == "none", "empty")
     nxt, n, sig, why = retarget_generation_prompt(
         strats,
-        [{"kind": "need_stronger_lemma"}],
+        [{"kind": "need_arithmetic_lemma"}],
         EQUATIONAL_PROMPT,
         1,
         "none",
@@ -244,7 +260,7 @@ def test_kind_signature_change_retargets_before_streak() -> None:
 
     nxt, n, sig, why = retarget_generation_prompt(
         strats,
-        [{"kind": "need_stronger_lemma"}],
+        [{"kind": "need_arithmetic_lemma"}],
         EQUATIONAL_PROMPT,
         1,
         "generalize",
@@ -253,13 +269,32 @@ def test_kind_signature_change_retargets_before_streak() -> None:
 
     nxt, n, sig, why = retarget_generation_prompt(
         strats,
-        [{"kind": "need_stronger_lemma"}],
+        [{"kind": "need_arithmetic_lemma"}],
         EQUATIONAL_PROMPT,
         2,
         "generalize",
     )
     _ok(why == "consecutive" and nxt == TERM_REWRITE_PROMPT and n == 0, (nxt, n, why))
 
+    # CVC consecutive-only: rewrite kind must not retarget before streak.
+    nxt, n, sig, why = retarget_generation_prompt(
+        strats,
+        [{"kind": "need_rewrite"}],
+        EQUATIONAL_PROMPT,
+        1,
+        "none",
+        hint_guided=False,
+    )
+    _ok(why == "keep" and nxt == EQUATIONAL_PROMPT and n == 1 and sig == "none", (nxt, n, sig, why))
+    nxt, n, sig, why = retarget_generation_prompt(
+        strats,
+        [{"kind": "need_rewrite"}],
+        EQUATIONAL_PROMPT,
+        2,
+        "none",
+        hint_guided=False,
+    )
+    _ok(why == "consecutive" and nxt == TERM_REWRITE_PROMPT and n == 0, (nxt, n, why))
 
 def test_v2_hd_sample_and_retarget() -> None:
     from solver_routing import (
@@ -332,7 +367,7 @@ def test_prompt_mode_seed_replays_first_draw() -> None:
 
     strats = [EQUATIONAL_PROMPT, TERM_REWRITE_PROMPT]
     hints = [
-        {"kind": "need_stronger_lemma", "strength": 0.6},
+        {"kind": "need_arithmetic_lemma", "strength": 0.6},
         {"kind": "need_rewrite", "strength": 0.4},
     ]
     reset_prompt_mode_rng()

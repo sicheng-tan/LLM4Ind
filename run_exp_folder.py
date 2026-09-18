@@ -244,12 +244,21 @@ if __name__ == "__main__":
                             'naive 只用 prompt_naive 重复 2N 次; '
                             'v2 用 prompts_v2（lemma_general+induction_step；'
                             'PROMPT_RETARGET=off 时固定 lemma_general）')
+    parser.add_argument(
+        '--cvc-patterns',
+        choices=['on', 'off'],
+        default=None,
+        help='CVC 公理注入是否加 :pattern（与 --strategy-mode 正交）。'
+             '默认跟环境变量 CVC_PATTERNS（未设则为 off）',
+    )
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')
     add_skip_file_argument(parser)
     args = parser.parse_args()
-    
+
+    from exp_flags import apply_cvc_patterns_cli, cvc_patterns_enabled
+    apply_cvc_patterns_cli(args.cvc_patterns)    
     # 设置多进程启动方法（在某些系统上需要）
     multiprocessing.set_start_method('spawn', force=True)
     # 使用命令行参数设置原始文件夹路径
@@ -289,6 +298,7 @@ if __name__ == "__main__":
         print(f"📝 策略模式: {args.strategy_mode}")
         if args.strategy_mode == "naive":
             print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
+        print(f"📎 CVC patterns: {'on' if cvc_patterns_enabled() else 'off'}")
     
     # 存储所有结果
     results = []

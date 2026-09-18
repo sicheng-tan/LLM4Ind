@@ -24,15 +24,14 @@ LIBRARY_END = "; proved lemma library end"
 
 NORMAL_KIND = "obligation_tree"
 
+# Kinds still emitted by derive_repair_hints and shown on the obligation tree.
+# Disabled / misleading kinds (need_stronger_lemma, need_induction_lemma,
+# induction_depth_limit, timeout, search_explosion-as-hint) are omitted.
 GUIDANCE_HINT_KINDS = (
     "need_rewrite",
     "need_directed_rewrite",
     "induction_stuck",
-    "need_induction_lemma",
-    "need_stronger_lemma",
     "need_arithmetic_lemma",
-    "search_explosion",
-    "induction_depth_limit",
     "high_difficulty_assertions",
 )
 
@@ -247,8 +246,19 @@ def add_proved_lemma(
         return lib_id
 
 
-def inject_library_axioms(smt_content: str, lemmas: Sequence[dict]) -> str:
-    """Insert proved lemmas as axioms just before the proof-goal block."""
+def inject_library_axioms(
+    smt_content: str,
+    lemmas: Sequence[dict],
+    *,
+    add_patterns: bool = False,
+) -> str:
+    """Insert proved lemmas as axioms just before the proof-goal block.
+
+    When ``add_patterns`` is set (v2 CVC only), directed equalities get a
+    ``:pattern`` on the LHS for E-matching. Subgoal SMT stays bare.
+    """
+    from smt_patterns import format_assert_line
+
     stripped = re.sub(
         rf"{re.escape(LIBRARY_BEGIN)}.*?{re.escape(LIBRARY_END)}\n?",
         "",
@@ -264,7 +274,7 @@ def inject_library_axioms(smt_content: str, lemmas: Sequence[dict]) -> str:
         if not formula:
             continue
         lines.append(f"; {lib_id}")
-        lines.append(f"(assert {formula})")
+        lines.append(format_assert_line(formula, add_pattern=add_patterns))
     lines.append(LIBRARY_END)
     block = "\n".join(lines) + "\n"
     marker = "; proof goal"
@@ -274,7 +284,12 @@ def inject_library_axioms(smt_content: str, lemmas: Sequence[dict]) -> str:
     return block + stripped
 
 
-def materialize_smt_with_library(smt_path: Path, base_path: str) -> Path:
+def materialize_smt_with_library(
+    smt_path: Path,
+    base_path: str,
+    *,
+    add_patterns: bool = False,
+) -> Path:
     """Write a sibling SMT file that includes the lemma library, if any."""
     if not lemma_library_enabled():
         return smt_path
@@ -282,18 +297,28 @@ def materialize_smt_with_library(smt_path: Path, base_path: str) -> Path:
     if not lemmas:
         return smt_path
     content = inject_library_axioms(
-        smt_path.read_text(encoding="utf-8"), lemmas
+        smt_path.read_text(encoding="utf-8"),
+        lemmas,
+        add_patterns=add_patterns,
     )
     out = smt_path.with_name(smt_path.stem + ".__lib.smt2")
     out.write_text(content, encoding="utf-8")
     return out
 
 
-def solver_smt_content(smt_content: str, base_path: Optional[str]) -> str:
+def solver_smt_content(
+    smt_content: str,
+    base_path: Optional[str],
+    *,
+    add_patterns: bool = False,
+) -> str:
     if not base_path or not lemma_library_enabled():
         return smt_content
-    return inject_library_axioms(smt_content, load_lemma_library(base_path))
-
+    return inject_library_axioms(
+        smt_content,
+        load_lemma_library(base_path),
+        add_patterns=add_patterns,
+    )
 
 def classify_failed_attempt(extracted: Sequence[str], failed_data: dict) -> str:
     if not extracted:

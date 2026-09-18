@@ -244,11 +244,20 @@ if __name__ == "__main__":
                             'naive 只用 prompt_naive 重复 2N 次; '
                             'v2 用 prompts_v2（lemma_general+induction_step；'
                             'PROMPT_RETARGET=off 时固定 lemma_general）')
+    parser.add_argument(
+        '--cvc-patterns',
+        choices=['on', 'off'],
+        default=None,
+        help='CVC 公理 :pattern 开关（Vampire 忽略）。默认跟 CVC_PATTERNS 环境变量（未设 off）',
+    )
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')
     add_skip_file_argument(parser)
     args = parser.parse_args()
+
+    from exp_flags import apply_cvc_patterns_cli
+    apply_cvc_patterns_cli(args.cvc_patterns)
     
     # 设置多进程启动方法（在某些系统上需要）
     multiprocessing.set_start_method('spawn', force=True)

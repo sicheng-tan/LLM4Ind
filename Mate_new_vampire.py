@@ -2610,7 +2610,7 @@ def _prove_run_body(
 
     # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
     # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
-    # (ours only): hint family picks the template. With retarget off: paper
+    # (Vampire): hint family picks the template. With retarget off: paper
     # order, N attempts per template. v2 + retarget off: always lemma_general.
     for attempt in range(total_attempts):
         if not retarget:

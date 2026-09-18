@@ -82,6 +82,11 @@ def llm_selector_enabled() -> bool:
     return routing_decider_mode() == "llm"
 
 
+def _hint_guided_prompts(backend: str) -> bool:
+    """Vampire keeps hint-family prompt order; CVC5 uses paper / consecutive only."""
+    return backend == "vampire"
+
+
 def choose_joint_action(
     *,
     llm: Any,
@@ -111,6 +116,7 @@ def choose_joint_action(
 
     if routing_decider_mode() != "llm":
         profile, prompt = _select_relative_pair(
+            backend=backend,
             profiles=profiles,
             prompts=prompts,
             hints=hints,
@@ -157,7 +163,9 @@ def choose_joint_action(
         if prompt not in prompts:
             # Prompt selection is optional for compatibility with profile-only
             # selectors.  Use the deterministic feedback choice.
-            prompt = order_prompt_strategies(prompts, hints)[0]
+            prompt = order_prompt_strategies(
+                prompts, hints, hint_guided=_hint_guided_prompts(backend)
+            )[0]
         if confidence < _minimum_confidence():
             raise ValueError(f"confidence below threshold: {confidence:.2f}")
         return RoutingDecision(
@@ -251,7 +259,9 @@ def _fallback_decision(
     *,
     error: str,
 ) -> RoutingDecision:
-    ordered = order_prompt_strategies(prompts, hints)
+    ordered = order_prompt_strategies(
+        prompts, hints, hint_guided=_hint_guided_prompts(backend)
+    )
     return RoutingDecision(
         backend=backend,
         profile=profiles[0],
@@ -265,6 +275,7 @@ def _fallback_decision(
 
 def _select_relative_pair(
     *,
+    backend: str,
     profiles: Sequence[str],
     prompts: Sequence[str],
     hints: Sequence[dict],
@@ -278,7 +289,9 @@ def _select_relative_pair(
     Pair history is not scored; a failed combo is skipped once, errors more so.
     """
     del current_profile, current_prompt
-    ordered_prompts = order_prompt_strategies(prompts, hints)
+    ordered_prompts = order_prompt_strategies(
+        prompts, hints, hint_guided=_hint_guided_prompts(backend)
+    )
     last_failed: Optional[tuple[str, str]] = None
     for item in reversed(list(history)):
         prompt = item.get("prompt_strategy") or ""

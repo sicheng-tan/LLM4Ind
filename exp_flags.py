@@ -13,7 +13,7 @@ ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 _OFF_VALUES = frozenset({"0", "off", "false", "no"})
 
@@ -66,6 +66,32 @@ def ancestor_cycle_filter_enabled() -> bool:
 def ancestor_prompt_enabled() -> bool:
     """Inject PROOF PATH GOALS (CURRENT + strict ancestors) into the user prompt."""
     return _flag_enabled("ANCESTOR_PROMPT")
+
+
+def cvc_patterns_enabled() -> bool:
+    """Attach CVC ``:pattern`` on axiom inject when feedback triggers fire.
+
+    Independent of ``--strategy-mode`` (works with default / naive / v2 / …).
+    Default **off**; enable with ``CVC_PATTERNS=on`` or ``--cvc-patterns on``.
+    Vampire ignores this (no SMT ``:pattern``).
+    """
+    return _flag_enabled("CVC_PATTERNS", default="off")
+
+
+def resolve_cvc_patterns_enabled(override: Optional[bool] = None) -> bool:
+    """CLI/prove_run override, else ``CVC_PATTERNS`` env (default off)."""
+    if override is not None:
+        return bool(override)
+    return cvc_patterns_enabled()
+
+
+def apply_cvc_patterns_cli(value: Optional[str]) -> None:
+    """Set ``CVC_PATTERNS`` from ``--cvc-patterns on|off`` (None = leave env)."""
+    if value is None:
+        return
+    os.environ["CVC_PATTERNS"] = "on" if str(value).strip().lower() in (
+        "on", "1", "true", "yes",
+    ) else "off"
 
 
 # Fail-fast / child-budget switches live in lemma_gates.py (same default-on

@@ -42,6 +42,15 @@ INST_OF_MATCHING_MAX = 0.75
 CONJ_SHARE_MIN = 0.25
 INST_PER_SKOLEM_MAX = 10.0
 SKOLEM_SHARE_MIN = 0.01
+# Pattern gate: E-matching per conjecture below this ⇒ matching-poor (hard).
+EMATCHING_PER_CONJ_MAX = 5.0
+# Softer bar used only with usefulness timeout (transitional).
+EMATCHING_PER_CONJ_SOFT = 15.0
+# Pattern gate: E-matching per conjecture-gen (lower ⇒ matching starved).
+# full706 baseline_diag: p10≈2.1, p25≈8.3, median≈29 — 5.0 is selective.
+EMATCHING_PER_CONJ_MAX = 5.0
+# Softer bar only when usefulness already timed out (transitional).
+EMATCHING_PER_CONJ_SOFT_MAX = 10.0
 
 # In-problem difficulty: keep assertions at/above this percentile of positive scores.
 HARD_AXIOM_PERCENTILE = 0.50

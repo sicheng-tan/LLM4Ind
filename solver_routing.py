@@ -97,15 +97,12 @@ CVC5_PROMPT_GUIDANCE = {
 }
 
 # Rewrite-family hints → term_rewrite template (matching / demodulation lemmas).
-# Generalize-family hints → equational template (induction-case bridges / stronger IH).
+# Generalize-family hints → equational template (induction-case bridges).
+# Only kinds still emitted by derive_repair_hints belong here. Disabled /
+# misleading kinds (need_stronger_lemma, need_induction_lemma,
+# induction_depth_limit, timeout, search_explosion) are intentionally absent.
 _REWRITE_HINTS = {"need_rewrite", "induction_stuck", "need_directed_rewrite"}
-_GENERALIZE_HINTS = {
-    "need_induction_lemma",
-    "need_stronger_lemma",
-    "need_arithmetic_lemma",
-    "induction_depth_limit",
-}
-_EXPLOSION_HINTS = {"search_explosion", "timeout"}
+_GENERALIZE_HINTS = {"need_arithmetic_lemma"}
 
 EQUATIONAL_PROMPT = "prove_prompt_equational_reasoning"
 TERM_REWRITE_PROMPT = "prove_prompt_term_rewrite"
@@ -229,18 +226,9 @@ def recommend_vampire_profiles(
     if "need_arithmetic_lemma" in kinds:
         _boost(ranked, ["alasca_arith", "integer_induction", "smtcomp"])
         reasons.append("hint:need_arithmetic_lemma")
-    if kinds & _EXPLOSION_HINTS:
-        _boost(ranked, ["struct_induction", "struct_single"])
-        reasons.append("hint:search_explosion_or_timeout")
     if kinds & _REWRITE_HINTS:
         _boost(ranked, ["struct_induction", "induction_portfolio"])
         reasons.append("hint:need_rewrite_or_induction_stuck")
-    if "need_induction_lemma" in kinds or "induction_depth_limit" in kinds:
-        _boost(ranked, ["induction_portfolio", "struct_induction"])
-        if "need_induction_lemma" in kinds:
-            reasons.append("hint:need_induction_lemma")
-        if "induction_depth_limit" in kinds:
-            reasons.append("hint:induction_depth_limit")
 
     if parent_profile:
         _boost(ranked, [parent_profile])
@@ -278,12 +266,6 @@ def recommend_cvc5_profiles(
     if "need_rewrite" in kinds:
         _boost(ranked, ["cvc5_inductive_no_ematching", "cvc5_simple"])
         reasons.append("hint:need_rewrite")
-    if "need_stronger_lemma" in kinds:
-        _boost(ranked, ["cvc5_inductive", "adt_structural", "integer_recursive"])
-        reasons.append("hint:need_stronger_lemma")
-    if kinds & _EXPLOSION_HINTS or "search_explosion" in kinds:
-        _boost(ranked, ["controlled_conjecture", "cvc5_inductive_no_ematching"])
-        reasons.append("hint:search_explosion_or_timeout")
     if "high_difficulty_assertions" in kinds and features.has_adt:
         _boost(ranked, ["adt_structural", "cvc5_inductive"])
         reasons.append("hint:high_difficulty_assertions")
@@ -592,10 +574,11 @@ def _relative_profile_utility(
 def preferred_prompt_for_hints(hints: Sequence[dict]) -> Optional[str]:
     """Template that matches a single hint family, or None if mixed / empty.
 
-    Rewrite-family kinds ask for lemmas that fire matching and demodulation;
-    that is ``prove_prompt_term_rewrite``. Generalize / induction-family kinds
-    ask for induction-case bridges and stronger IHs; that is
-    ``prove_prompt_equational_reasoning``.
+    Used for Vampire (and any ``hint_guided`` caller). CVC5 default retarget
+    passes ``hint_guided=False`` and ignores this.
+
+    Rewrite-family kinds → ``prove_prompt_term_rewrite``.
+    Generalize-family kinds → ``prove_prompt_equational_reasoning``.
     """
     kinds = set(hint_kinds(hints))
     has_generalize = bool(kinds & _GENERALIZE_HINTS)
@@ -610,12 +593,17 @@ def preferred_prompt_for_hints(hints: Sequence[dict]) -> Optional[str]:
 def order_prompt_strategies(
     strategies: Sequence[str],
     hints: Sequence[dict],
+    *,
+    hint_guided: bool = True,
 ) -> List[str]:
     """Reorder the paper prompt pool; never drop a strategy.
 
     One hint family: that family's template goes first. Both families: keep
     the given order — ``select_generation_prompt`` samples instead.
+    With ``hint_guided=False`` (CVC5), keep the given paper order.
     """
+    if not hint_guided:
+        return list(strategies)
     prefer = preferred_prompt_for_hints(hints)
     if not prefer:
         return list(strategies)
@@ -793,6 +781,7 @@ def select_generation_prompt(
     hints: Sequence[dict],
     *,
     rng: Optional[random.Random] = None,
+    hint_guided: bool = True,
 ) -> str:
     """Starting LLM template from existing repair-hint kinds.
 
@@ -801,14 +790,19 @@ def select_generation_prompt(
     P(term_rewrite) = rewrite_strength / (generalize + rewrite), using
     mix-gate overshoot stored on each hint. Does not drop a strategy from the pool.
 
+    With ``hint_guided=False`` (CVC5 default), ignore repair-hint families and
+    keep the paper / v2 start order.
+
     For the v2 pack (``lemma_general`` / ``induction_step``), always start on
-    ``lemma_general``; HD only affects later retarget.
+    ``lemma_general``; HD only affects later retarget when ``hint_guided``.
     """
     pool = [s for s in strategies if s]
     if not pool:
         return ""
     if _pool_is_v2(pool):
         return select_v2_generation_prompt(pool, hints, rng=rng)
+    if not hint_guided:
+        return pool[0]
     p_rewrite = term_rewrite_sample_prob(hints)
     if p_rewrite is None:
         return order_prompt_strategies(pool, hints)[0]
@@ -859,18 +853,30 @@ def retarget_generation_prompt(
     *,
     rng: Optional[random.Random] = None,
     switch_after: int = NO_HELP_PROMPT_SWITCH,
+    hint_guided: bool = True,
 ) -> Tuple[str, int, str, str]:
     """After a no-help attempt, maybe change the generation template.
 
     - Kind family set changed: re-run one-family kind pick or both-family sample.
     - Same family set: only consecutive empty/invalid/useless can toggle.
 
-    For v2 packs, HD bit changes map deterministically to induction_step /
-    lemma_general; consecutive no-help still toggles with no per-node flip cap.
+    With ``hint_guided=False`` (CVC5 default), only consecutive empty/invalid/
+    useless toggles; repair-hint / HD kind changes are ignored.
+
+    For v2 packs (when ``hint_guided``), HD bit changes map deterministically
+    to induction_step / lemma_general; consecutive no-help still toggles with
+    no per-node flip cap.
 
     Returns (prompt, consecutive_no_help, signature, reason)
     with reason in ``kind`` / ``consecutive`` / ``keep``.
     """
+    if not hint_guided:
+        nxt, consecutive_no_help, switched = advance_generation_prompt(
+            strategies, current, consecutive_no_help, switch_after=switch_after
+        )
+        if switched:
+            return nxt, consecutive_no_help, "none", "consecutive"
+        return current, consecutive_no_help, "none", "keep"
     if _pool_is_v2(strategies):
         return retarget_v2_generation_prompt(
             strategies,

@@ -1,0 +1,197 @@
+"""Tests for CVC ``:pattern`` helpers and gating (any strategy mode)."""
+
+from __future__ import annotations
+
+import os
+
+from smt_patterns import (
+    equality_lhs,
+    format_assert_line,
+    has_directed_equality,
+    infer_trigger_pattern,
+    should_add_cvc_patterns,
+    strip_bang_attrs,
+    v2_pattern_features,
+    v2_should_add_cvc_patterns,
+)
+from obligation_tree import inject_library_axioms
+from exp_flags import apply_cvc_patterns_cli, cvc_patterns_enabled
+
+
+def _ok(cond: bool, msg: str = "") -> None:
+    assert cond, msg
+
+
+def test_infer_pattern_on_directed_eq() -> None:
+    f = "(forall ((x Bin) (y Bin)) (= (plus (s x) y) (s (plus x y))))"
+    _ok(has_directed_equality(f), "directed")
+    _ok(equality_lhs(f) == "(plus (s x) y)", equality_lhs(f))
+    _ok(infer_trigger_pattern(f) == "((plus (s x) y))", infer_trigger_pattern(f))
+    line = format_assert_line(f, add_pattern=True)
+    _ok(line.startswith("(assert (! "), line)
+    _ok(":pattern ((plus (s x) y))" in line, line)
+    bare = format_assert_line(f, add_pattern=False)
+    _ok(bare == f"(assert {f})", bare)
+
+
+def test_pattern_skips_var_eq_and_implications() -> None:
+    _ok(not has_directed_equality("(forall ((x Nat)) (= x x))"))
+    f = "(forall ((x Nat)) (=> (P x) (= (f x) (g x))))"
+    _ok(has_directed_equality(f), f)
+    _ok(infer_trigger_pattern(f) == "((f x))", infer_trigger_pattern(f))
+
+
+def test_strip_bang_attrs() -> None:
+    raw = "(! (forall ((x Nat)) (= (f x) x)) :pattern ((f x)))"
+    _ok(strip_bang_attrs(raw) == "(forall ((x Nat)) (= (f x) x))", strip_bang_attrs(raw))
+
+
+def test_inject_library_with_patterns() -> None:
+    smt = """(set-logic ALL)
+; proof goal
+(assert (not true))
+; proof goal end
+"""
+    formula = "(forall ((x Nat)) (= (plus x zero) x))"
+    out = inject_library_axioms(
+        smt,
+        [{"id": "lib_1", "formula": formula}],
+        add_patterns=True,
+    )
+    _ok("(assert (! (forall ((x Nat)) (= (plus x zero) x)) :pattern ((plus x zero)))" in out, out)
+    bare = inject_library_axioms(
+        smt,
+        [{"id": "lib_1", "formula": formula}],
+        add_patterns=False,
+    )
+    _ok(f"(assert {formula})" in bare, bare)
+    _ok(":pattern" not in bare, bare)
+
+
+def test_pattern_gate_requires_flag() -> None:
+    eq = "(forall ((x Nat)) (= (f x) x))"
+    failed = {"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]}
+    prev = os.environ.pop("CVC_PATTERNS", None)
+    try:
+        _ok(not cvc_patterns_enabled())
+        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
+        _ok(
+            should_add_cvc_patterns(
+                failed_data=failed, formulas=[eq], enabled=True,
+            )
+        )
+        _ok(
+            v2_should_add_cvc_patterns(
+                strategy_mode="default",
+                failed_data=failed,
+                formulas=[eq],
+                enabled=True,
+            )
+        )
+        apply_cvc_patterns_cli("on")
+        _ok(cvc_patterns_enabled())
+        _ok(should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
+        apply_cvc_patterns_cli("off")
+        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
+        _ok(
+            should_add_cvc_patterns(
+                failed_data={**failed, "cvc_patterns": True},
+                formulas=[eq],
+            )
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("CVC_PATTERNS", None)
+        else:
+            os.environ["CVC_PATTERNS"] = prev
+
+
+def test_pattern_feature_gates() -> None:
+    eq = "(forall ((x Nat)) (= (f x) x))"
+    # usefulness timeout + directed eq → on (fail-skewed bridge case)
+    _ok(
+        should_add_cvc_patterns(
+            failed_data={"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]},
+            formulas=[eq],
+            enabled=True,
+        )
+    )
+    # need_rewrite
+    _ok(
+        should_add_cvc_patterns(
+            failed_data={"repair_hints": [{"kind": "need_rewrite"}]},
+            formulas=[eq],
+            enabled=True,
+        )
+    )
+    # rare_inst
+    _ok(
+        should_add_cvc_patterns(
+            failed_data={
+                "repair_hints": [{
+                    "kind": "high_difficulty_assertions",
+                    "rarely_instantiated": ["(forall ((x Nat)) true)"],
+                }],
+            },
+            formulas=[eq],
+            enabled=True,
+        )
+    )
+    # low em/conj alone does NOT open (would prefer successes on full706)
+    _ok(
+        not should_add_cvc_patterns(
+            failed_data={
+                "baseline_diag": {
+                    "stats": {
+                        "QUANTIFIERS_INST_E_MATCHING": 10,
+                        "INST_TOTAL": 10,
+                        "CONJ_TOTAL": 10,
+                        "QUANTIFIERS_SKOLEMIZE": 0,
+                    }
+                },
+            },
+            formulas=[eq],
+            enabled=True,
+        )
+    )
+    # timeout but no directed equality
+    _ok(
+        not should_add_cvc_patterns(
+            failed_data={"useless_lemma_groups": [{"lemmas": ["true"], "status": "timeout"}]},
+            formulas=["(forall ((x Nat)) true)"],
+            enabled=True,
+        )
+    )
+    # explosion ignored (always off in features)
+    feats = v2_pattern_features(
+        {
+            "useless_lemma_groups": [{"status": "timeout"}],
+            "progress_routing_signals": ["search_explosion(+50%)"],
+        }
+    )
+    _ok(feats["useful_timeout"] and feats["trigger"], feats)
+    _ok(feats["search_explosion"] is False, feats)
+    _ok(
+        should_add_cvc_patterns(
+            failed_data={
+                "useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}],
+                "progress_routing_signals": ["search_explosion(+50%)"],
+            },
+            formulas=[eq],
+            enabled=True,
+        )
+    )
+
+
+def main() -> None:
+    test_infer_pattern_on_directed_eq()
+    test_pattern_skips_var_eq_and_implications()
+    test_strip_bang_attrs()
+    test_inject_library_with_patterns()
+    test_pattern_gate_requires_flag()
+    test_pattern_feature_gates()
+    print("ok")
+
+
+if __name__ == "__main__":
+    main()

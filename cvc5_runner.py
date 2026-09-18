@@ -2,10 +2,12 @@
 CVC5/CVC4 runner with rich feedback for solver-guided lemma repair.
 
 Design notes vs Vampire:
-- Main prove path: multi-strategy portfolio. Optional --stats / get-difficulty
+- Main prove path: multi-strategy portfolio. Optional --stats / difficulty
   hang on that same process (no extra 3s diagnostic before the 60s prove).
 - Diagnostic path: short single-strategy run for usefulness-failure sidecars.
-- Difficulty: SMT-LIB produce-difficulty / get-difficulty (cvc5-specific).
+- Difficulty: CVC5 ``--produce-difficulty --dump-difficulty`` dumps scores after
+  check-sat (no SMT ``(get-difficulty)``). Still needs ``--tlimit-per`` to end
+  check-sat cleanly, plus a short wall-clock grace before hard-kill.
 - Unsat cores on inductive problems are unreliable; we do NOT depend on them
   for lemma pruning (unlike Vampire, which also no longer prunes via ucore).
 """
@@ -16,12 +18,12 @@ import time
 import os
 import re
 import signal
-import tempfile
 import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from llm_time_budget import remaining_task_s
 from solver_routing import (
     CVC5_FALLBACK_PROFILES,
     GoalSearchState,
@@ -64,6 +66,56 @@ def _cvc5_binary() -> str:
 
 def _cvc4_binary() -> str:
     return os.getenv("CVC4_BINARY", "./cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt")
+
+
+# After --tlimit-per ends check-sat, allow this many seconds for --dump-difficulty
+# / stats flush before the portfolio wall-clock kill. Override with CVC_DIFFICULTY_GRACE_S.
+# Empirically: 2s still loses dumps on some 20–60s portfolio timeouts; 5s is safer.
+_DEFAULT_DIFFICULTY_GRACE_S = 5.0
+_MIN_DIFFICULTY_GRACE_S = 0.5
+
+
+def _difficulty_grace_cap_s() -> float:
+    raw = os.getenv("CVC_DIFFICULTY_GRACE_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_DIFFICULTY_GRACE_S
+
+
+def cvc_time_budget(
+    prove_timeout_s: float,
+    *,
+    collect_difficulty: bool,
+) -> Tuple[float, float]:
+    """Return ``(tlimit_s, wall_s)`` for one CVC prove.
+
+    ``tlimit_s`` drives ``--tlimit-per`` (ends check-sat). ``wall_s`` is the
+    process wait before hard-kill. When collecting difficulty, ``wall_s`` is
+    ``tlimit_s + grace`` so ``--dump-difficulty`` can flush; grace shrinks near
+    the task deadline (``remaining_task_s``).
+    """
+    prove = max(0.5, float(prove_timeout_s))
+    if not collect_difficulty:
+        return prove, prove
+
+    grace_cap = _difficulty_grace_cap_s()
+    rem = remaining_task_s()
+    if rem is None:
+        return prove, prove + grace_cap
+
+    wall_cap = max(0.5, float(rem))
+    if prove + grace_cap <= wall_cap:
+        return prove, prove + grace_cap
+    if prove + _MIN_DIFFICULTY_GRACE_S <= wall_cap:
+        return prove, wall_cap
+    if prove <= wall_cap:
+        # No room for grace: prefer keeping the prove slice; may lose difficulty.
+        return prove, wall_cap
+    # Task nearly exhausted: shrink both.
+    return wall_cap, wall_cap
 
 
 @dataclass
@@ -195,8 +247,8 @@ def run_cvc(
     Default profiles match the paper (simple / inductive / no-ematching / cvc4).
     First unsat wins.
 
-    When collect_stats / collect_difficulty are set, CVC5 strategies get --stats
-    and --tlimit-per so a timeout still yields counters / get-difficulty.
+    When collect_stats / collect_difficulty are set, CVC5 strategies get --stats,
+    --tlimit-per, and (for difficulty) --produce-difficulty --dump-difficulty.
     """
     names = profiles or list(CVC5_FALLBACK_PROFILES)
     return _run_cvc_parallel(
@@ -296,13 +348,24 @@ def _cvc_prove_cmd(
     *,
     collect_stats: bool,
     collect_difficulty: bool,
+    tlimit_s: Optional[float] = None,
 ) -> List[str]:
+    """Build a CVC command. ``tlimit_s`` overrides ``timeout`` for ``--tlimit-per``."""
     cmd = [cfg["binary"]] + list(cfg["options"])
+    limit = float(timeout if tlimit_s is None else tlimit_s)
+    tlimit_ms = max(1, int(round(limit * 1000)))
     if cfg.get("type") == "CVC5" and (collect_stats or collect_difficulty):
         cmd.append("--stats")
         cmd.append("-o")
         cmd.append("inst")
-        cmd.append(f"--tlimit-per={max(1, int(timeout * 1000))}")
+        cmd.append(f"--tlimit-per={tlimit_ms}")
+        if collect_difficulty:
+            cmd.append("--produce-difficulty")
+            cmd.append("--dump-difficulty")
+    elif cfg.get("type") == "CVC4" and tlimit_s is not None:
+        # Stop CVC4 at the prove slice so portfolio grace is reserved for CVC5
+        # difficulty dump (CVC4 has no difficulty output).
+        cmd.append(f"--tlimit-per={tlimit_ms}")
     cmd.append(str(input_path))
     return cmd
 
@@ -327,42 +390,29 @@ def _run_named_cvc_profile(
     cfg = specs[profile]
     if collect_difficulty and cfg.get("type") != "CVC5":
         collect_difficulty = False
-    tmp_path = None
+    tlimit_s, wall_s = cvc_time_budget(
+        timeout, collect_difficulty=collect_difficulty,
+    )
     try:
         content = smt2_path.read_text(encoding="utf-8")
     except OSError:
         content = ""
     goal_term = extract_proof_goal_term(content) if content else None
-    input_path = smt2_path
-    if collect_difficulty and content:
-        script = _inject_difficulty_script(content)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".smt2", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(script)
-            tmp_path = tf.name
-        input_path = Path(tmp_path)
     cmd = _cvc_prove_cmd(
         cfg,
-        input_path,
+        smt2_path,
         timeout,
         collect_stats=collect_stats,
         collect_difficulty=collect_difficulty,
+        tlimit_s=tlimit_s,
     )
-    try:
-        result = _execute_single(cmd, timeout + 2, strategy=profile)
-        result.goal_term = goal_term
-        if collect_difficulty:
-            result.difficulty = parse_cvc_difficulty(
-                result.stdout + "\n" + result.stderr
-            )
-        return result
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    result = _execute_single(cmd, int(math.ceil(wall_s)), strategy=profile)
+    result.goal_term = goal_term
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(
+            result.stdout + "\n" + result.stderr
+        )
+    return result
 
 
 def _cvc_result_from_output(
@@ -447,37 +497,28 @@ def _run_cvc_parallel(
     if not strategies:
         return CvcResult(status="error", error="no known cvc profiles requested")
 
+    tlimit_s, wall_s = cvc_time_budget(
+        timeout, collect_difficulty=collect_difficulty,
+    )
     processes = {}
     start = time.time()
     summaries: Dict[str, dict] = {}
     full_results: Dict[str, CvcResult] = {}
-    injected_path = None
     try:
         try:
             smt_content = smt2_path.read_text(encoding="utf-8")
         except OSError:
             smt_content = ""
         goal_term = extract_proof_goal_term(smt_content) if smt_content else None
-        if collect_difficulty:
-            script = _inject_difficulty_script(smt_content or smt2_path.read_text(encoding="utf-8"))
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".smt2", delete=False, encoding="utf-8"
-            ) as tf:
-                tf.write(script)
-                injected_path = Path(tf.name)
 
         for name, cfg in strategies.items():
-            input_path = (
-                injected_path
-                if collect_difficulty and cfg.get("type") == "CVC5" and injected_path is not None
-                else smt2_path
-            )
             cmd = _cvc_prove_cmd(
                 cfg,
-                input_path,
+                smt2_path,
                 timeout,
                 collect_stats=collect_stats,
                 collect_difficulty=collect_difficulty,
+                tlimit_s=tlimit_s,
             )
             try:
                 proc = subprocess.Popen(
@@ -499,7 +540,7 @@ def _run_cvc_parallel(
             return CvcResult(status="error", error="no solver process started", portfolio_results=summaries)
 
         completed = set()
-        while time.time() - start < timeout:
+        while time.time() - start < wall_s:
             for name, proc in processes.items():
                 if name in completed:
                     continue
@@ -590,15 +631,11 @@ def _run_cvc_parallel(
             stderr=richest.stderr if richest else "",
             portfolio_results=summaries,
             goal_term=goal_term or (richest.goal_term if richest else None),
+            instantiations=list(richest.instantiations) if richest else [],
         )
 
     finally:
         _cleanup_processes(processes)
-        if injected_path is not None:
-            try:
-                injected_path.unlink()
-            except OSError:
-                pass
 
 
 def cvc_diagnostic_profile(profile: Optional[str]) -> str:
@@ -626,68 +663,34 @@ def run_cvc_diagnostic(
     smt2_path = Path(smt2_path)
     name = cvc_diagnostic_profile(profile)
     cfg = cvc_profile_specs()[name]
-    ms = max(1, int(timeout * 1000))
-    tmp_path = None
+    tlimit_s, wall_s = cvc_time_budget(timeout, collect_difficulty=collect_difficulty)
     try:
         content = smt2_path.read_text(encoding="utf-8")
     except OSError:
         content = ""
     goal_term = extract_proof_goal_term(content) if content else None
-    input_path = smt2_path
-    if collect_difficulty and content:
-        script = _inject_difficulty_script(content)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".smt2", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(script)
-            tmp_path = tf.name
-        input_path = Path(tmp_path)
-    cmd = [cfg["binary"]] + list(cfg["options"]) + [
-        f"--tlimit-per={ms}", "--stats", "-o", "inst", str(input_path),
-    ]
-    try:
-        result = _execute_single(cmd, timeout + 2, strategy=name)
-        result.goal_term = goal_term
-        if collect_difficulty:
-            result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
-        return result
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    cmd = _cvc_prove_cmd(
+        cfg,
+        smt2_path,
+        timeout,
+        collect_stats=True,
+        collect_difficulty=collect_difficulty,
+        tlimit_s=tlimit_s,
+    )
+    result = _execute_single(cmd, int(math.ceil(wall_s)), strategy=name)
+    result.goal_term = goal_term
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
+    return result
 
 
 def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = None) -> CvcResult:
     """
-    Run cvc5 on a rewritten SMT script that enables produce-difficulty and
-    calls (get-difficulty) after check-sat.
+    Run cvc5 with ``--produce-difficulty --dump-difficulty`` (same process as prove).
     """
-    smt2_path = Path(smt2_path)
-    name = cvc_diagnostic_profile(profile)
-    cfg = cvc_profile_specs()[name]
-    content = smt2_path.read_text(encoding="utf-8")
-    script = _inject_difficulty_script(content)
-    ms = max(1, int(timeout * 1000))
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".smt2", delete=False, encoding="utf-8"
-    ) as tf:
-        tf.write(script)
-        tmp_path = tf.name
-
-    try:
-        cmd = [cfg["binary"]] + list(cfg["options"]) + [f"--tlimit-per={ms}", tmp_path]
-        result = _execute_single(cmd, timeout + 2, strategy=f"{name}_difficulty")
-        result.difficulty = parse_cvc_difficulty(result.stdout)
-        result.goal_term = extract_proof_goal_term(content)
-        return result
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    return run_cvc_diagnostic(
+        smt2_path, timeout=timeout, collect_difficulty=True, profile=profile,
+    )
 
 
 def parse_cvc_stats(text: str) -> Dict[str, int]:
@@ -1024,7 +1027,8 @@ def _parse_difficulty_list(expr: str) -> List[Tuple[str, int]]:
 
 def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
     """
-    Parse (get-difficulty) output with a balanced s-expr scan.
+    Parse ``--dump-difficulty`` (or legacy ``(get-difficulty)``) output with a
+    balanced s-expr scan.
 
     Each entry is `( <s-expr> <int> )`. Nested SMT such as
     `(plus (succ n) m)` is allowed; a one-level parenthesis regex is not.
@@ -1369,42 +1373,6 @@ def _stdout_is_unsat(stdout: str) -> bool:
     return "unsat" in stdout.lower() and not re.search(
         r"(?m)^(sat)\s*$", stdout.lower()
     )
-
-
-def _inject_difficulty_script(content: str) -> str:
-    option = "(set-option :produce-difficulty true)"
-    lines = content.splitlines()
-    has_set_logic = any(line.strip().startswith("(set-logic") for line in lines)
-    out: List[str] = []
-    injected = False
-    for line in lines:
-        stripped = line.strip()
-        if not injected and has_set_logic and stripped.startswith("(set-logic"):
-            out.append(line)
-            out.append(option)
-            injected = True
-            continue
-        if (
-            not injected
-            and not has_set_logic
-            and stripped.startswith("(")
-            and not stripped.startswith(";")
-        ):
-            out.append(option)
-            injected = True
-        out.append(line)
-    if not injected:
-        out.insert(0, option)
-    text = "\n".join(out)
-    if "(check-sat)" in text:
-        text = text.replace(
-            "(check-sat)",
-            "(check-sat)\n(get-difficulty)",
-            1,
-        )
-    else:
-        text += "\n(check-sat)\n(get-difficulty)\n"
-    return text
 
 
 def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:

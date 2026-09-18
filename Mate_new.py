@@ -30,8 +30,6 @@ from solver_routing import (
     format_routing_for_prompt,
     select_generation_prompt,
     retarget_generation_prompt,
-    prompt_kind_signature,
-    V2_START_SIGNATURE,
     NO_HELP_PROMPT_SWITCH,
     probe_profile_count,
     probe_timeout_s,
@@ -72,12 +70,19 @@ from obligation_tree import (
 )
 from exp_flags import (
     ancestor_prompt_enabled,
+    normalize_strategy_mode,
     paper_schedule_prompt,
     progress_feedback_enabled,
     prompt_retarget_active,
     repair_hints_enabled,
+    resolve_cvc_patterns_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
+)
+from smt_patterns import (
+    format_assert_line,
+    pattern_trigger_reasons,
+    should_add_cvc_patterns,
 )
 from ancestor_stack import (
     AncestorStack,
@@ -855,13 +860,80 @@ def parse_llm_response(
     """解析LLM输出，提取有效断言。"""
     return parse_llm_lemmas(response, depth=depth, diagnosis_only=diagnosis_only)
 
+def _remember_strategy_mode(base_path: str, goal_name: str, strategy_mode: str) -> str:
+    """Persist normalized strategy mode on the node so inject paths can read it."""
+    mode = normalize_strategy_mode(strategy_mode)
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    if failed_data.get("strategy_mode") != mode:
+        failed_data["strategy_mode"] = mode
+        save_failed_lemmas(base_path, goal_name, failed_data)
+    return mode
+
+
+def _remember_cvc_patterns(base_path: str, goal_name: str, enabled: bool) -> bool:
+    """Persist whether CVC ``:pattern`` inject is enabled for this node."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    flag = bool(enabled)
+    if failed_data.get("cvc_patterns") != flag:
+        failed_data["cvc_patterns"] = flag
+        save_failed_lemmas(base_path, goal_name, failed_data)
+    return flag
+
+
+def _resolve_cvc_add_patterns(
+    base_path: Optional[str],
+    goal_name: Optional[str],
+    extra_formulas: Sequence[str] = (),
+    *,
+    cvc_patterns: Optional[bool] = None,
+) -> bool:
+    """Whether to attach ``:pattern`` when lemmas are axioms for CVC (any mode)."""
+    if not base_path or not goal_name:
+        return False
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    enabled = resolve_cvc_patterns_enabled(
+        cvc_patterns
+        if cvc_patterns is not None
+        else (
+            failed_data.get("cvc_patterns")
+            if "cvc_patterns" in failed_data
+            else None
+        )
+    )
+    formulas = [str(f) for f in extra_formulas if f]
+    formulas.extend(
+        str(item.get("formula") or "") for item in load_lemma_library(base_path)
+    )
+    on = should_add_cvc_patterns(
+        failed_data=failed_data,
+        formulas=formulas,
+        enabled=enabled,
+    )
+    if on:
+        log_exp(
+            "cvc_patterns",
+            goal=goal_name,
+            on=True,
+            reasons=pattern_trigger_reasons(failed_data),
+        )
+    return on
+
+
 def _write_combined_smt(
     asserts: List[str],
     original_content: str,
     output_path: Path,
+    *,
+    add_patterns: bool = False,
 ) -> None:
-    """Insert lemmas before `; proof goal` (Mate_new historical style)."""
-    combined_asserts = "\n".join(f"(assert {a})" for a in asserts)
+    """Insert lemmas before `; proof goal` (Mate_new historical style).
+
+    ``add_patterns`` only for usefulness-style axiom injection (CVC).
+    Progress / control diagnostics keep bare asserts (default).
+    """
+    combined_asserts = "\n".join(
+        format_assert_line(a, add_pattern=add_patterns) for a in asserts
+    )
     new_content = re.sub(
         r'; proof goal',
         combined_asserts + "\n; proof goal",
@@ -1075,7 +1147,12 @@ def verify_combined_lemmas(
     work_dir = output_path.parent
     gname = goal_name or output_path.stem
 
-    _write_combined_smt(asserts, original_content, output_path)
+    add_patterns = _resolve_cvc_add_patterns(
+        base_path, gname if base_path else None, asserts,
+    )
+    _write_combined_smt(
+        asserts, original_content, output_path, add_patterns=add_patterns,
+    )
     state = load_routing_state(base_path, gname) if base_path else GoalSearchState()
     if solver_profile:
         set_routing_candidates(
@@ -1181,7 +1258,10 @@ def perform_initial_verification(
     if base_path and lemma_library_enabled():
         n_lib = len(load_lemma_library(base_path))
         log_library_inject(base_path, goal_name, n_lib, log_event)
-        smt_path = materialize_smt_with_library(goal_smt_file, base_path)
+        add_patterns = _resolve_cvc_add_patterns(base_path, goal_name)
+        smt_path = materialize_smt_with_library(
+            goal_smt_file, base_path, add_patterns=add_patterns,
+        )
     result = run_cvc_routed(
         smt_path,
         default_timeout,
@@ -2087,7 +2167,10 @@ def quick_run(
     smt_file_path = Path(base_path)
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
     smt_content = goal_smt_file.read_text()
-    solver_content = solver_smt_content(smt_content, base_path)
+    add_patterns = _resolve_cvc_add_patterns(base_path, goal_smt_name)
+    solver_content = solver_smt_content(
+        smt_content, base_path, add_patterns=add_patterns,
+    )
     _store_harvest_dispatch(base_path, goal_smt_name, {})
     if base_path and lemma_library_enabled():
         log_library_inject(
@@ -2294,6 +2377,7 @@ def prove_subgoals_parallel(
     *,
     ancestor_stack: AncestorStack = (),
     parent_formula: Optional[str] = None,
+    cvc_patterns: Optional[bool] = None,
 ) -> Tuple[bool, List[dict]]:
     """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
     if not subgoals:
@@ -2373,6 +2457,7 @@ def prove_subgoals_parallel(
                 parent_goal_name,
                 skip_initial=subgoal in skip_initial_for,
                 ancestor_stack=child_stack,
+                cvc_patterns=cvc_patterns,
             ): subgoal
             for subgoal in subgoals
         }
@@ -2479,8 +2564,14 @@ def prove_run(
     parent_goal_name: Optional[str] = None,
     skip_initial: bool = False,
     ancestor_stack: AncestorStack = (),
+    *,
+    cvc_patterns: Optional[bool] = None,
 ) -> bool:
-    """提示策略的递归验证函数 主程序入口"""
+    """提示策略的递归验证函数 主程序入口
+
+    ``cvc_patterns``: optional override for CVC ``:pattern`` axiom inject
+    (else ``CVC_PATTERNS`` env, default off). Independent of ``strategy_mode``.
+    """
     outcome = {"proved": False, "reason": "attempts_exhausted"}
 
     def _done(ok: bool, reason: str) -> bool:
@@ -2493,6 +2584,7 @@ def prove_run(
             base_path, base_name, depth, strategy_mode, baseline_only,
             parent_goal_name, skip_initial, _done,
             ancestor_stack=ancestor_stack or empty_ancestor_stack(),
+            cvc_patterns=cvc_patterns,
         )
     finally:
         if depth == 0:
@@ -2520,6 +2612,7 @@ def _prove_run_body(
     _done,
     *,
     ancestor_stack: AncestorStack = (),
+    cvc_patterns: Optional[bool] = None,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     # 检查递归深度限制
@@ -2530,6 +2623,7 @@ def _prove_run_body(
         return _done(False, "max_depth")
 
     arm_task_deadline(depth, config.get("TASK_TIMEOUT"))
+    patterns_enabled = resolve_cvc_patterns_enabled(cvc_patterns)
     
     if depth == 0:
         log_run_config(
@@ -2542,6 +2636,7 @@ def _prove_run_body(
                 "prompt_pack": resolve_prompt_pack(
                     strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"]
                 )["mode"],
+                "cvc_patterns": "on" if patterns_enabled else "off",
             },
         )
 
@@ -2553,12 +2648,19 @@ def _prove_run_body(
     
     logging.info(f"开始处理 Path: {base_path}, Name: {base_name} (递归深度: {depth})")
     log_exp("node_enter", goal=base_name, depth=depth, parent=parent_goal_name)
+    _remember_strategy_mode(base_path, base_name, strategy_mode)
+    _remember_cvc_patterns(base_path, base_name, patterns_enabled)
 
     goal_smt_file = Path(base_path) / f"{base_name}.smt2"
     current_formula: Optional[str] = None
     try:
+        add_patterns = _resolve_cvc_add_patterns(base_path, base_name)
         _a, current_formula = extract_original_goal(
-            solver_smt_content(goal_smt_file.read_text(encoding="utf-8"), base_path)
+            solver_smt_content(
+                goal_smt_file.read_text(encoding="utf-8"),
+                base_path,
+                add_patterns=add_patterns,
+            )
         )
     except Exception:
         current_formula = None
@@ -2593,14 +2695,12 @@ def _prove_run_body(
     retarget = prompt_retarget_active(len(strategies))
     fixed_no_retarget = pack.get("no_retarget_prompt")
     if retarget:
+        # CVC5: consecutive-only retarget; ignore repair-hint / HD families.
         hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
-        current_prompt = select_generation_prompt(strategies, hint_list)
-        # v2: start signature is sentinel so the first HD/no_hd update can retarget.
-        kind_signature = (
-            V2_START_SIGNATURE
-            if pack.get("mode") == "v2"
-            else prompt_kind_signature(hint_list)
+        current_prompt = select_generation_prompt(
+            strategies, hint_list, hint_guided=False
         )
+        kind_signature = "none"
     else:
         current_prompt = fixed_no_retarget or paper_schedule_prompt(
             strategies, 0, max_attempts_per_prompt
@@ -2620,8 +2720,9 @@ def _prove_run_body(
 
     # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
     # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
-    # (ours only): hint family picks the template. With retarget off: paper
-    # order, N attempts per template. v2 + retarget off: always lemma_general.
+    # (CVC5): consecutive empty/invalid/useless toggles only — repair-hint
+    # families do not pick the template. With retarget off: paper order, N
+    # attempts per template. v2 + retarget off: always lemma_general.
     for attempt in range(total_attempts):
         if not retarget:
             current_prompt = fixed_no_retarget or paper_schedule_prompt(
@@ -2725,6 +2826,7 @@ def _prove_run_body(
                     skip_initial_for=skip_for,
                     ancestor_stack=ancestor_stack,
                     parent_formula=current_formula,
+                    cvc_patterns=patterns_enabled,
                 )
                 if isinstance(subgoal_result, tuple):
                     ok, rec_nodes = subgoal_result
@@ -2773,6 +2875,7 @@ def _prove_run_body(
                     current_prompt,
                     consecutive_no_help,
                     kind_signature,
+                    hint_guided=False,
                 )
                 if why == "consecutive":
                     logging.info(

@@ -20,12 +20,13 @@ os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 from cvc5_runner import (
     CvcResult,
     _cvc_prove_cmd,
-    _inject_difficulty_script,
+    cvc_time_budget,
     parse_cvc_difficulty,
     run_cvc_probe,
     cvc_probeable_profiles,
     cvc_profile_specs,
 )
+from llm_time_budget import set_task_deadline
 from vampire_runner import VampireResult, _vampire_command
 
 
@@ -35,25 +36,6 @@ TINY_SMT = """(set-logic ALL)
 (assert (not (P 0)))
 (check-sat)
 """
-
-
-def test_inject_difficulty_script() -> None:
-    script = _inject_difficulty_script(TINY_SMT)
-    assert "(set-option :produce-difficulty true)" in script
-    assert "(get-difficulty)" in script
-    assert script.count("(check-sat)") == 1
-
-
-def test_inject_difficulty_without_set_logic() -> None:
-    smt = """(declare-fun P (Int) Bool)
-(assert (forall ((x Int)) (P x)))
-(assert (not (P 0)))
-(check-sat)
-"""
-    script = _inject_difficulty_script(smt)
-    assert script.splitlines()[0] == "(set-option :produce-difficulty true)"
-    assert "(get-difficulty)" in script
-    assert "(set-logic" not in script
 
 
 def test_parse_cvc_difficulty_simple() -> None:
@@ -76,6 +58,8 @@ def test_cvc_prove_cmd_adds_stats_and_tlimit() -> None:
     assert "--stats" in cmd
     assert "-o" in cmd and "inst" in cmd
     assert "--tlimit-per=60000" in cmd
+    assert "--produce-difficulty" in cmd
+    assert "--dump-difficulty" in cmd
     assert cmd[-1] == "goal.smt2"
 
     cvc4 = {"binary": "cvc4", "options": [], "type": "CVC4"}
@@ -84,6 +68,72 @@ def test_cvc_prove_cmd_adds_stats_and_tlimit() -> None:
     )
     assert "--stats" not in cmd4
     assert "inst" not in cmd4
+    assert "--tlimit-per" not in cmd4
+
+    cmd4_grace = _cvc_prove_cmd(
+        cvc4,
+        Path("goal.smt2"),
+        60,
+        collect_stats=True,
+        collect_difficulty=True,
+        tlimit_s=60.0,
+    )
+    assert "--tlimit-per=60000" in cmd4_grace
+
+
+def test_cvc_time_budget_adds_grace_for_difficulty() -> None:
+    set_task_deadline(None)
+    with patch.dict(os.environ, {"CVC_DIFFICULTY_GRACE_S": "5"}, clear=False):
+        tlimit, wall = cvc_time_budget(60, collect_difficulty=True)
+        assert tlimit == 60
+        assert wall == 65
+        tlimit2, wall2 = cvc_time_budget(60, collect_difficulty=False)
+        assert tlimit2 == wall2 == 60
+
+
+def test_cvc_time_budget_shrinks_grace_near_deadline() -> None:
+    set_task_deadline(None)
+    with patch.dict(os.environ, {"CVC_DIFFICULTY_GRACE_S": "2"}, clear=False):
+        with patch("cvc5_runner.remaining_task_s", return_value=61.0):
+            tlimit, wall = cvc_time_budget(60, collect_difficulty=True)
+            assert tlimit == 60
+            assert wall == 61.0
+        with patch("cvc5_runner.remaining_task_s", return_value=60.0):
+            tlimit, wall = cvc_time_budget(60, collect_difficulty=True)
+            assert tlimit == 60
+            assert wall == 60.0
+        with patch("cvc5_runner.remaining_task_s", return_value=3.0):
+            tlimit, wall = cvc_time_budget(60, collect_difficulty=True)
+            assert tlimit == wall == 3.0
+    set_task_deadline(None)
+
+
+
+def test_cvc_prove_cmd_stats_only_skips_dump_difficulty() -> None:
+    cfg = {"binary": "cvc5", "options": [], "type": "CVC5"}
+    cmd = _cvc_prove_cmd(
+        cfg,
+        Path("goal.smt2"),
+        10,
+        collect_stats=True,
+        collect_difficulty=False,
+    )
+    assert "--stats" in cmd
+    assert "--dump-difficulty" not in cmd
+    assert "--produce-difficulty" not in cmd
+
+
+def test_cvc_prove_cmd_uses_explicit_tlimit_s() -> None:
+    cfg = {"binary": "cvc5", "options": [], "type": "CVC5"}
+    cmd = _cvc_prove_cmd(
+        cfg,
+        Path("goal.smt2"),
+        60,
+        collect_stats=True,
+        collect_difficulty=True,
+        tlimit_s=58.5,
+    )
+    assert "--tlimit-per=58500" in cmd
 
 
 def test_vampire_command_show_induction() -> None:
@@ -464,7 +514,7 @@ def test_repair_hints_keep_all_kinds() -> None:
         mate.add_repair_hints(tmp, "template", [
             {"kind": "high_difficulty_assertions", "detail": "hard"},
             {"kind": "need_rewrite", "detail": "mix"},
-            {"kind": "need_induction_lemma", "detail": "ind"},
+            {"kind": "need_arithmetic_lemma", "detail": "ind"},
         ])
         mate.add_repair_hints(tmp, "template", [
             {"kind": "timeout", "detail": "t1", "context": "attempt"},
@@ -478,7 +528,7 @@ def test_repair_hints_keep_all_kinds() -> None:
         assert timeout["detail"] == "t2"
         assert "no_progress" in kinds
         assert "need_rewrite" in kinds
-        assert "need_induction_lemma" in kinds
+        assert "need_arithmetic_lemma" in kinds
         assert "high_difficulty_assertions" in kinds
 
 
@@ -758,6 +808,7 @@ def test_two_no_help_switches_generation_prompt() -> None:
     calls.clear()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(goal_smt, encoding="utf-8")
+        # Dead / misleading kinds must not affect CVC consecutive-only retarget.
         mate.add_repair_hints(
             tmp,
             "template",
@@ -814,8 +865,10 @@ def _collect_prove_prompts(
             len(calls) - 1, prompt_strategy, base_path=base_path, mate=mate
         )
 
-    def wrapped_select(strategies, hint_list, *, rng=None):
-        return real_select(strategies, hint_list, rng=select_rng)
+    def wrapped_select(strategies, hint_list, *, rng=None, hint_guided=True):
+        return real_select(
+            strategies, hint_list, rng=select_rng, hint_guided=hint_guided
+        )
 
     decision = decision or SimpleNamespace(
         prompt_strategy="prove_prompt_term_rewrite",
@@ -885,15 +938,17 @@ def test_routing_does_not_override_generation_prompt() -> None:
 
 
 def test_prove_run_samples_when_both_kind_families() -> None:
+    """Vampire still samples when both prompt families fire; CVC does not."""
+
     def quick(_n, _prompt, **_kwargs):
         return False, [], []
 
     hints = [
-        {"kind": "need_stronger_lemma", "strength": 0.9, "detail": "g", "context": "goal"},
+        {"kind": "need_arithmetic_lemma", "strength": 0.9, "detail": "g", "context": "goal"},
         {"kind": "need_rewrite", "strength": 0.1, "detail": "r", "context": "goal"},
     ]
     rewrite = _collect_prove_prompts(
-        "Mate_new",
+        "Mate_new_vampire",
         quick,
         hints=hints,
         select_rng=_FixedRng(0.05),
@@ -901,12 +956,16 @@ def test_prove_run_samples_when_both_kind_families() -> None:
     assert rewrite[0] == "prove_prompt_term_rewrite", rewrite
     assert rewrite[1] == "prove_prompt_term_rewrite", rewrite
     equational = _collect_prove_prompts(
-        "Mate_new",
+        "Mate_new_vampire",
         quick,
         hints=hints,
         select_rng=_FixedRng(0.50),
     )
     assert equational[0] == "prove_prompt_equational_reasoning", equational
+
+    # CVC ignores hint families: paper order even with rewrite-heavy mix.
+    cvc = _collect_prove_prompts("Mate_new", quick, hints=hints, select_rng=_FixedRng(0.05))
+    assert cvc[0] == "prove_prompt_equational_reasoning", cvc
 
 
 def test_useful_subgoal_failure_resets_no_help_streak() -> None:
@@ -945,16 +1004,18 @@ def test_timeout_breaks_no_help_streak() -> None:
 
 
 def test_kind_feedback_switches_after_one_no_help() -> None:
+    """Vampire retargets on kind-family change; CVC waits for consecutive streak."""
+
     def keep_generalize(n, _prompt, **kwargs):
         if n == 0:
             kwargs["mate"].add_repair_hints(
                 kwargs["base_path"],
                 "template",
-                [{"kind": "need_stronger_lemma", "detail": "g", "context": "goal"}],
+                [{"kind": "need_arithmetic_lemma", "detail": "g", "context": "goal"}],
             )
         return False, [], []
 
-    keep = _collect_prove_prompts("Mate_new", keep_generalize)
+    keep = _collect_prove_prompts("Mate_new_vampire", keep_generalize)
     assert keep[0] == "prove_prompt_equational_reasoning", keep
     assert keep[1] == "prove_prompt_equational_reasoning", keep
 
@@ -967,9 +1028,14 @@ def test_kind_feedback_switches_after_one_no_help() -> None:
             )
         return False, [], []
 
-    switched = _collect_prove_prompts("Mate_new", switch_rewrite)
+    switched = _collect_prove_prompts("Mate_new_vampire", switch_rewrite)
     assert switched[0] == "prove_prompt_equational_reasoning", switched
     assert switched[1] == "prove_prompt_term_rewrite", switched
+
+    # CVC: need_rewrite must not switch until consecutive no-help streak.
+    cvc = _collect_prove_prompts("Mate_new", switch_rewrite)
+    assert cvc[0] == "prove_prompt_equational_reasoning", cvc
+    assert cvc[1] == "prove_prompt_equational_reasoning", cvc
 
 
 def test_stats_without_reference_skip_utility() -> None:
@@ -1162,8 +1228,6 @@ def test_sidecar_does_not_write_mix_hints() -> None:
 
 
 def main() -> int:
-    test_inject_difficulty_script()
-    test_inject_difficulty_without_set_logic()
     test_parse_cvc_difficulty_simple()
     test_cvc_prove_cmd_adds_stats_and_tlimit()
     test_vampire_command_show_induction()
