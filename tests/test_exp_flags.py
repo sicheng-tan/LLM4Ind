@@ -138,6 +138,17 @@ def test_resolve_prompt_pack() -> None:
     assert v2["no_retarget_prompt"] == "lemma_general"
     assert prompt_retarget_active(len(v2["strategies"])) is True
     assert normalize_strategy_mode("general_ind") == "v2"
+    simple = resolve_prompt_pack("default_simple", 3)
+    assert simple["mode"] == "default_simple"
+    assert simple["folder_path"] == "./prompts_ours_compact"
+    assert simple["strategies"] == [
+        "prove_prompt_equational_reasoning",
+        "prove_prompt_term_rewrite",
+    ]
+    assert simple["total_attempts"] == 6
+    assert simple.get("no_retarget_prompt") is None
+    assert normalize_strategy_mode("ours_simple") == "default_simple"
+    assert normalize_strategy_mode("simple") == "default_simple"
 
 
 def test_naive_strategy_repeats_prompt_naive() -> None:

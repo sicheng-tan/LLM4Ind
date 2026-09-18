@@ -106,6 +106,8 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
         return "zero_shot"
     if mode in ("v2", "general_ind", "general_induction"):
         return "v2"
+    if mode in ("default_simple", "ours_simple", "simple"):
+        return "default_simple"
     if mode in ("default", "ours", ""):
         return "default"
     return "default"
@@ -121,6 +123,9 @@ def resolve_prompt_pack(
     on each of two templates (2N total). Naive uses the single ``prompt_naive``
     template 2N times so the LLM-call budget matches. ``zero_shot`` currently
     uses the same ours pack as ``default`` (no separate prompt folder).
+
+    ``default_simple`` uses the same two template *names* as ``default``, but
+    loads shortened system prompts from ``prompts_ours_compact``.
 
     ``v2`` uses ``prompts_v2`` with ``lemma_general`` + ``induction_step``
     (budget 2N). With ``PROMPT_RETARGET=off``, the loop stays on
@@ -151,6 +156,16 @@ def resolve_prompt_pack(
             "total_attempts": n * 2,
             # Retarget off: never rotate onto induction_step via paper schedule.
             "no_retarget_prompt": V2_LEMMA_GENERAL,
+        }
+    if mode == "default_simple":
+        strategies = list(OURS_PROMPT_STRATEGIES)
+        return {
+            "mode": mode,
+            "folder_path": "./prompts_ours_compact",
+            "strategies": strategies,
+            "max_attempts_per_prompt": n,
+            "total_attempts": n * len(strategies),
+            "no_retarget_prompt": None,
         }
     strategies = list(OURS_PROMPT_STRATEGIES)
     return {

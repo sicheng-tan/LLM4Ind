@@ -18,9 +18,10 @@ if __name__ == "__main__":
     parser.add_argument("base_name")
     parser.add_argument(
         "--strategy-mode",
-        choices=["default", "zero_shot", "naive", "v2"],
+        choices=["default", "default_simple", "zero_shot", "naive", "v2"],
         default="default",
-        help="default/zero_shot: prompts_ours; naive: prompt_naive × 2N; "
+        help="default: prompts_ours; default_simple: prompts_ours_compact (same two modes); "
+        "zero_shot: same as default; naive: prompt_naive × 2N; "
         "v2: prompts_v2 lemma_general+induction_step (retarget off → always general)",
     )
     parser.add_argument(

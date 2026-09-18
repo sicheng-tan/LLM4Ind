@@ -238,9 +238,11 @@ if __name__ == "__main__":
                        default="/home/ssdllm/ProofMate/preprocessed/all-int",
                        help='原始文件夹路径')
     parser.add_argument('--strategy-mode', type=str, 
-                       choices=['default', 'zero_shot', 'naive', 'v2'],
+                       choices=['default', 'default_simple', 'zero_shot', 'naive', 'v2'],
                        default='default',
-                       help='提示词包: default/zero_shot 用 prompts_ours（等式+重写各 N 次）; '
+                       help='提示词包: default 用 prompts_ours（等式+重写各 N 次）; '
+                            'default_simple 用 prompts_ours_compact（同两模板、精简 system）; '
+                            'zero_shot 同 default; '
                             'naive 只用 prompt_naive 重复 2N 次; '
                             'v2 用 prompts_v2（lemma_general+induction_step；'
                             'PROMPT_RETARGET=off 时固定 lemma_general）')
@@ -298,6 +300,8 @@ if __name__ == "__main__":
         print(f"📝 策略模式: {args.strategy_mode}")
         if args.strategy_mode == "naive":
             print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
+        elif args.strategy_mode == "default_simple":
+            print("   default_simple: 与 default 相同两模板，system 用 prompts_ours_compact")
     
     # 存储所有结果
     results = []
