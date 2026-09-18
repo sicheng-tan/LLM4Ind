@@ -137,9 +137,16 @@ class CvcResult:
     goal_term: Optional[str] = None
     # (-o inst) per-quantifier instantiation counts: (term_or_qid, count).
     instantiations: List[Tuple[str, int]] = field(default_factory=list)
+    # Compact ``(get-model)`` text when status is sat (optional).
+    model_text: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+# Prompt / invalid-reason budget for solver counterexamples (longer than LLM tag).
+MAX_CEX_REASON_CHARS = 400
+_CEX_TIMEOUT_S = 2
 
 
 def run_cvc_solver_with_timeout(smt2_path, timeout=60) -> bool:
@@ -1001,6 +1008,171 @@ def extract_proof_goal_term(smt: str) -> Optional[str]:
         if classify_difficulty_term(body, None) == "goal":
             return normalize_smt_term(strip_named_annotation(body))
     return None
+
+
+def prepare_smt_for_get_model(smt: str) -> str:
+    """Ensure ``:produce-models`` and a trailing ``(get-model)`` after ``(check-sat)``."""
+    text = smt or ""
+    if "produce-models" not in text:
+        text = "(set-option :produce-models true)\n" + text
+    if "(get-model)" not in text:
+        if re.search(r"\(check-sat\)", text):
+            text = re.sub(
+                r"\(check-sat\)",
+                "(check-sat)\n(get-model)",
+                text,
+                count=1,
+            )
+        else:
+            text = text.rstrip() + "\n(check-sat)\n(get-model)\n"
+    return text
+
+
+def smt_negate_proof_goal_assert(smt: str) -> str:
+    """Rewrite ``; proof goal (assert φ)`` into ``(assert (not φ))`` for cex search.
+
+    Validation files assert φ positively; after unsat we seek a model of ¬φ.
+    If the body is already ``(not ...)``, leave it unchanged.
+    """
+    def _repl(match: re.Match) -> str:
+        body = (match.group(1) or "").strip()
+        stripped = body
+        if stripped.startswith("(not ") or stripped.startswith("(not\n"):
+            return match.group(0)
+        return f"; proof goal\n(assert (not {body}))\n; proof goal end"
+
+    return re.sub(
+        r";\s*proof goal\s*\(assert\s+(.+?)\)\s*;\s*proof goal end",
+        _repl,
+        smt,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def parse_cvc_model(text: str) -> Optional[str]:
+    """Extract a compact model block from cvc5 stdout after ``(get-model)``.
+
+    Accepts ``sat`` or ``unknown`` followed by a ``define-fun`` model — some
+    quantifier problems report unknown while still printing a witness.
+    """
+    raw = text or ""
+    # Prefer a top-level s-expression that contains define-fun (standard get-model).
+    best: Optional[str] = None
+    best_len = 0
+    i = 0
+    while i < len(raw):
+        if raw[i] != "(":
+            i += 1
+            continue
+        expr, nxt = _read_sexpr(raw, i)
+        if expr is None:
+            break
+        if "define-fun" in expr or "define-funs-rec" in expr:
+            if len(expr) > best_len:
+                best = expr
+                best_len = len(expr)
+        i = nxt if nxt > i else i + 1
+    if best:
+        return re.sub(r"\s+", " ", best).strip()
+    # Fallback: lines after sat/unknown until blank.
+    lines = []
+    seen_status = False
+    for line in raw.splitlines():
+        if re.match(r"(?i)^(sat|unknown)\s*$", line.strip()):
+            seen_status = True
+            continue
+        if not seen_status:
+            continue
+        if re.match(r"(?i)^(unsat|timeout)\b", line.strip()):
+            break
+        if line.strip().startswith("(") or lines:
+            lines.append(line.rstrip())
+        if lines and not line.strip():
+            break
+    blob = " ".join(x.strip() for x in lines if x.strip())
+    return re.sub(r"\s+", " ", blob).strip() or None
+
+
+def format_counterexample_reason(
+    model_text: Optional[str],
+    *,
+    fallback: str = "solver:sat",
+    limit: int = MAX_CEX_REASON_CHARS,
+) -> str:
+    """Build an invalid/node reason that includes the solver model when available."""
+    model = (model_text or "").strip()
+    if not model:
+        return fallback
+    body = model if len(model) <= limit - len("Counterexample: ") else (
+        model[: max(0, limit - len("Counterexample: ") - 3)] + "..."
+    )
+    return f"Counterexample: {body}"
+
+
+def run_cvc_counterexample(
+    smt2_path,
+    timeout: int = _CEX_TIMEOUT_S,
+    *,
+    profile: str = "cvc5_simple",
+    negate_proof_goal: bool = False,
+) -> CvcResult:
+    """Short CVC5 run that asks for a model on sat (for invalid / refutation reasons).
+
+    ``negate_proof_goal``: flip validation-style ``(assert φ)`` to ``(assert (not φ))``
+    so a lemma that contradicted axioms can still yield a concrete witness.
+    """
+    import tempfile
+
+    src = Path(smt2_path)
+    try:
+        content = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        return CvcResult(status="error", error=str(exc), strategy=profile)
+
+    if negate_proof_goal:
+        content = smt_negate_proof_goal_assert(content)
+    content = prepare_smt_for_get_model(content)
+
+    specs = cvc_profile_specs()
+    cfg = specs.get(profile) or specs.get("cvc5_simple")
+    if not cfg or cfg.get("type") != "CVC5":
+        return CvcResult(status="error", error="no CVC5 profile for model query", strategy=profile)
+
+    with tempfile.TemporaryDirectory(prefix="cvc_cex_") as tmp:
+        cex_path = Path(tmp) / "cex.smt2"
+        cex_path.write_text(content, encoding="utf-8")
+        cmd = [cfg["binary"]] + list(cfg["options"]) + [str(cex_path)]
+        # Prefer a light quantifier schedule; models only need a sat witness.
+        if "--full-saturate-quant" not in cmd:
+            pass
+        result = _execute_single(cmd, max(1, int(timeout)), strategy=profile)
+        result.goal_term = extract_proof_goal_term(content)
+        result.model_text = parse_cvc_model(result.stdout + "\n" + result.stderr)
+        # A printed model is a usable witness even when the solver says unknown.
+        if result.model_text and result.status in ("unknown", "timeout", ""):
+            result.status = "sat"
+        return result
+
+
+def counterexample_reason_for_smt(
+    smt2_path,
+    *,
+    timeout: int = _CEX_TIMEOUT_S,
+    negate_proof_goal: bool = False,
+    fallback: str = "solver:sat",
+) -> str:
+    """Return ``Counterexample: …`` or ``fallback`` after a short model query."""
+    result = run_cvc_counterexample(
+        smt2_path,
+        timeout=timeout,
+        negate_proof_goal=negate_proof_goal,
+    )
+    if result.model_text:
+        return format_counterexample_reason(result.model_text, fallback=fallback)
+    if result.status == "sat":
+        return fallback
+    return fallback
 
 
 def _parse_difficulty_entry(expr: str) -> Optional[Tuple[str, int]]:

@@ -21,6 +21,7 @@ from cvc5_runner import (
     derive_repair_hints,
     cvc_diagnostic_profile,
     hard_axioms_from_difficulty,
+    counterexample_reason_for_smt,
     CvcResult,
 )
 from solver_routing import (
@@ -1919,6 +1920,21 @@ def create_validation_files(extracted_asserts: List[str], smt_content: str,
     return valid_check_paths
 
 
+def _solver_sat_reason(smt_path: Path, *, fallback: str = "solver:sat") -> str:
+    """Reason for a refuted subgoal (axioms ∧ ¬φ is sat): attach a CVC model when possible.
+
+    Only used on the sat-abort path. Validity unsat (axioms ∧ φ) does not pay for
+    a second ¬φ model query — ``contradicts axioms`` is enough there.
+    """
+    try:
+        return counterexample_reason_for_smt(
+            smt_path, negate_proof_goal=False, fallback=fallback
+        )
+    except Exception as exc:
+        logging.debug("counterexample query failed for %s: %s", smt_path, exc)
+        return fallback
+
+
 def verify_single_lemma(valid_path: Path) -> Tuple[Path, CvcResult]:
     """验证单个引理的有效性（assert lemma 若 unsat ⇒ 与公理矛盾 ⇒ invalid）"""
     logging.info(f"开始检查有效性: {valid_path.name}")
@@ -2683,10 +2699,11 @@ def _prove_run_body(
     ):
         diag = _load_cached_diag(base_path, base_name, "baseline_diag")
         if diag is not None and str(diag.status).lower() == "sat":
+            sat_reason = _solver_sat_reason(goal_smt_file, fallback="solver:sat")
             _set_node_outcome(
-                base_path, base_name, kind="invalid", reason="solver:sat", source="solver"
+                base_path, base_name, kind="invalid", reason=sat_reason, source="solver"
             )
-            logging.info("子目标 %s 为 sat，停止 LLM", base_name)
+            logging.info("子目标 %s 为 sat，停止 LLM (%s)", base_name, sat_reason[:120])
             return _done(False, "refuted")
 
     pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
