@@ -1,8 +1,12 @@
 """CVC5 ``:pattern`` helpers for axiom injection.
 
-Patterns are an *injection* option (``CVC_PATTERNS`` / ``--cvc-patterns``),
-independent of ``--strategy-mode``. Used when lemmas are axioms in
-``A ∪ Lib ∪ C ⊢ G``. Subgoal / validation SMT files stay bare.
+Syntax helpers (``infer_trigger_pattern`` / ``format_assert_line``) stay.
+The feedback-gated 6-way ±pattern portfolio is **temporarily deprecated**:
+last-round ``rare_inst`` must not change the next CVC run. v2 LAST ATTEMPT
+``advice: TRIGGER`` consumes that evidence instead.
+
+``CVC_PATTERNS`` / ``--cvc-patterns`` default **off**. Even when set on,
+``should_add_cvc_patterns`` stays false until ``PATTERN_FEEDBACK_GATE_ENABLED``.
 """
 
 from __future__ import annotations
@@ -155,8 +159,18 @@ def infer_trigger_pattern(formula: str) -> Optional[str]:
     return f"({lhs})"
 
 
-def format_assert_line(formula: str, *, add_pattern: bool = False) -> str:
-    """``(assert φ)`` or ``(assert (! φ :pattern ((f …))))`` for directed eqs."""
+def candidate_lemma_id(index: int) -> str:
+    """Stable SMT ``:named`` id for mix-round generated lemma ``index`` (1-based)."""
+    return f"C{int(index)}"
+
+
+def format_assert_line(
+    formula: str,
+    *,
+    add_pattern: bool = False,
+    named: Optional[str] = None,
+) -> str:
+    """``(assert φ)`` or ``(assert (! φ :named C1 :pattern …))``."""
     text = normalize_lemma_formula(formula)
     if text.startswith("(assert"):
         inner, _ = read_sexpr(text, 0)
@@ -165,10 +179,16 @@ def format_assert_line(formula: str, *, add_pattern: bool = False) -> str:
             if head == "assert" and args:
                 text = normalize_lemma_formula(args[0])
     text = strip_bang_attrs(text)
+    attrs: List[str] = []
+    label = str(named or "").strip()
+    if label:
+        attrs.append(f":named {label}")
     if add_pattern:
         pat = infer_trigger_pattern(text)
         if pat:
-            return f"(assert (! {text} :pattern {pat}))"
+            attrs.append(f":pattern {pat}")
+    if attrs:
+        return f"(assert (! {text} {' '.join(attrs)}))"
     return f"(assert {text})"
 
 
@@ -272,6 +292,11 @@ def v2_pattern_features(failed_data: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+# Last-round rare_inst → next-round 6-way :pattern. Deprecated: that evidence
+# now goes to LLM TRIGGER advice, not solver config. Keep helpers + flag.
+PATTERN_FEEDBACK_GATE_ENABLED = False
+
+
 def should_add_cvc_patterns(
     *,
     failed_data: Optional[dict] = None,
@@ -280,16 +305,11 @@ def should_add_cvc_patterns(
 ) -> bool:
     """Whether to wrap directed equalities with ``:pattern`` on CVC axiom inject.
 
-    Gated by ``CVC_PATTERNS`` / ``enabled`` (any strategy mode). Decision:
-
-    ``pattern_on`` =
-      patterns_enabled
-      ∧ rare_inst
-      ∧ has_directed_eq
-
-    Opens only when a high-difficulty axiom had no formula-shaped instantiations.
-    ``useful_timeout`` / ``rewrite_scarce`` are not triggers.
+    Currently always false (``PATTERN_FEEDBACK_GATE_ENABLED``). Historical
+    ``pattern_on`` was ``patterns_enabled ∧ rare_inst ∧ has_directed_eq``.
     """
+    if not PATTERN_FEEDBACK_GATE_ENABLED:
+        return False
     data = failed_data if isinstance(failed_data, dict) else {}
     if enabled is None and "cvc_patterns" in data:
         enabled = bool(data.get("cvc_patterns"))

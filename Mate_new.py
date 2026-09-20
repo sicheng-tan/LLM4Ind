@@ -19,9 +19,15 @@ from cvc5_runner import (
     run_cvc_routed,
     compute_progress_score,
     derive_repair_hints,
+    difficulty_dump_complete,
     cvc_diagnostic_profile,
     hard_axioms_from_difficulty,
     counterexample_reason_for_smt,
+    canonical_smt_term,
+    classify_difficulty_term,
+    attributed_ids_from_portfolio,
+    expand_named_difficulty,
+    pick_advice_witness,
     CvcResult,
 )
 from solver_routing import (
@@ -82,6 +88,7 @@ from exp_flags import (
 )
 from smt_patterns import (
     format_assert_line,
+    candidate_lemma_id,
     pattern_trigger_reasons,
     should_add_cvc_patterns,
 )
@@ -502,7 +509,26 @@ def _compact_cvc_diag(result: CvcResult) -> dict:
         "difficulty": [[t, s] for t, s in (result.difficulty or [])],
         "instantiations": [[t, n] for t, n in (result.instantiations or [])],
         "goal_term": result.goal_term,
+        "portfolio_results": dict(result.portfolio_results or {}),
+        "dump_complete": difficulty_dump_complete(result.difficulty),
     }
+
+
+def _compact_harvest_diag(result: Any) -> Optional[dict]:
+    """JSON-safe harvest A⊢cᵢ dump for a skipped child initial prove."""
+    if not isinstance(result, CvcResult) or result.proved:
+        return None
+    return _compact_cvc_diag(result)
+
+
+def _goal_difficulty_score(result: Optional[CvcResult]) -> Optional[int]:
+    if result is None:
+        return None
+    goal_term = result.goal_term
+    for term, score in result.difficulty or []:
+        if int(score or 0) > 0 and classify_difficulty_term(term, goal_term) == "goal":
+            return int(score)
+    return None
 
 
 def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
@@ -525,6 +551,7 @@ def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
         difficulty=difficulty,
         instantiations=instantiations,
         goal_term=data.get("goal_term") or None,
+        portfolio_results=dict(data.get("portfolio_results") or {}),
     )
 
 
@@ -545,12 +572,34 @@ def _record_failed_prove_diagnostics(
     *,
     context: str = "initial_goal",
 ) -> None:
-    """Cache first-prove stats/difficulty as baseline; do not overwrite later runs."""
-    if result.proved:
+    """Cache a failed goal-only prove as this node's PRUNE/LOCALIZE baseline."""
+    _set_goal_only_baseline(
+        base_path, goal_name, result, context=context, replace=False,
+    )
+
+
+def _set_goal_only_baseline(
+    base_path: str,
+    goal_name: str,
+    result: Optional[CvcResult],
+    *,
+    context: str,
+    replace: bool = False,
+) -> None:
+    """Store A ∪ Lib ⊢ G (no current C). Refresh when the library changed.
+
+    Do not use a usefulness mix as baseline: that run already contains candidate
+    lemmas, so CONJ/INST log-gain would compare C_new against C_old.
+    """
+    if result is None or result.proved:
         return
-    if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
-        _store_cached_diag(base_path, goal_name, "baseline_diag", result)
-    add_repair_hints(base_path, goal_name, derive_repair_hints(result, context=context))
+    existing = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    if existing is not None and not replace:
+        return
+    _store_cached_diag(base_path, goal_name, "baseline_diag", result)
+    add_repair_hints(
+        base_path, goal_name, derive_repair_hints(result, context=context),
+    )
     if result.difficulty:
         logging.info(
             "cvc5 高难度断言 (%s): %s",
@@ -627,14 +676,32 @@ def _record_failed_usefulness_mix(
     goal_name: str,
     result: CvcResult,
     lemmas: Optional[List[str]] = None,
+    candidate_ids: Optional[Dict[str, str]] = None,
 ) -> None:
     """Single-run mix from the failed full-timeout A∧C→P prove, not the 3s sidecar."""
     if not _usefulness_has_mix_signal(result):
         return
+    name_map = dict(candidate_ids or {})
+    witness = pick_advice_witness(result)
+    if name_map:
+        witness = CvcResult(
+            proved=witness.proved,
+            status=witness.status,
+            elapsed=witness.elapsed,
+            strategy=witness.strategy,
+            stats=dict(witness.stats or {}),
+            difficulty=expand_named_difficulty(witness.difficulty, name_map),
+            instantiations=list(witness.instantiations or []),
+            goal_term=witness.goal_term,
+            portfolio_results=witness.portfolio_results,
+            stdout=witness.stdout,
+            stderr=witness.stderr,
+            error=witness.error,
+        )
     add_repair_hints(
         base_path, goal_name,
         attach_source_lemmas(
-            derive_repair_hints(result, context="usefulness_check"),
+            derive_repair_hints(witness, context="usefulness_check"),
             lemmas,
             context="usefulness_check",
         ),
@@ -910,25 +977,33 @@ def _write_combined_smt(
     output_path: Path,
     *,
     add_patterns: bool = False,
-) -> Optional[Path]:
-    """Insert lemmas before `; proof goal` (Mate_new historical style).
+) -> Tuple[Optional[Path], Dict[str, str]]:
+    """Insert named mix lemmas before `; proof goal` (Mate_new historical style).
 
     Always writes a bare combined SMT to ``output_path``. When ``add_patterns``
     is set, also writes ``stem.__pat.smt2`` with ``:pattern`` on directed eqs
     and returns that path for the 6-way portfolio contrast.
     """
-    bare = "\n".join(format_assert_line(a, add_pattern=False) for a in asserts)
+    ids: Dict[str, str] = {}
+    bare_lines: List[str] = []
+    for i, formula in enumerate(asserts, 1):
+        cid = candidate_lemma_id(i)
+        ids[cid] = str(formula).strip()
+        bare_lines.append(format_assert_line(formula, add_pattern=False, named=cid))
     output_path.write_text(
-        re.sub(r'; proof goal', bare + "\n; proof goal", original_content, count=1)
+        re.sub(r'; proof goal', "\n".join(bare_lines) + "\n; proof goal", original_content, count=1)
     )
     if not add_patterns:
-        return None
-    patterned = "\n".join(format_assert_line(a, add_pattern=True) for a in asserts)
+        return None, ids
+    pat_lines = [
+        format_assert_line(formula, add_pattern=True, named=candidate_lemma_id(i))
+        for i, formula in enumerate(asserts, 1)
+    ]
     pat_path = output_path.with_name(output_path.stem + ".__pat.smt2")
     pat_path.write_text(
-        re.sub(r'; proof goal', patterned + "\n; proof goal", original_content, count=1)
+        re.sub(r'; proof goal', "\n".join(pat_lines) + "\n; proof goal", original_content, count=1)
     )
-    return pat_path
+    return pat_path, ids
 
 
 def _first_datatype_name(smt_content: str) -> Optional[str]:
@@ -1138,7 +1213,7 @@ def verify_combined_lemmas(
     add_patterns = _resolve_cvc_add_patterns(
         base_path, gname if base_path else None, asserts,
     )
-    pattern_smt = _write_combined_smt(
+    pattern_smt, candidate_ids = _write_combined_smt(
         asserts, original_content, output_path, add_patterns=add_patterns,
     )
     extra = {}
@@ -1197,7 +1272,35 @@ def verify_combined_lemmas(
     progressive: List[str] = []
     if base_path and goal_name:
         meta: Dict[str, Any] = {"status": full.status}
-        _record_failed_usefulness_mix(base_path, gname, full, asserts)
+        _record_failed_usefulness_mix(
+            base_path, gname, full, asserts, candidate_ids=candidate_ids,
+        )
+        baseline_mix = _load_cached_diag(base_path, gname, "baseline_diag")
+        if baseline_mix is not None:
+            _score, mix_signals = compute_progress_score(baseline_mix, full)
+            meta["progress_signals"] = mix_signals
+        per_profile = dict(full.portfolio_results or {})
+        meta["per_profile"] = per_profile
+        meta["candidate_ids"] = dict(candidate_ids)
+        attributed_ids = attributed_ids_from_portfolio(full, candidate_ids)
+        meta["attributed_ids"] = attributed_ids
+        meta["difficulty_attributed"] = bool(attributed_ids)
+        ind = per_profile.get("cvc5_inductive") if isinstance(per_profile.get("cvc5_inductive"), dict) else {}
+        ind_stats = ind.get("stats") if isinstance(ind.get("stats"), dict) else {}
+        meta["mix_stats"] = {
+            "CONJ_TOTAL": int((ind_stats.get("CONJ_TOTAL") if ind_stats else (full.stats or {}).get("CONJ_TOTAL")) or 0),
+            "INST_TOTAL": int((ind_stats.get("INST_TOTAL") if ind_stats else (full.stats or {}).get("INST_TOTAL")) or 0),
+            "QUANTIFIERS_SKOLEMIZE": int(
+                (ind_stats.get("QUANTIFIERS_SKOLEMIZE") if ind_stats else (full.stats or {}).get("QUANTIFIERS_SKOLEMIZE")) or 0
+            ),
+        }
+        witness = pick_advice_witness(full)
+        meta["difficulty_dump_complete"] = difficulty_dump_complete(witness.difficulty)
+        meta["goal_difficulty_mix"] = _goal_difficulty_score(witness)
+        if baseline_mix is not None:
+            meta["goal_difficulty_baseline"] = _goal_difficulty_score(
+                pick_advice_witness(baseline_mix),
+            )
         if progress_feedback_enabled():
             progressive, _baseline = analyze_lemma_progress(
                 asserts, original_content, work_dir, gname, base_path
@@ -1319,17 +1422,29 @@ def perform_initial_verification(
         logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
 
-    if log_event == "initial_prove" and base_path and goal_name:
-        _record_failed_prove_diagnostics(base_path, goal_name, result)
-        logging.error(
-            "CVC5验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
-            result.status, result.elapsed, result.strategy,
-        )
-    else:
-        logging.info(
-            "再证当前目标未通过 (status=%s elapsed=%.2fs)",
-            result.status, result.elapsed,
-        )
+    if base_path and goal_name:
+        if log_event == "initial_prove":
+            _set_goal_only_baseline(
+                base_path, goal_name, result, context="initial_goal", replace=False,
+            )
+            logging.error(
+                "CVC5验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
+                result.status, result.elapsed, result.strategy,
+            )
+        elif log_event == "harvest_retry":
+            _set_goal_only_baseline(
+                base_path, goal_name, result,
+                context="harvest_retry", replace=True,
+            )
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                result.status, result.elapsed,
+            )
+        else:
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)",
+                result.status, result.elapsed,
+            )
     return False
 
 
@@ -2057,6 +2172,8 @@ def _harvest_direct_prove(smt_path: Path, base_path: str) -> CvcResult:
         smt_path,
         config["DEFAULT_CVC_TIMEOUT"],
         profiles=list(HARVEST_CVC_PROFILES),
+        collect_stats=True,
+        collect_difficulty=True,
     )
     add_solver_time(base_path, result.elapsed)
     log_exp(
@@ -2112,6 +2229,7 @@ def _finish_usefulness_unsat(
     )
     slot_by_index = {slot.index: slot for slot in slots}
     skip_initial: List[str] = []
+    skip_initial_diag: Dict[str, dict] = {}
     pre_proved: Dict[str, dict] = {}
     recurse: List[str] = []
     order: List[str] = []
@@ -2130,12 +2248,16 @@ def _finish_usefulness_unsat(
         elif kind == "exhausted":
             recurse.append(name)
             skip_initial.append(name)
+            compact = _compact_harvest_diag(getattr(slot, "result", None) if slot else None)
+            if compact:
+                skip_initial_diag[name] = compact
         else:
             recurse.append(name)
     _store_harvest_dispatch(base_path, goal_smt_name, {
         "order": order,
         "pre_proved": pre_proved,
         "skip_initial": skip_initial,
+        "skip_initial_diag": skip_initial_diag,
     })
     logging.info(
         "lemmas有用，保留 %d/%d 条用于子目标生成 (direct_proved=%d recurse=%d)",
@@ -2404,6 +2526,7 @@ def prove_subgoals_parallel(
     parent_goal_name: str = None,
     attempt: int = 0,
     skip_initial_for: Optional[Set[str]] = None,
+    skip_initial_diag: Optional[Dict[str, dict]] = None,
     *,
     ancestor_stack: AncestorStack = (),
     parent_formula: Optional[str] = None,
@@ -2416,6 +2539,7 @@ def prove_subgoals_parallel(
     logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
     parent_lemmas = parent_lemmas or []
     skip_initial_for = skip_initial_for or set()
+    skip_initial_diag = skip_initial_diag or {}
     snapshots: Dict[str, dict] = {}
     formula = parent_formula
     if formula is None and parent_goal_name:
@@ -2486,6 +2610,7 @@ def prove_subgoals_parallel(
                 baseline_only,
                 parent_goal_name,
                 skip_initial=subgoal in skip_initial_for,
+                skip_initial_diag=skip_initial_diag.get(subgoal),
                 ancestor_stack=child_stack,
                 cvc_patterns=cvc_patterns,
             ): subgoal
@@ -2596,11 +2721,13 @@ def prove_run(
     ancestor_stack: AncestorStack = (),
     *,
     cvc_patterns: Optional[bool] = None,
+    skip_initial_diag: Optional[dict] = None,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口
 
-    ``cvc_patterns``: optional override for CVC ``:pattern`` axiom inject
-    (else ``CVC_PATTERNS`` env, default off). Independent of ``strategy_mode``.
+    ``cvc_patterns``: leftover override for CVC ``:pattern`` inject. Feedback
+    6-way is temporarily deprecated (``should_add_cvc_patterns`` stays false).
+    Independent of ``strategy_mode``.
     """
     outcome = {"proved": False, "reason": "attempts_exhausted"}
 
@@ -2615,6 +2742,7 @@ def prove_run(
             parent_goal_name, skip_initial, _done,
             ancestor_stack=ancestor_stack or empty_ancestor_stack(),
             cvc_patterns=cvc_patterns,
+            skip_initial_diag=skip_initial_diag,
         )
     finally:
         if depth == 0:
@@ -2643,6 +2771,7 @@ def _prove_run_body(
     *,
     ancestor_stack: AncestorStack = (),
     cvc_patterns: Optional[bool] = None,
+    skip_initial_diag: Optional[dict] = None,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     # 检查递归深度限制
@@ -2702,6 +2831,13 @@ def _prove_run_body(
     # 执行初始验证检查
     if skip_initial:
         log_exp("skip_initial_prove", goal=base_name, because="harvest_exhausted")
+        harvested = skip_initial_diag
+        if not isinstance(harvested, CvcResult):
+            harvested = _cvc_diag_from_compact(harvested)
+        _set_goal_only_baseline(
+            base_path, base_name, harvested,
+            context="harvest_exhausted", replace=False,
+        )
     elif perform_initial_verification(
         goal_smt_file, base_path=base_path, goal_name=base_name
     ):
@@ -2753,7 +2889,8 @@ def _prove_run_body(
     # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
     # (CVC5): consecutive empty/invalid/useless toggles only — repair-hint
     # families do not pick the template. With retarget off: paper order, N
-    # attempts per template. v2 + retarget off: always lemma_general.
+    # attempts per template. v2: always lemma_general (2N); retarget on/off
+    # does not change the template.
     for attempt in range(total_attempts):
         if not retarget:
             current_prompt = fixed_no_retarget or paper_schedule_prompt(
@@ -2825,6 +2962,9 @@ def _prove_run_body(
                 pre_proved = dispatch.get("pre_proved") or {}
                 order = list(dispatch.get("order") or new_subgoals)
                 skip_for = set(dispatch.get("skip_initial") or [])
+                skip_diag = dispatch.get("skip_initial_diag") or {}
+                if not isinstance(skip_diag, dict):
+                    skip_diag = {}
 
                 # 成功证明的情况，没有subgoal了
                 if not new_subgoals:
@@ -2855,6 +2995,7 @@ def _prove_run_body(
                     base_path, new_subgoals, depth, strategy_mode, baseline_only,
                     current_lemmas, base_name, attempt=attempt + 1,
                     skip_initial_for=skip_for,
+                    skip_initial_diag=skip_diag,
                     ancestor_stack=ancestor_stack,
                     parent_formula=current_formula,
                     cvc_patterns=patterns_enabled,

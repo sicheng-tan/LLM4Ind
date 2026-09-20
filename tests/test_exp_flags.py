@@ -133,10 +133,10 @@ def test_resolve_prompt_pack() -> None:
     v2 = resolve_prompt_pack("v2", 3)
     assert v2["mode"] == "v2"
     assert v2["folder_path"] == "./prompts_v2"
-    assert v2["strategies"] == ["lemma_general", "induction_step"]
+    assert v2["strategies"] == ["lemma_general"]
     assert v2["total_attempts"] == 6
     assert v2["no_retarget_prompt"] == "lemma_general"
-    assert prompt_retarget_active(len(v2["strategies"])) is True
+    assert prompt_retarget_active(len(v2["strategies"])) is False
     assert normalize_strategy_mode("general_ind") == "v2"
     simple = resolve_prompt_pack("default_simple", 3)
     assert simple["mode"] == "default_simple"
@@ -149,6 +149,15 @@ def test_resolve_prompt_pack() -> None:
     assert simple.get("no_retarget_prompt") is None
     assert normalize_strategy_mode("ours_simple") == "default_simple"
     assert normalize_strategy_mode("simple") == "default_simple"
+    v2s = resolve_prompt_pack("v2_simple", 3)
+    assert v2s["mode"] == "v2_simple"
+    assert v2s["folder_path"] == "./prompts_v2_compact"
+    assert v2s["strategies"] == ["lemma_general"]
+    assert v2s["total_attempts"] == 6
+    assert v2s["no_retarget_prompt"] == "lemma_general"
+    assert prompt_retarget_active(len(v2s["strategies"])) is False
+    assert normalize_strategy_mode("v2_compact") == "v2_simple"
+    assert normalize_strategy_mode("general_ind_simple") == "v2_simple"
 
 
 def test_naive_strategy_repeats_prompt_naive() -> None:
@@ -207,6 +216,68 @@ def test_v2_retarget_off_always_lemma_general() -> None:
     assert len(calls) == 6, calls
     assert all(name == "lemma_general" for name, _folder in calls)
     assert all(folder == "./prompts_v2" for _name, folder in calls)
+
+
+def test_v2_retarget_on_always_lemma_general() -> None:
+    import Mate_new as mate
+
+    calls: list[str] = []
+
+    def fake_quick_run(_base, _name, prompt_strategy, folder_path, *_args, **_kwargs):
+        calls.append((prompt_strategy, folder_path))
+        return False, [], []
+
+    saved = _clear_flags()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
+            mate.add_repair_hints(
+                tmp, "template",
+                [{"kind": "high_difficulty_assertions", "hard_axioms": ["(P x)"]}],
+            )
+            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
+                "Mate_new.routing_enabled", return_value=False
+            ), patch(
+                "Mate_new.perform_initial_verification", return_value=False
+            ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
+                mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
+            ):
+                assert mate.prove_run(tmp, "template", strategy_mode="v2") is False
+    finally:
+        _restore_flags(saved)
+
+    assert len(calls) == 6, calls
+    assert all(name == "lemma_general" for name, _folder in calls)
+    assert all(folder == "./prompts_v2" for _name, folder in calls)
+
+
+def test_v2_simple_uses_compact_folder() -> None:
+    import Mate_new as mate
+
+    calls: list[str] = []
+
+    def fake_quick_run(_base, _name, prompt_strategy, folder_path, *_args, **_kwargs):
+        calls.append((prompt_strategy, folder_path))
+        return False, [], []
+
+    saved = _clear_flags()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
+            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
+                "Mate_new.routing_enabled", return_value=False
+            ), patch(
+                "Mate_new.perform_initial_verification", return_value=False
+            ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
+                mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
+            ):
+                assert mate.prove_run(tmp, "template", strategy_mode="v2_simple") is False
+    finally:
+        _restore_flags(saved)
+
+    assert len(calls) == 6, calls
+    assert all(name == "lemma_general" for name, _folder in calls)
+    assert all(folder == "./prompts_v2_compact" for _name, folder in calls)
 
 
 def test_paper_schedule_prompt() -> None:
@@ -400,6 +471,8 @@ def main() -> int:
     test_prompt_retarget_off_uses_paper_order()
     test_naive_strategy_repeats_prompt_naive()
     test_v2_retarget_off_always_lemma_general()
+    test_v2_retarget_on_always_lemma_general()
+    test_v2_simple_uses_compact_folder()
     test_vampire_prompt_and_paper_order_respect_flags()
     print("exp flag tests passed")
     return 0

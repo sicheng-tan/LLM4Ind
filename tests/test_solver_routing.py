@@ -298,7 +298,6 @@ def test_kind_signature_change_retargets_before_streak() -> None:
 
 def test_v2_hd_sample_and_retarget() -> None:
     from solver_routing import (
-        V2_INDUCTION_STEP,
         V2_LEMMA_GENERAL,
         V2_START_SIGNATURE,
         retarget_v2_generation_prompt,
@@ -307,7 +306,7 @@ def test_v2_hd_sample_and_retarget() -> None:
         v2_mode_from_hd,
     )
 
-    strats = [V2_LEMMA_GENERAL, V2_INDUCTION_STEP]
+    strats = [V2_LEMMA_GENERAL]
     _ok(v2_hd_signature([]) == "no_hd", "no hd")
     _ok(
         v2_hd_signature([{"kind": "high_difficulty_assertions"}]) == "hd",
@@ -315,39 +314,33 @@ def test_v2_hd_sample_and_retarget() -> None:
     )
     _ok(v2_mode_from_hd([]) == V2_LEMMA_GENERAL, "mode nohd")
     _ok(
-        v2_mode_from_hd([{"kind": "high_difficulty_assertions"}]) == V2_INDUCTION_STEP,
-        "mode hd",
+        v2_mode_from_hd([{"kind": "high_difficulty_assertions"}]) == V2_LEMMA_GENERAL,
+        "mode hd stays general",
     )
 
-    # First pick always lemma_general, even with HD present
     hd = [{"kind": "high_difficulty_assertions"}]
     pick = select_v2_generation_prompt(strats, hd)
     _ok(pick == V2_LEMMA_GENERAL, pick)
     pick = select_generation_prompt(strats, hd)
     _ok(pick == V2_LEMMA_GENERAL, pick)
 
-    # From start sentinel + HD → induction (deterministic feedback)
     nxt, n, sig, why = retarget_v2_generation_prompt(
         strats, hd, V2_LEMMA_GENERAL, 1, V2_START_SIGNATURE
     )
-    _ok(why == "kind" and nxt == V2_INDUCTION_STEP and sig == "hd" and n == 0, (why, nxt, sig, n))
+    _ok(why == "keep" and nxt == V2_LEMMA_GENERAL and sig == "hd", (why, nxt, sig, n))
 
-    # HD cleared → back to general
     nxt, n, sig, why = retarget_v2_generation_prompt(
-        strats, [], V2_INDUCTION_STEP, 1, "hd"
+        strats, [], V2_LEMMA_GENERAL, 1, "hd"
     )
-    _ok(why == "kind" and nxt == V2_LEMMA_GENERAL and sig == "no_hd", (why, nxt, sig))
-
-    # Same HD signature: consecutive flip
-    nxt, n, sig, why = retarget_v2_generation_prompt(
-        strats, hd, V2_INDUCTION_STEP, 2, "hd"
-    )
-    _ok(why == "consecutive" and nxt == V2_LEMMA_GENERAL and n == 0, (why, nxt, n))
+    _ok(why == "keep" and nxt == V2_LEMMA_GENERAL and sig == "no_hd", (why, nxt, sig))
 
     nxt, n, sig, why = retarget_v2_generation_prompt(
         strats, hd, V2_LEMMA_GENERAL, 2, "hd"
     )
-    _ok(why == "consecutive" and nxt == V2_INDUCTION_STEP and n == 0, (why, nxt, n))
+    _ok(why == "keep" and nxt == V2_LEMMA_GENERAL and n == 2, (why, nxt, n))
+
+    from exp_flags import prompt_retarget_active
+    _ok(prompt_retarget_active(len(strats)) is False, "singleton pool disables retarget")
 
     # Ours default pool unchanged
     ours = [EQUATIONAL_PROMPT, TERM_REWRITE_PROMPT]

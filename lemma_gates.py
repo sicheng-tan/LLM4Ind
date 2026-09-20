@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import _flag_enabled
 from obligation_tree import compact_formula, lemmas_equivalent, normalize_lemma_formula
+from prompt_modes import advice_from_failed_data, format_advice_lines
 
 _DECLARE_FUN = re.compile(
     r"\(declare-fun\s+([A-Za-z_][A-Za-z0-9_+*/<>=!?-]*)"
@@ -740,8 +741,14 @@ def format_dropped_line(item: dict) -> Optional[str]:
     return f"    {lemma}  [{label}]"
 
 
-def format_stuck_lines(hints: Sequence[dict], backend: str = "cvc5") -> List[str]:
+def format_stuck_lines(
+    hints: Sequence[dict],
+    backend: str = "cvc5",
+    *,
+    omit_axiom_goal_hint: bool = False,
+) -> List[str]:
     """Compact solver-stuck lines. ``need_rewrite`` is not shown (disabled)."""
+    del backend
     lines: List[str] = []
     for hint in hints or []:
         if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
@@ -772,7 +779,8 @@ def format_stuck_lines(hints: Sequence[dict], backend: str = "cvc5") -> List[str
                 lines.append("    high-difficulty assertions (no compact terms)")
             if shown_hd:
                 lines.append(f"    {HD_DIFFICULTY_EXPLAIN}")
-                lines.append(f"    {HD_AXIOM_GOAL_HINT}")
+                if not omit_axiom_goal_hint:
+                    lines.append(f"    {HD_AXIOM_GOAL_HINT}")
             continue
         detail = str(hint.get("detail") or "").strip()
         lines.append(f"    {kind}: {detail}" if detail else f"    {kind}")
@@ -810,10 +818,14 @@ def format_attempt_feedback_for_prompt(
     hints: Sequence[dict] = (
         group_hints if group_hints is not None else (data.get("repair_hints") or [])
     )
-    stuck_lines = format_stuck_lines(hints, backend) if include_stuck else []
+    advice = advice_from_failed_data(data, backend=backend, has_kept=bool(kept))
+    stuck_lines = format_stuck_lines(
+        hints, backend, omit_axiom_goal_hint=advice is not None,
+    ) if include_stuck else []
+    advice_lines = format_advice_lines(advice) if include_stuck else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
     has_attempt = bool(kept or drop_lines)
-    if not has_attempt and not stuck_lines:
+    if not has_attempt and not stuck_lines and not advice_lines:
         return ""
 
     parts: List[str] = []
@@ -829,9 +841,10 @@ def format_attempt_feedback_for_prompt(
         if drop_lines:
             parts.append("  dropped:")
             parts.extend(drop_lines)
-        if stuck_lines:
+        if stuck_lines or advice_lines:
             parts.append("  repair hints:")
             parts.extend(stuck_lines)
+            parts.extend(advice_lines)
         parts.append("  You may refine kept lemmas or propose a different set.")
         return "\n".join(parts)
 
@@ -840,6 +853,7 @@ def format_attempt_feedback_for_prompt(
     )
     parts.append("  repair hints:")
     parts.extend(stuck_lines)
+    parts.extend(advice_lines)
     parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
     return "\n".join(parts)
 

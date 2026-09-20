@@ -238,20 +238,20 @@ if __name__ == "__main__":
                        default="/home/ssdllm/ProofMate/preprocessed/all-int",
                        help='原始文件夹路径')
     parser.add_argument('--strategy-mode', type=str, 
-                       choices=['default', 'default_simple', 'zero_shot', 'naive', 'v2'],
+                       choices=['default', 'default_simple', 'zero_shot', 'naive', 'v2', 'v2_simple'],
                        default='default',
                        help='提示词包: default 用 prompts_ours（等式+重写各 N 次）; '
                             'default_simple 用 prompts_ours_compact（同两模板、精简 system）; '
                             'zero_shot 同 default; '
                             'naive 只用 prompt_naive 重复 2N 次; '
-                            'v2 用 prompts_v2（lemma_general+induction_step；'
-                            'PROMPT_RETARGET=off 时固定 lemma_general）')
+                            'v2 用 prompts_v2（lemma_general × 2N）; '
+                            'v2_simple 用 prompts_v2_compact（同 lemma_general、精简 system）')
     parser.add_argument(
         '--cvc-patterns',
         choices=['on', 'off'],
         default=None,
-        help='CVC 公理注入是否加 :pattern（与 --strategy-mode 正交）。'
-             '默认跟环境变量 CVC_PATTERNS（未设则为 off）',
+        help='CVC 公理 :pattern 开关（暂弃用：即使 on 也不会开 6-way）。'
+             '默认 off，跟 CVC_PATTERNS',
     )
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
@@ -302,6 +302,10 @@ if __name__ == "__main__":
             print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
         elif args.strategy_mode == "default_simple":
             print("   default_simple: 与 default 相同两模板，system 用 prompts_ours_compact")
+        elif args.strategy_mode == "v2":
+            print("   v2: lemma_general × 2N，system 用 prompts_v2")
+        elif args.strategy_mode == "v2_simple":
+            print("   v2_simple: 与 v2 相同模板，system 用 prompts_v2_compact")
         print(f"📎 CVC patterns: {'on' if cvc_patterns_enabled() else 'off'}")
     
     # 存储所有结果

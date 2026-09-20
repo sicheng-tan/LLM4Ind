@@ -33,6 +33,10 @@ def test_infer_pattern_on_directed_eq() -> None:
     _ok(":pattern ((plus (s x) y))" in line, line)
     bare = format_assert_line(f, add_pattern=False)
     _ok(bare == f"(assert {f})", bare)
+    named = format_assert_line(f, named="C1")
+    _ok(":named C1" in named and f in named, named)
+    both = format_assert_line(f, add_pattern=True, named="C1")
+    _ok(":named C1" in both and ":pattern ((plus (s x) y))" in both, both)
 
 
 def test_pattern_skips_var_eq_and_implications() -> None:
@@ -85,13 +89,14 @@ def test_pattern_gate_requires_flag() -> None:
     try:
         _ok(not cvc_patterns_enabled())
         _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
+        # Feedback 6-way is deprecated: enabled=True still does not open.
         _ok(
-            should_add_cvc_patterns(
+            not should_add_cvc_patterns(
                 failed_data=failed, formulas=[eq], enabled=True,
             )
         )
         _ok(
-            v2_should_add_cvc_patterns(
+            not v2_should_add_cvc_patterns(
                 strategy_mode="default",
                 failed_data=failed,
                 formulas=[eq],
@@ -100,11 +105,11 @@ def test_pattern_gate_requires_flag() -> None:
         )
         apply_cvc_patterns_cli("on")
         _ok(cvc_patterns_enabled())
-        _ok(should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
+        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
         apply_cvc_patterns_cli("off")
         _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
         _ok(
-            should_add_cvc_patterns(
+            not should_add_cvc_patterns(
                 failed_data={**failed, "cvc_patterns": True},
                 formulas=[eq],
             )
@@ -139,9 +144,9 @@ def test_pattern_feature_gates() -> None:
             enabled=True,
         )
     )
-    # rare_inst + directed eq + flag
+    # rare_inst + directed eq + flag still does not open (deprecated 6-way)
     _ok(
-        should_add_cvc_patterns(
+        not should_add_cvc_patterns(
             failed_data=rare,
             formulas=[eq],
             enabled=True,

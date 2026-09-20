@@ -18,18 +18,19 @@ if __name__ == "__main__":
     parser.add_argument("base_name")
     parser.add_argument(
         "--strategy-mode",
-        choices=["default", "default_simple", "zero_shot", "naive", "v2"],
+        choices=["default", "default_simple", "zero_shot", "naive", "v2", "v2_simple"],
         default="default",
         help="default: prompts_ours; default_simple: prompts_ours_compact (same two modes); "
         "zero_shot: same as default; naive: prompt_naive × 2N; "
-        "v2: prompts_v2 lemma_general+induction_step (retarget off → always general)",
+        "v2: prompts_v2 lemma_general × 2N; "
+        "v2_simple: prompts_v2_compact lemma_general × 2N (same advice as v2)",
     )
     parser.add_argument(
         "--cvc-patterns",
         choices=["on", "off"],
         default=None,
-        help="CVC :pattern on axiom inject (orthogonal to --strategy-mode). "
-        "Default: env CVC_PATTERNS or off",
+        help="CVC :pattern flag (temporarily unused: even on does not open 6-way). "
+        "Default: off",
     )
     parser.add_argument(
         "--baseline",

@@ -262,15 +262,181 @@ def cvc_profile_specs() -> Dict[str, dict]:
     }
 
 
+def named_difficulty_hits(
+    difficulty: Optional[List[Tuple[str, int]]],
+) -> List[str]:
+    """Assertion names with positive difficulty (``C1`` or ``(! … :named C1)``)."""
+    out: List[str] = []
+    seen = set()
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        tok = str(term or "").strip()
+        label = tok if tok and not tok.startswith("(") else (named_attr_id(tok) or "")
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def expand_named_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, int]]:
+    """Replace dump names / bang-named terms with the original candidate formula."""
+    mapping = {
+        str(k).strip(): str(v).strip()
+        for k, v in (name_map or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    out: List[Tuple[str, int]] = []
+    for term, score in difficulty or []:
+        tok = str(term or "").strip()
+        label = tok if tok and not tok.startswith("(") else (named_attr_id(tok) or "")
+        formula = mapping.get(label) if label else None
+        if formula:
+            out.append((formula, int(score)))
+            continue
+        inner = strip_named_annotation(tok) if tok.startswith("(") else tok
+        out.append((inner or tok, int(score)))
+    return out
+
+
+def attributed_candidate_ids(
+    difficulty: Optional[List[Tuple[str, int]]],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Exact ``:named`` hits, else canonical/α match of dump term to a candidate."""
+    mapping = {
+        str(k).strip(): str(v).strip()
+        for k, v in (name_map or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    found: List[str] = []
+    seen = set()
+
+    def _add(cid: str) -> None:
+        if cid and cid not in seen:
+            seen.add(cid)
+            found.append(cid)
+
+    for cid in named_difficulty_hits(difficulty):
+        if not mapping or cid in mapping:
+            _add(cid)
+    if not mapping:
+        return found
+    cans = {cid: canonical_smt_term(formula) for cid, formula in mapping.items()}
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        tok = str(term or "").strip()
+        if not tok.startswith("("):
+            continue
+        can = canonical_smt_term(strip_named_annotation(tok))
+        for cid, want in cans.items():
+            if can == want:
+                _add(cid)
+    return found
+
+
+def attributed_ids_from_portfolio(
+    result: Optional[CvcResult],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Exists-attribution across CVC5 portfolio dumps (not CVC4)."""
+    if result is None:
+        return []
+    found: List[str] = []
+    seen = set()
+    blobs: List[Optional[List[Tuple[str, int]]]] = [list(result.difficulty or [])]
+    for name, blob in (result.portfolio_results or {}).items():
+        if name == "cvc4_default" or not isinstance(blob, dict):
+            continue
+        diff: List[Tuple[str, int]] = []
+        for item in blob.get("difficulty") or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                diff.append((str(item[0]), int(item[1])))
+        blobs.append(diff)
+    for diff in blobs:
+        for cid in attributed_candidate_ids(diff, name_map):
+            if cid not in seen:
+                seen.add(cid)
+                found.append(cid)
+    return found
+
+
+def _goal_score_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+) -> Optional[int]:
+    for term, score in difficulty or []:
+        if int(score or 0) > 0 and classify_difficulty_term(str(term), goal_term) == "goal":
+            return int(score)
+    return None
+
+
 def _compact_cvc(result: CvcResult) -> dict:
+    stats = result.stats or {}
+    slim_stats = {
+        "CONJ_TOTAL": int(stats.get("CONJ_TOTAL") or 0),
+        "INST_TOTAL": int(stats.get("INST_TOTAL") or 0),
+        "QUANTIFIERS_SKOLEMIZE": int(stats.get("QUANTIFIERS_SKOLEMIZE") or 0),
+    } if stats else {}
     return {
         "proved": result.proved,
         "status": result.status,
         "elapsed": round(result.elapsed, 3),
         "strategy": result.strategy,
-        "stats": result.stats,
+        "stats": slim_stats or result.stats,
         "error": result.error,
+        "dump_complete": difficulty_dump_complete(result.difficulty),
+        "goal_difficulty": _goal_score_from_difficulty(
+            result.difficulty, result.goal_term,
+        ),
+        "attributed_ids": named_difficulty_hits(result.difficulty),
+        "difficulty": [[t, s] for t, s in (result.difficulty or [])],
+        "instantiations": [[t, n] for t, n in (result.instantiations or [])],
+        "goal_term": result.goal_term,
     }
+
+
+def profile_as_result(parent: CvcResult, name: str) -> Optional[CvcResult]:
+    """Rebuild one portfolio arm as a ``CvcResult`` from compact summaries."""
+    blob = (parent.portfolio_results or {}).get(name)
+    if not isinstance(blob, dict):
+        if parent.strategy == name:
+            return parent
+        return None
+    difficulty: List[Tuple[str, int]] = []
+    for item in blob.get("difficulty") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            difficulty.append((str(item[0]), int(item[1])))
+    instantiations: List[Tuple[str, int]] = []
+    for item in blob.get("instantiations") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            instantiations.append((str(item[0]), int(item[1])))
+    stats = blob.get("stats") if isinstance(blob.get("stats"), dict) else {}
+    return CvcResult(
+        proved=bool(blob.get("proved", False)),
+        status=str(blob.get("status") or parent.status),
+        elapsed=float(blob.get("elapsed") or parent.elapsed or 0.0),
+        strategy=name,
+        stats=dict(stats or {}),
+        difficulty=difficulty,
+        instantiations=instantiations,
+        goal_term=blob.get("goal_term") or parent.goal_term,
+        portfolio_results=parent.portfolio_results,
+    )
+
+
+def pick_advice_witness(result: CvcResult) -> CvcResult:
+    """HD / TRIGGER shape: prefer a complete ``cvc5_simple`` dump, not richest CONJ."""
+    for name in ("cvc5_simple", "cvc5_inductive", "cvc5_inductive_no_ematching"):
+        sub = profile_as_result(result, name)
+        if sub is not None and difficulty_dump_complete(sub.difficulty):
+            return sub
+    return result
 
 
 def run_cvc(
@@ -1235,6 +1401,20 @@ def counterexample_reason_for_smt(
     return fallback
 
 
+def named_attr_id(term: str) -> Optional[str]:
+    """``C1`` from ``(! φ :named C1)``, else None."""
+    kids = _sexpr_children(term)
+    if not kids or kids[0] != "!":
+        return None
+    i = 2
+    while i < len(kids) - 1:
+        if kids[i] == ":named":
+            label = str(kids[i + 1] or "").strip()
+            return label or None
+        i += 1
+    return None
+
+
 def _parse_difficulty_entry(expr: str) -> Optional[Tuple[str, int]]:
     kids = _sexpr_children(expr)
     if len(kids) != 2:
@@ -1242,7 +1422,8 @@ def _parse_difficulty_entry(expr: str) -> Optional[Tuple[str, int]]:
     term, score_tok = kids
     if not re.fullmatch(r"-?\d+", score_tok):
         return None
-    if not term.startswith("("):
+    # Named dump prints ``(C1 756)``; formulas still start with ``(``.
+    if not term:
         return None
     return normalize_smt_term(term), int(score_tok)
 
@@ -1262,8 +1443,8 @@ def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
     Parse ``--dump-difficulty`` (or legacy ``(get-difficulty)``) output with a
     balanced s-expr scan.
 
-    Each entry is `( <s-expr> <int> )`. Nested SMT such as
-    `(plus (succ n) m)` is allowed; a one-level parenthesis regex is not.
+    Each entry is `( <s-expr-or-name> <int> )`. Nested SMT such as
+    `(plus (succ n) m)` is allowed. ``:named C1`` dumps as ``(C1 756)``.
     """
     items: List[Tuple[str, int]] = []
     i = 0

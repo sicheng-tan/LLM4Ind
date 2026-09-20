@@ -107,9 +107,8 @@ _GENERALIZE_HINTS = {"need_arithmetic_lemma"}
 EQUATIONAL_PROMPT = "prove_prompt_equational_reasoning"
 TERM_REWRITE_PROMPT = "prove_prompt_term_rewrite"
 
-# v2 pack (prompts_v2): start on lemma_general; HD bit drives deterministic retarget.
+# v2 pack (prompts_v2): only lemma_general. HD/structural repair is LAST ATTEMPT advice.
 V2_LEMMA_GENERAL = "lemma_general"
-V2_INDUCTION_STEP = "induction_step"
 _HD_HINT_KIND = "high_difficulty_assertions"
 # Sentinel so the first post-failure retarget always compares against a fresh HD bit.
 V2_START_SIGNATURE = "start"
@@ -694,7 +693,7 @@ def reset_prompt_mode_rng() -> None:
 
 def _pool_is_v2(strategies: Sequence[str]) -> bool:
     pool = {s for s in strategies if s}
-    return V2_LEMMA_GENERAL in pool or V2_INDUCTION_STEP in pool
+    return V2_LEMMA_GENERAL in pool
 
 
 def hints_have_high_difficulty(hints: Sequence[dict]) -> bool:
@@ -711,9 +710,8 @@ def v2_hd_signature(hints: Sequence[dict]) -> str:
 
 
 def v2_mode_from_hd(hints: Sequence[dict]) -> str:
-    """Deterministic map: HD → induction_step, else lemma_general."""
-    if hints_have_high_difficulty(hints):
-        return V2_INDUCTION_STEP
+    """v2 has a single template; HD does not switch prompts."""
+    del hints
     return V2_LEMMA_GENERAL
 
 
@@ -723,13 +721,13 @@ def select_v2_generation_prompt(
     *,
     rng: Optional[random.Random] = None,
 ) -> str:
-    """First template for v2: always ``lemma_general`` (HD applies only on retarget)."""
+    """First (and only) template for v2: always ``lemma_general``."""
     del hints, rng  # first pick ignores HD / RNG
     pool = [s for s in strategies if s]
     if not pool:
         return ""
     if V2_LEMMA_GENERAL in pool:
-        logging.info("v2 start prompt → %s (default; HD retarget later)", V2_LEMMA_GENERAL)
+        logging.info("v2 start prompt → %s", V2_LEMMA_GENERAL)
         return V2_LEMMA_GENERAL
     return pool[0]
 
@@ -744,10 +742,10 @@ def retarget_v2_generation_prompt(
     rng: Optional[random.Random] = None,
     switch_after: int = NO_HELP_PROMPT_SWITCH,
 ) -> Tuple[str, int, str, str]:
-    """v2 retarget: HD bit change → deterministic mode; else consecutive flip.
+    """v2 retarget: stay on ``lemma_general`` (singleton pool).
 
-    - ``hd`` → ``induction_step``, ``no_hd`` → ``lemma_general``
-    - Consecutive flips have **no per-node cap**.
+    HD bit / consecutive no-help used to flip ``induction_step``; that
+    template is gone, so both paths keep ``lemma_general``.
     Returns (prompt, consecutive_no_help, signature, reason) with reason in
     ``kind`` / ``consecutive`` / ``keep``.
     """
@@ -793,8 +791,7 @@ def select_generation_prompt(
     With ``hint_guided=False`` (CVC5 default), ignore repair-hint families and
     keep the paper / v2 start order.
 
-    For the v2 pack (``lemma_general`` / ``induction_step``), always start on
-    ``lemma_general``; HD only affects later retarget when ``hint_guided``.
+    For the v2 pack, always start on ``lemma_general``.
     """
     pool = [s for s in strategies if s]
     if not pool:
@@ -863,9 +860,8 @@ def retarget_generation_prompt(
     With ``hint_guided=False`` (CVC5 default), only consecutive empty/invalid/
     useless toggles; repair-hint / HD kind changes are ignored.
 
-    For v2 packs (when ``hint_guided``), HD bit changes map deterministically
-    to induction_step / lemma_general; consecutive no-help still toggles with
-    no per-node flip cap.
+    For v2 packs (when ``hint_guided``), the singleton ``lemma_general``
+    pool cannot flip.
 
     Returns (prompt, consecutive_no_help, signature, reason)
     with reason in ``kind`` / ``consecutive`` / ``keep``.

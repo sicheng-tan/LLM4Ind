@@ -163,12 +163,21 @@ def test_exhausted_harvest_unsat_sets_skip_initial() -> None:
         assert lemmas == [_LEMMA]
         assert dispatch.get("skip_initial") == ["template_1"]
         assert dispatch.get("pre_proved") == {}
+        diag = (dispatch.get("skip_initial_diag") or {}).get("template_1") or {}
+        assert diag.get("status") == "timeout"
+        assert diag.get("proved") is False
 
 
 def test_skip_initial_prove_run_does_not_call_initial() -> None:
     import Mate_new as mate
 
     initial = MagicMock(return_value=False)
+    harvested = CvcResult(
+        status="timeout",
+        stats={"CONJ_TOTAL": 7, "INST_TOTAL": 1},
+        difficulty=[("(not (P 0))", 4)],
+        elapsed=0.2,
+    )
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
@@ -178,8 +187,40 @@ def test_skip_initial_prove_run_does_not_call_initial() -> None:
         }), patch("Mate_new.perform_initial_verification", initial), patch(
             "Mate_new.quick_run", return_value=(False, [], [])
         ):
-            mate.prove_run(tmp, "template", depth=1, skip_initial=True)
+            mate.prove_run(
+                tmp, "template", depth=1, skip_initial=True,
+                skip_initial_diag=mate._compact_cvc_diag(harvested),
+            )
         initial.assert_not_called()
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.status == "timeout"
+        assert cached.stats["CONJ_TOTAL"] == 7
+        assert cached.difficulty[0][1] == 4
+
+
+def test_harvest_retry_refreshes_goal_only_baseline() -> None:
+    import Mate_new as mate
+
+    first = CvcResult(status="timeout", stats={"CONJ_TOTAL": 1}, strategy="a")
+    retry = CvcResult(status="timeout", stats={"CONJ_TOTAL": 9}, strategy="b")
+    with tempfile.TemporaryDirectory() as tmp:
+        smt = Path(tmp) / "template.smt2"
+        smt.write_text(_GOAL, encoding="utf-8")
+        mate._set_goal_only_baseline(
+            tmp, "template", first, context="initial_goal", replace=False,
+        )
+        with patch("Mate_new.run_cvc_routed", return_value=retry), patch.dict(
+            os.environ, {"SOLVER_ROUTING": "off"},
+        ):
+            ok = mate.perform_initial_verification(
+                smt, base_path=tmp, goal_name="template", log_event="harvest_retry",
+            )
+        assert ok is False
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.stats["CONJ_TOTAL"] == 9
+        assert cached.strategy == "b"
 
 
 def test_library_off_disables_harvest() -> None:
@@ -220,6 +261,7 @@ def main() -> int:
     test_slow_unsat_proved_harvest_skips_prove_run_and_initial()
     test_exhausted_harvest_unsat_sets_skip_initial()
     test_skip_initial_prove_run_does_not_call_initial()
+    test_harvest_retry_refreshes_goal_only_baseline()
     test_library_off_disables_harvest()
     print("lemma harvest tests passed")
     return 0

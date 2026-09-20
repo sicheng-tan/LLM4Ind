@@ -60,6 +60,21 @@ def test_parse_named_assertion() -> None:
     _ok(classify_difficulty_term(items[0][0]) == "axiom", items[0][0])
 
 
+def test_parse_named_symbol_difficulty() -> None:
+    from cvc5_runner import attributed_candidate_ids, expand_named_difficulty
+
+    text = "unknown\n(\n(C1 756)\n((forall ((n Nat)) (= n n)) 3)\n)\n"
+    items = parse_cvc_difficulty(text)
+    scores = {term: score for term, score in items}
+    _ok(scores.get("C1") == 756, items)
+    _ok(any("forall" in t for t in scores), items)
+    mapping = {"C1": "(forall ((x Nat)) (= (plus x zero) x))"}
+    expanded = expand_named_difficulty(items, mapping)
+    _ok(any("plus x zero" in t for t, _s in expanded), expanded)
+    ids = attributed_candidate_ids(items, mapping)
+    _ok(ids == ["C1"], ids)
+
+
 def test_extract_proof_goal_block() -> None:
     smt = """(set-logic UFDT)
 (assert (forall ((n Nat)) (= (plus zero n) n)))
@@ -228,6 +243,7 @@ def main() -> int:
     tests = [
         test_parse_nested_difficulty,
         test_parse_named_assertion,
+        test_parse_named_symbol_difficulty,
         test_extract_proof_goal_block,
         test_goal_diff_ignores_front_negated_axiom,
         test_hard_axioms_not_raw_score_topk,

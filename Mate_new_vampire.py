@@ -83,6 +83,7 @@ from exp_flags import (
     repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
+    is_v2_strategy_mode,
 )
 from ancestor_stack import (
     AncestorStack,
@@ -2585,7 +2586,7 @@ def _prove_run_body(
         # v2: start signature is sentinel so the first HD/no_hd update can retarget.
         kind_signature = (
             V2_START_SIGNATURE
-            if pack.get("mode") == "v2"
+            if is_v2_strategy_mode(str(pack.get("mode") or ""))
             else prompt_kind_signature(hint_list)
         )
     else:
@@ -2608,7 +2609,8 @@ def _prove_run_body(
     # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
     # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
     # (Vampire): hint family picks the template. With retarget off: paper
-    # order, N attempts per template. v2 + retarget off: always lemma_general.
+    # order, N attempts per template. v2: always lemma_general (2N); retarget
+    # on/off does not change the template.
     for attempt in range(total_attempts):
         if not retarget:
             current_prompt = fixed_no_retarget or paper_schedule_prompt(

@@ -22,13 +22,10 @@ OURS_PROMPT_STRATEGIES = (
     "prove_prompt_term_rewrite",
 )
 NAIVE_PROMPT_STRATEGIES = ("prompt_naive",)
-# v2: general small-bridge + induction-step local bridges (no term_rewrite arm).
-V2_PROMPT_STRATEGIES = (
-    "lemma_general",
-    "induction_step",
-)
+# v2: one generic template (lemma_general). Structural repair is LAST ATTEMPT
+# GENERALIZE hint directions, not a second system prompt. Budget stays 2N.
+V2_PROMPT_STRATEGIES = ("lemma_general",)
 V2_LEMMA_GENERAL = "lemma_general"
-V2_INDUCTION_STEP = "induction_step"
 
 
 def _flag_enabled(name: str, default: str = "on") -> bool:
@@ -69,11 +66,11 @@ def ancestor_prompt_enabled() -> bool:
 
 
 def cvc_patterns_enabled() -> bool:
-    """Attach CVC ``:pattern`` on axiom inject when feedback triggers fire.
+    """CVC ``:pattern`` CLI/env flag. Default **off** (temporarily unused).
 
-    Independent of ``--strategy-mode`` (works with default / naive / v2 / …).
-    Default **off**; enable with ``CVC_PATTERNS=on`` or ``--cvc-patterns on``.
-    Vampire ignores this (no SMT ``:pattern``).
+    Feedback-gated 6-way ±pattern is deprecated: ``should_add_cvc_patterns``
+    stays false even if this returns true. Re-enable only with
+    ``PATTERN_FEEDBACK_GATE_ENABLED`` in ``smt_patterns.py``.
     """
     return _flag_enabled("CVC_PATTERNS", default="off")
 
@@ -104,6 +101,8 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
         return "naive"
     if mode in ("zero_shot", "zeroshot"):
         return "zero_shot"
+    if mode in ("v2_simple", "v2_compact", "general_ind_simple"):
+        return "v2_simple"
     if mode in ("v2", "general_ind", "general_induction"):
         return "v2"
     if mode in ("default_simple", "ours_simple", "simple"):
@@ -111,6 +110,11 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
     if mode in ("default", "ours", ""):
         return "default"
     return "default"
+
+
+def is_v2_strategy_mode(strategy_mode: str) -> bool:
+    """True for ``v2`` and ``v2_simple`` (same advice / lemma_general template)."""
+    return normalize_strategy_mode(strategy_mode) in ("v2", "v2_simple")
 
 
 def resolve_prompt_pack(
@@ -127,12 +131,10 @@ def resolve_prompt_pack(
     ``default_simple`` uses the same two template *names* as ``default``, but
     loads shortened system prompts from ``prompts_ours_compact``.
 
-    ``v2`` uses ``prompts_v2`` with ``lemma_general`` + ``induction_step``
-    (budget 2N). With ``PROMPT_RETARGET=off``, the loop stays on
-    ``lemma_general`` only (see ``no_retarget_prompt``). With retarget on,
-    the first attempt is always ``lemma_general``; HD then maps
-    deterministically to ``induction_step`` / ``lemma_general``, and
-    consecutive no-help flips the other template.
+    ``v2`` uses ``prompts_v2`` with only ``lemma_general`` (budget 2N).
+    ``v2_simple`` uses the same template name and budget from
+    ``prompts_v2_compact``. Retarget on/off does not change the template:
+    the pool is a singleton, so ``prompt_retarget_active`` is false either way.
     """
     n = max(1, int(max_attempts_per_prompt) or 1)
     mode = normalize_strategy_mode(strategy_mode)
@@ -154,7 +156,16 @@ def resolve_prompt_pack(
             "strategies": strategies,
             "max_attempts_per_prompt": n,
             "total_attempts": n * 2,
-            # Retarget off: never rotate onto induction_step via paper schedule.
+            "no_retarget_prompt": V2_LEMMA_GENERAL,
+        }
+    if mode == "v2_simple":
+        strategies = list(V2_PROMPT_STRATEGIES)
+        return {
+            "mode": mode,
+            "folder_path": "./prompts_v2_compact",
+            "strategies": strategies,
+            "max_attempts_per_prompt": n,
+            "total_attempts": n * 2,
             "no_retarget_prompt": V2_LEMMA_GENERAL,
         }
     if mode == "default_simple":
