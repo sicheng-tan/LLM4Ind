@@ -956,26 +956,27 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             ] + hint["suggested_actions"][:1]
         hints.append(hint)
 
-    # One mix inequality per hint. Both may fire; rewrite first.
-    if mix > 0:
-        rewrite_per_ind = dem / max(ind, 1)
-        if ind > 0 and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
-            hints.append({
-                "kind": "need_rewrite",
-                "priority": 1,
-                "context": context,
-                "detail": (
-                    "Rewriting is scarce relative to induction (demod/induction < 8). "
-                    "Likely missing equational lemmas that enable rewriting under the IH."
-                ),
-                "strength": round(
-                    gate_overshoot(rewrite_per_ind, REWRITE_PER_INDUCTION_MAX), 4
-                ),
-                "suggested_actions": [
-                    "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
-                    "Prefer lemmas whose LHS matches a subterm of the proof goal",
-                ],
-            })
+    # Disabled: need_rewrite — demod/induction mix mainly asks for equational
+    # lemmas; keep high-difficulty / induction_stuck as the LLM-facing signal.
+    # if mix > 0:
+    #     rewrite_per_ind = dem / max(ind, 1)
+    #     if ind > 0 and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
+    #         hints.append({
+    #             "kind": "need_rewrite",
+    #             "priority": 1,
+    #             "context": context,
+    #             "detail": (
+    #                 "Rewriting is scarce relative to induction (demod/induction < 8). "
+    #                 "Likely missing equational lemmas that enable rewriting under the IH."
+    #             ),
+    #             "strength": round(
+    #                 gate_overshoot(rewrite_per_ind, REWRITE_PER_INDUCTION_MAX), 4
+    #             ),
+    #             "suggested_actions": [
+    #                 "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
+    #                 "Prefer lemmas whose LHS matches a subterm of the proof goal",
+    #             ],
+    #         })
         # Disabled: need_induction_lemma — same "strengthen/generalize the goal"
         # narrative as CVC need_stronger_lemma.
         # ind_share = ind / mix

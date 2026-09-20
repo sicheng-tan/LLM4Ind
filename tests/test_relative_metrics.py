@@ -164,8 +164,8 @@ def test_cvc_mix_hints_small_problem() -> None:
         stats={"CONJ_TOTAL": 2, "QUANTIFIERS_SKOLEMIZE": 4, "INST_TOTAL": 8},
     ))
     _ok(
-        any(h["kind"] == "need_rewrite" for h in hints_rw),
-        f"skolem with sparse inst: {hints_rw}",
+        not any(h["kind"] == "need_rewrite" for h in hints_rw),
+        f"need_rewrite disabled: {hints_rw}",
     )
 
     hints_big = derive_repair_hints(CvcResult(
@@ -174,7 +174,7 @@ def test_cvc_mix_hints_small_problem() -> None:
     ))
     _ok(
         not any(h["kind"] == "need_rewrite" for h in hints_big),
-        f"skol=100 inst=900 is not sparse: {hints_big}",
+        f"need_rewrite disabled: {hints_big}",
     )
 
     hints_both = derive_repair_hints(CvcResult(
@@ -183,11 +183,7 @@ def test_cvc_mix_hints_small_problem() -> None:
     ))
     kinds_both = {h["kind"] for h in hints_both}
     _ok("need_stronger_lemma" not in kinds_both, f"stronger disabled: {hints_both}")
-    _ok("need_rewrite" in kinds_both, f"rewrite mix hint may still fire: {hints_both}")
-    by_kind = {h["kind"]: h for h in hints_both}
-    rewrite = by_kind["need_rewrite"]["strength"]
-    _ok(abs(rewrite - gate_overshoot(1 / 3, 0.75)) < 1e-4, rewrite)
-    _ok(rewrite > 0, rewrite)
+    _ok("need_rewrite" not in kinds_both, f"need_rewrite disabled: {hints_both}")
 
 
 def test_gate_overshoot_bounds() -> None:
@@ -204,15 +200,7 @@ def test_vampire_mix_strength_and_both_families() -> None:
         stats={"InductionApplications": 4, "StructuralInduction": 2, "Fw demodulations": 8},
     ))
     by_kind = {h["kind"]: h for h in rewrite_only}
-    _ok("need_rewrite" in by_kind, rewrite_only)
-    ind = 4 + 2
-    rewrite_per_ind = 8 / ind
-    _ok(
-        abs(by_kind["need_rewrite"]["strength"] - gate_overshoot(
-            rewrite_per_ind, REWRITE_PER_INDUCTION_MAX
-        )) < 1e-4,
-        by_kind["need_rewrite"],
-    )
+    _ok("need_rewrite" not in by_kind, f"need_rewrite disabled: {rewrite_only}")
 
     both = vampire_hints(VampireResult(
         status="timeout", elapsed=elapsed,
@@ -220,13 +208,9 @@ def test_vampire_mix_strength_and_both_families() -> None:
         stats={"InductionApplications": 1, "Fw demodulations": 6},
     ))
     kinds = {h["kind"]: h for h in both}
-    _ok("need_rewrite" in kinds, both)
+    _ok("need_rewrite" not in kinds, f"need_rewrite disabled: {both}")
     _ok("need_induction_lemma" not in kinds, f"induction_lemma disabled: {both}")
     _ok(kinds["induction_stuck"]["strength"] == 0.5, kinds["induction_stuck"])
-    _ok(
-        abs(kinds["need_rewrite"]["strength"] - gate_overshoot(6 / 1, REWRITE_PER_INDUCTION_MAX)) < 1e-4,
-        kinds["need_rewrite"],
-    )
 
 
 def test_vampire_small_vs_large() -> None:
@@ -289,8 +273,8 @@ def test_vampire_explosion_and_mix() -> None:
         stats={"InductionApplications": 4, "StructuralInduction": 2, "Fw demodulations": 8},
     ))
     _ok(
-        any(h["kind"] == "need_rewrite" for h in hints),
-        f"small induction-without-rewrite: {hints}",
+        not any(h["kind"] == "need_rewrite" for h in hints),
+        f"need_rewrite disabled: {hints}",
     )
 
     hints_ind = vampire_hints(VampireResult(
@@ -547,8 +531,9 @@ def test_cvc_instantiation_parse_and_rare_axioms() -> None:
     hard = next(h for h in hints if h["kind"] == "high_difficulty_assertions")
     _ok(unmatched in (hard.get("rarely_instantiated") or []), hard)
     _ok(
-        any("rarely instantiated" in a.lower() or "LHS" in a for a in hard.get("suggested_actions") or []),
-        hard.get("suggested_actions"),
+        "LHS" in (hard.get("detail") or "")
+        or any("rewrite" in str(a).lower() for a in (hard.get("suggested_actions") or [])),
+        hard.get("detail"),
     )
 
 

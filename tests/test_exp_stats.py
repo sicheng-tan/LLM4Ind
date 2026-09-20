@@ -184,11 +184,11 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
     folder = str(tmp_path)
     feedback = (
         "INVALID: The following lemmas are INVALID or CANNOT be verified.\n"
-        "PREVIOUS COMBINATIONS: each set below was tried with the axioms and did\n"
+        "LAST ATTEMPT (did not prove the CURRENT goal, status=timeout)\n"
         "SOLVER PROGRESS SIGNALS (cvc5 stats/difficulty)\n"
         "USEFUL BUT UNPROVED: these lemmas helped\n"
         "SOLVER ROUTING (feedback-guided theory portfolio):\n"
-        "SOLVER-GUIDED REPAIR (from cvc5 failure analysis).\n"
+        "  repair hints:\n"
         "Library (already proved, in axioms):\n"
         "Last obligation tree (attempt 2; for reference only):\n"
     )

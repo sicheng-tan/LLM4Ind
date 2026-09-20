@@ -102,8 +102,10 @@ from lemma_gates import (
     apply_static_lemma_screen,
     attach_source_lemmas,
     BENIGN_SCREEN_GATES,
+    compact_repair_snapshot,
     drop_failing_members,
-    format_repair_header,
+    format_attempt_feedback_for_prompt,
+    last_screen_records,
     is_invalid_diagnosis_reason,
     lemma_filter_drop_enabled,
     lemma_known_invalid,
@@ -114,7 +116,6 @@ from lemma_gates import (
     parse_final_diagnosis,
     parse_llm_lemmas,
     parse_llm_reason,
-    repair_hint_for_prompt,
     should_append_diagnosis_suffix,
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
@@ -177,6 +178,7 @@ def _empty_failed_data() -> dict:
         "exp_attempts": [],
         "node_outcome": {},
         "last_llm_reason": "",
+        "last_screen": [],
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -201,6 +203,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("exp_attempts", [])
             data.setdefault("node_outcome", {})
             data.setdefault("last_llm_reason", "")
+            data.setdefault("last_screen", [])
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -267,6 +270,17 @@ def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[st
         status=(meta or {}).get("status") if meta else None,
         hint=(meta or {}).get("hint_kind") if meta else None,
     )
+
+
+def save_last_screen(
+    base_path: str,
+    goal_name: str,
+    dropped: Sequence[Tuple[str, str, str]],
+) -> None:
+    """Overwrite the latest static-screen drops for the next LLM prompt."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_screen"] = last_screen_records(dropped)
+    save_failed_lemmas(base_path, goal_name, failed_data)
 
 def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
                        score: float, signals: List[str],
@@ -676,22 +690,13 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
 
     useless_members = _lemmas_in_useless_groups(failed_data)
 
-    if failed_data.get("useless_lemma_groups"):
-        parts.append(
-            "\nPREVIOUS COMBINATIONS: each set below was tried with the axioms and did "
-            "not prove the CURRENT goal within 60s. Some of these lemmas may still "
-            "help, but this set was not enough. Do not emit the exact same set "
-            "unchanged. You may keep any of these lemmas and add new ones:"
-        )
-        for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
-            lemmas = group if isinstance(group, list) else group.get("lemmas", [])
-            meta = "" if isinstance(group, list) else (
-                f" [vampire_status={group.get('status', '?')}; "
-                f"hint={group.get('hint_kind', '')}]"
-            )
-            parts.append(f"  Combination {i}{meta}:")
-            for j, lemma in enumerate(lemmas, 1):
-                parts.append(f"    {j}. {lemma}")
+    attempt_txt = format_attempt_feedback_for_prompt(
+        failed_data,
+        backend="vampire",
+        include_stuck=repair_hints_enabled(),
+    )
+    if attempt_txt:
+        parts.append(attempt_txt)
 
     if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
         parts.append(
@@ -704,7 +709,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
             profile = record.get("best_profile")
             profile_bit = f", profile={profile}" if profile else ""
             in_group = (
-                ", in a previous combination: you may keep it"
+                ", in the last attempt: you may keep it"
                 if record.get("lemma") in useless_members else ""
             )
             parts.append(
@@ -729,20 +734,6 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
         )
         if routing_txt:
             parts.append(routing_txt)
-
-    if repair_hints_enabled() and failed_data.get("repair_hints"):
-        hints = [h for h in failed_data["repair_hints"] if repair_hint_for_prompt(h)]
-        if hints:
-            parts.extend(format_repair_header("Vampire", hints))
-            for i, hint in enumerate(hints, 1):
-                parts.append(f"  Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}")
-                focus = hint.get("induction_focus") or []
-                if focus:
-                    parts.append(f"    Induction focus: {'; '.join(focus[:4])}")
-                for schema in (hint.get("induction_formulas") or [])[:2]:
-                    parts.append(f"    Induction schema: {schema}")
-                for action in hint.get("suggested_actions", [])[:3]:
-                    parts.append(f"    -> {action}")
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
@@ -1143,6 +1134,11 @@ def verify_combined_lemmas(
                     "Do not emit the exact same set unchanged; you may keep members and add lemmas.",
                 ],
             }], asserts, context="usefulness_check"))
+        snapshot = compact_repair_snapshot(
+            load_failed_lemmas(base_path, goal_name).get("repair_hints") or []
+        )
+        if snapshot:
+            meta["repair_hints"] = snapshot
         add_useless_lemma_group(
             base_path,
             goal_name,
@@ -2140,6 +2136,7 @@ def quick_run(
         library_items=library_items,
         ancestor_stack=ancestor_stack,
     )
+    save_last_screen(base_path, goal_smt_name, dropped)
     for lemma, reason, gate in dropped:
         if gate == "same_as_ancestor":
             log_exp(

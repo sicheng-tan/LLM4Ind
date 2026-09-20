@@ -21,7 +21,7 @@ import signal
 import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from llm_time_budget import remaining_task_s
 from solver_routing import (
@@ -66,6 +66,38 @@ def _cvc5_binary() -> str:
 
 def _cvc4_binary() -> str:
     return os.getenv("CVC4_BINARY", "./cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt")
+
+
+# Extra ±pattern arms: only E-matching profiles. no_ematching / cvc4 stay bare.
+PATTERN_CONTRAST_PROFILES = ("cvc5_simple", "cvc5_inductive")
+
+
+def cvc_portfolio_jobs(
+    names: Sequence[str],
+    smt2_path,
+    pattern_smt2_path=None,
+) -> List[Tuple[str, str, Path]]:
+    """Bare portfolio jobs, plus ``simple``/``inductive`` +pattern when gated.
+
+    Each item is ``(result_name, spec_name, smt_path)``. Pattern arms are
+    added only when ``pattern_smt2_path`` is set *and* that spec is already
+    in this wave (default 4-way → 6-way).
+    """
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    jobs: List[Tuple[str, str, Path]] = []
+    seen_specs = set()
+    for name in names:
+        if name not in specs:
+            continue
+        jobs.append((name, name, smt2_path))
+        seen_specs.add(name)
+    if pattern_smt2_path:
+        pat = Path(pattern_smt2_path)
+        for spec_name in PATTERN_CONTRAST_PROFILES:
+            if spec_name in seen_specs:
+                jobs.append((f"{spec_name}+pattern", spec_name, pat))
+    return jobs
 
 
 # After --tlimit-per ends check-sat, allow this many seconds for --dump-difficulty
@@ -248,22 +280,27 @@ def run_cvc(
     collect_stats: bool = False,
     collect_difficulty: bool = False,
     profiles: Optional[List[str]] = None,
+    pattern_smt2_path=None,
 ) -> CvcResult:
     """
     Portfolio prove: named CVC5/CVC4 strategies in parallel.
     Default profiles match the paper (simple / inductive / no-ematching / cvc4).
     First unsat wins.
 
-    When collect_stats / collect_difficulty are set, CVC5 strategies get --stats,
-    --tlimit-per, and (for difficulty) --produce-difficulty --dump-difficulty.
+    ``pattern_smt2_path``: when set, also race ``cvc5_simple+pattern`` and
+    ``cvc5_inductive+pattern`` on that SMT (6-way if the default 4 names run).
     """
     names = profiles or list(CVC5_FALLBACK_PROFILES)
+    extra = {}
+    if pattern_smt2_path:
+        extra["pattern_smt2_path"] = pattern_smt2_path
     return _run_cvc_parallel(
         smt2_path,
         timeout,
         names,
         collect_stats=collect_stats,
         collect_difficulty=collect_difficulty,
+        **extra,
     )
 
 
@@ -298,14 +335,19 @@ def run_cvc_routed(
     state: Optional[GoalSearchState] = None,
     collect_stats: bool = False,
     collect_difficulty: bool = False,
+    pattern_smt2_path=None,
 ) -> CvcResult:
     """Prove with recommended profiles first, then the paper 4-way portfolio."""
+    extra = {}
+    if pattern_smt2_path:
+        extra["pattern_smt2_path"] = pattern_smt2_path
     if not routing_enabled() or state is None or not state.candidate_profiles:
         return run_cvc(
             smt2_path,
             timeout,
             collect_stats=collect_stats,
             collect_difficulty=collect_difficulty,
+            **extra,
         )
 
     start = time.time()
@@ -326,6 +368,7 @@ def run_cvc_routed(
         primary,
         collect_stats=collect_stats,
         collect_difficulty=collect_difficulty,
+        **extra,
     )
     summaries = dict(result.portfolio_results)
     if result.proved:
@@ -340,6 +383,7 @@ def run_cvc_routed(
             fallback,
             collect_stats=collect_stats,
             collect_difficulty=collect_difficulty,
+            **extra,
         )
         summaries.update(fb.portfolio_results)
         fb.portfolio_results = summaries
@@ -369,6 +413,7 @@ def _cvc_prove_cmd(
         if collect_difficulty:
             cmd.append("--produce-difficulty")
             cmd.append("--dump-difficulty")
+            cmd.append("--difficulty-mode=lemma-literal-all")
     elif cfg.get("type") == "CVC4" and tlimit_s is not None:
         # Stop CVC4 at the prove slice so portfolio grace is reserved for CVC5
         # difficulty dump (CVC4 has no difficulty output).
@@ -497,12 +542,14 @@ def _run_cvc_parallel(
     *,
     collect_stats: bool,
     collect_difficulty: bool = False,
+    pattern_smt2_path=None,
 ) -> CvcResult:
     smt2_path = Path(smt2_path)
     specs = cvc_profile_specs()
-    strategies = {n: specs[n] for n in names if n in specs}
-    if not strategies:
+    jobs = cvc_portfolio_jobs(names, smt2_path, pattern_smt2_path)
+    if not jobs:
         return CvcResult(status="error", error="no known cvc profiles requested")
+    spec_by_result = {result_name: spec_name for result_name, spec_name, _path in jobs}
 
     tlimit_s, wall_s = cvc_time_budget(
         timeout, collect_difficulty=collect_difficulty,
@@ -518,10 +565,11 @@ def _run_cvc_parallel(
             smt_content = ""
         goal_term = extract_proof_goal_term(smt_content) if smt_content else None
 
-        for name, cfg in strategies.items():
+        for result_name, spec_name, job_path in jobs:
+            cfg = specs[spec_name]
             cmd = _cvc_prove_cmd(
                 cfg,
-                smt2_path,
+                job_path,
                 timeout,
                 collect_stats=collect_stats,
                 collect_difficulty=collect_difficulty,
@@ -535,13 +583,21 @@ def _run_cvc_parallel(
                     text=True,
                     preexec_fn=os.setsid,
                 )
-                processes[name] = proc
+                processes[result_name] = proc
             except FileNotFoundError:
                 logging.error("%s binary not found: %s", cfg["type"], cfg["binary"])
-                summaries[name] = {"status": "error", "error": "binary not found", "strategy": name}
+                summaries[result_name] = {
+                    "status": "error",
+                    "error": "binary not found",
+                    "strategy": result_name,
+                }
             except Exception as e:
-                logging.error("Failed to start %s: %s", name, e)
-                summaries[name] = {"status": "error", "error": str(e), "strategy": name}
+                logging.error("Failed to start %s: %s", result_name, e)
+                summaries[result_name] = {
+                    "status": "error",
+                    "error": str(e),
+                    "strategy": result_name,
+                }
 
         if not processes:
             return CvcResult(status="error", error="no solver process started", portfolio_results=summaries)
@@ -582,7 +638,7 @@ def _run_cvc_parallel(
                     _cleanup_processes(processes, exclude=name)
                     logging.info(
                         "%s验证成功: unsat (策略: %s, %.2fs)",
-                        strategies[name]["type"], name, elapsed,
+                        specs[spec_by_result[name]]["type"], name, elapsed,
                     )
                     summaries[name] = _compact_cvc(result)
                     result.portfolio_results = summaries
@@ -611,9 +667,13 @@ def _run_cvc_parallel(
             )
             full_results[name] = result
             summaries[name] = _compact_cvc(result)
-        for name in strategies:
-            if name not in summaries:
-                summaries[name] = {"status": "timeout", "elapsed": round(elapsed, 3), "strategy": name}
+        for result_name, _spec_name, _path in jobs:
+            if result_name not in summaries:
+                summaries[result_name] = {
+                    "status": "timeout",
+                    "elapsed": round(elapsed, 3),
+                    "strategy": result_name,
+                }
         logging.warning("CVC5/CVC4验证超时或失败 (耗时: %.2f秒)", elapsed)
         statuses = [item.get("status") for item in summaries.values()]
         if timed_out:
@@ -631,7 +691,7 @@ def _run_cvc_parallel(
             proved=False,
             status=final_status,
             elapsed=elapsed,
-            strategy=richest.strategy if richest else next(iter(strategies)),
+            strategy=richest.strategy if richest else jobs[0][0],
             stats=dict(richest.stats) if richest else {},
             difficulty=list(richest.difficulty) if richest else [],
             stdout=richest.stdout if richest else "",
@@ -1227,7 +1287,7 @@ def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
         if t not in seen:
             seen.add(t)
             out.append((t, s))
-    return out[:12]
+    return out
 
 
 
@@ -1238,6 +1298,16 @@ def _cvc_stat_rate(stats: Dict[str, int], elapsed: float, key: str) -> float:
     if ms:
         time_s = max(time_s, ms / 1000.0)
     return activity_rate(count, time_s)
+
+
+def difficulty_dump_complete(difficulty: Optional[List[Tuple[str, int]]]) -> bool:
+    """True when CVC returned at least one positive score.
+
+    Official dumps omit difficulty-0 assertions. Our former top-12 cap is gone,
+    so a non-empty dump may treat unlisted assertions as 0. An empty list means
+    the dump is missing (timeout/no flush), not that everything is 0.
+    """
+    return bool(difficulty)
 
 
 def compute_progress_score(
@@ -1311,7 +1381,10 @@ def compute_progress_score(
         signals.append(f"goal_difficulty_drop({gb}->{gc},{int(round(100 * drop))}%)")
         strong += 1
 
-    if baseline.difficulty and candidate.difficulty:
+    if (
+        difficulty_dump_complete(baseline.difficulty)
+        and difficulty_dump_complete(candidate.difficulty)
+    ):
         def axiom_map(res: CvcResult) -> dict:
             g = goal_term or res.goal_term
             out = {}
@@ -1426,8 +1499,9 @@ def hard_axioms_from_difficulty(
 def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
     """Turn cvc5 failure signals into structured repair hints for the LLM.
 
-    Emits high_difficulty_assertions and need_rewrite. need_stronger_lemma and
-    generic timeout are intentionally disabled (commented) as misleading/noisy.
+    Emits high_difficulty_assertions. need_rewrite / need_stronger_lemma and
+    generic timeout are intentionally disabled (commented) as noisy for the LLM;
+    rewrite-scarce mix is still available to the ``:pattern`` gate via stats.
     """
     if result.proved:
         return []
@@ -1449,28 +1523,21 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
             "kind": "high_difficulty_assertions",
             "context": context,
             "detail": (
-                "cvc5 difficulty tracking shows these assertions were frequently "
-                "involved without finishing the proof. Prefer lemmas that bridge "
-                "high-difficulty recursive definitions to the goal."
+                "CVC5 difficulty marks these input assertions as runtime hotspots "
+                "(lemma-literal-all), not proof dependencies or instantiation counts."
             ),
             "hard_axioms": hard_axioms,
             "rarely_instantiated": rare,
             "goal_fragments": goal_bits,
             "suggested_actions": [
-                "Generate equational lemmas about functions appearing in hard axioms",
-                "If a recursive function appears in both hard axioms and the goal, "
-                "propose a generalized inductive lemma",
-                "Avoid repeating lemmas already marked invalid or useless",
+                "Propose a lemma using functions from a hotspot axiom and the CURRENT goal",
             ],
         })
         if rare:
             hints[-1]["detail"] += (
-                " Some hard axioms had no matching instantiations; "
-                "the solver may not be triggering them."
+                " Some hotspot axioms had no matching instantiations; "
+                "a rewrite whose LHS matches them or the goal may help triggering."
             )
-            hints[-1]["suggested_actions"] = [
-                "Add a rewrite lemma whose LHS matches a rarely instantiated hard axiom or the goal",
-            ] + hints[-1]["suggested_actions"][:2]
 
     conj = stats.get("CONJ_TOTAL", 0)
     skol = stats.get("QUANTIFIERS_SKOLEMIZE", 0)
@@ -1499,22 +1566,26 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
         #             "Try associativity/commutativity/distributivity style facts",
         #         ],
         #     })
-        if skol > 0 and inst_of_matching < INST_OF_MATCHING_MAX:
-            hints.append({
-                "kind": "need_rewrite",
-                "priority": 2,
-                "context": context,
-                "detail": (
-                    "cvc5 skolemized but instantiations are not the majority of "
-                    "skolem+matching activity. Missing rewrite-oriented lemmas "
-                    "may be blocking matching."
-                ),
-                "strength": round(gate_overshoot(inst_of_matching, INST_OF_MATCHING_MAX), 4),
-                "suggested_actions": [
-                    "Propose rewrite lemmas whose LHS matches a subterm of the goal",
-                    "Unfold recursive definitions one step in a lemma",
-                ],
-            })
+        # Disabled: need_rewrite — mix ratio (inst/(skol+inst) < 0.75) mainly
+        # tells the LLM to emit equational/rewrite lemmas; it is laggy when C
+        # changes and is a weaker prompt signal than high-difficulty axioms.
+        # The same stats still feed rewrite_scarce_stats in smt_patterns.
+        # if skol > 0 and inst_of_matching < INST_OF_MATCHING_MAX:
+        #     hints.append({
+        #         "kind": "need_rewrite",
+        #         "priority": 2,
+        #         "context": context,
+        #         "detail": (
+        #             "cvc5 skolemized but instantiations are not the majority of "
+        #             "skolem+matching activity. Missing rewrite-oriented lemmas "
+        #             "may be blocking matching."
+        #         ),
+        #         "strength": round(gate_overshoot(inst_of_matching, INST_OF_MATCHING_MAX), 4),
+        #         "suggested_actions": [
+        #             "Propose rewrite lemmas whose LHS matches a subterm of the goal",
+        #             "Unfold recursive definitions one step in a lemma",
+        #         ],
+        #     })
 
     # Disabled: generic timeout hint — low information; success/fail both emit it often.
     # if result.status in ("timeout", "unknown") and not hints:

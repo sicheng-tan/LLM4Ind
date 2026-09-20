@@ -9,6 +9,7 @@ from smt_patterns import (
     format_assert_line,
     has_directed_equality,
     infer_trigger_pattern,
+    pattern_trigger_reasons,
     should_add_cvc_patterns,
     strip_bang_attrs,
     v2_pattern_features,
@@ -68,9 +69,18 @@ def test_inject_library_with_patterns() -> None:
     _ok(":pattern" not in bare, bare)
 
 
+def _rare_inst_failed() -> dict:
+    return {
+        "repair_hints": [{
+            "kind": "high_difficulty_assertions",
+            "rarely_instantiated": ["(forall ((x Nat)) true)"],
+        }],
+    }
+
+
 def test_pattern_gate_requires_flag() -> None:
     eq = "(forall ((x Nat)) (= (f x) x))"
-    failed = {"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]}
+    failed = _rare_inst_failed()
     prev = os.environ.pop("CVC_PATTERNS", None)
     try:
         _ok(not cvc_patterns_enabled())
@@ -108,33 +118,40 @@ def test_pattern_gate_requires_flag() -> None:
 
 def test_pattern_feature_gates() -> None:
     eq = "(forall ((x Nat)) (= (f x) x))"
-    # usefulness timeout + directed eq → on (fail-skewed bridge case)
+    rare = _rare_inst_failed()
+    # usefulness timeout is logged, but does not open 6-way ±pattern
     _ok(
-        should_add_cvc_patterns(
+        not should_add_cvc_patterns(
             failed_data={"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]},
             formulas=[eq],
             enabled=True,
         )
     )
-    # need_rewrite
+    feats_to = v2_pattern_features(
+        {"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]}
+    )
+    _ok(feats_to["useful_timeout"] and not feats_to["trigger"], feats_to)
+    # need_rewrite / rewrite_scarce do not open
     _ok(
-        should_add_cvc_patterns(
+        not should_add_cvc_patterns(
             failed_data={"repair_hints": [{"kind": "need_rewrite"}]},
             formulas=[eq],
             enabled=True,
         )
     )
-    # rare_inst
+    # rare_inst + directed eq + flag
     _ok(
         should_add_cvc_patterns(
-            failed_data={
-                "repair_hints": [{
-                    "kind": "high_difficulty_assertions",
-                    "rarely_instantiated": ["(forall ((x Nat)) true)"],
-                }],
-            },
+            failed_data=rare,
             formulas=[eq],
             enabled=True,
+        )
+    )
+    _ok(
+        not should_add_cvc_patterns(
+            failed_data=rare,
+            formulas=[eq],
+            enabled=False,
         )
     )
     # low em/conj alone does NOT open (would prefer successes on full706)
@@ -154,10 +171,10 @@ def test_pattern_feature_gates() -> None:
             enabled=True,
         )
     )
-    # timeout but no directed equality
+    # rare_inst but no directed equality
     _ok(
         not should_add_cvc_patterns(
-            failed_data={"useless_lemma_groups": [{"lemmas": ["true"], "status": "timeout"}]},
+            failed_data=rare,
             formulas=["(forall ((x Nat)) true)"],
             enabled=True,
         )
@@ -165,22 +182,16 @@ def test_pattern_feature_gates() -> None:
     # explosion ignored (always off in features)
     feats = v2_pattern_features(
         {
-            "useless_lemma_groups": [{"status": "timeout"}],
+            **rare,
             "progress_routing_signals": ["search_explosion(+50%)"],
         }
     )
-    _ok(feats["useful_timeout"] and feats["trigger"], feats)
+    _ok(feats["rare_inst"] and feats["trigger"], feats)
     _ok(feats["search_explosion"] is False, feats)
-    _ok(
-        should_add_cvc_patterns(
-            failed_data={
-                "useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}],
-                "progress_routing_signals": ["search_explosion(+50%)"],
-            },
-            formulas=[eq],
-            enabled=True,
-        )
-    )
+    _ok(pattern_trigger_reasons(rare) == ["rare_inst"])
+    _ok(pattern_trigger_reasons(
+        {"useless_lemma_groups": [{"status": "timeout"}]}
+    ) == [])
 
 
 def main() -> None:

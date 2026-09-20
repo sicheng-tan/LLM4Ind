@@ -254,8 +254,8 @@ def inject_library_axioms(
 ) -> str:
     """Insert proved lemmas as axioms just before the proof-goal block.
 
-    When ``add_patterns`` is set (v2 CVC only), directed equalities get a
-    ``:pattern`` on the LHS for E-matching. Subgoal SMT stays bare.
+    When ``add_patterns`` is set, directed equalities get a ``:pattern`` on
+    the LHS for E-matching. Subgoal SMT stays bare.
     """
     from smt_patterns import format_assert_line
 
@@ -289,6 +289,7 @@ def materialize_smt_with_library(
     base_path: str,
     *,
     add_patterns: bool = False,
+    dest: Optional[Path] = None,
 ) -> Path:
     """Write a sibling SMT file that includes the lemma library, if any."""
     if not lemma_library_enabled():
@@ -301,7 +302,7 @@ def materialize_smt_with_library(
         lemmas,
         add_patterns=add_patterns,
     )
-    out = smt_path.with_name(smt_path.stem + ".__lib.smt2")
+    out = dest if dest is not None else smt_path.with_name(smt_path.stem + ".__lib.smt2")
     out.write_text(content, encoding="utf-8")
     return out
 

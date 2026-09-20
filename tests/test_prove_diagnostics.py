@@ -60,6 +60,7 @@ def test_cvc_prove_cmd_adds_stats_and_tlimit() -> None:
     assert "--tlimit-per=60000" in cmd
     assert "--produce-difficulty" in cmd
     assert "--dump-difficulty" in cmd
+    assert "--difficulty-mode=lemma-literal-all" in cmd
     assert cmd[-1] == "goal.smt2"
 
     cvc4 = {"binary": "cvc4", "options": [], "type": "CVC4"}
@@ -121,6 +122,7 @@ def test_cvc_prove_cmd_stats_only_skips_dump_difficulty() -> None:
     assert "--stats" in cmd
     assert "--dump-difficulty" not in cmd
     assert "--produce-difficulty" not in cmd
+    assert "--difficulty-mode=lemma-literal-all" not in cmd
 
 
 def test_cvc_prove_cmd_uses_explicit_tlimit_s() -> None:
@@ -597,8 +599,8 @@ def test_progress_prompt_does_not_fight_useless_group() -> None:
             "unproved_lemmas": [],
             "routing": {},
         })
-    assert "PREVIOUS COMBINATIONS" in txt
-    assert "in a previous combination: you may keep it" in txt
+    assert "LAST ATTEMPT" in txt
+    assert "in the last attempt: you may keep it" in txt
     assert "NOT proof of usefulness" in txt
 
 
@@ -623,8 +625,9 @@ def test_vampire_prompt_includes_induction_schema() -> None:
         "unproved_lemmas": [],
         "routing": {},
     })
-    assert "Induction schema:" in txt
+    assert "induction schema:" in txt
     assert "plus" in txt
+    assert "INITIAL SOLVE" in txt
     assert "[structural]" not in txt
 
 
@@ -707,8 +710,12 @@ def test_cvc_prompt_labels_rarely_instantiated() -> None:
         "unproved_lemmas": [],
         "routing": {},
     })
-    assert "Hard axiom (rarely instantiated):" in txt
-    assert "Hard axiom:" not in txt.replace("Hard axiom (rarely instantiated):", "")
+    assert "rarely instantiated:" in txt
+    assert "high-difficulty axiom:" in txt
+    assert "Add a rewrite lemma" not in txt
+    assert "extra runtime" in txt
+    assert "two ends of a gap" in txt
+    assert "inductive generalization" not in txt
 
 
 def test_empty_llm_does_not_retry_immediately() -> None:
@@ -1127,27 +1134,17 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         diag.assert_not_called()
         hints = mate_v.load_failed_lemmas(tmp, "template")["repair_hints"]
         by_kind = {h["kind"]: h for h in hints}
-        assert "need_rewrite" in by_kind
-        assert by_kind["need_rewrite"].get("context") == "usefulness_check"
-        assert lemma in (by_kind["need_rewrite"].get("source_lemmas") or [])
+        assert "need_rewrite" not in by_kind
         assert "induction_stuck" in by_kind
         assert "no_progress" not in by_kind
-        txt = mate_v.format_solver_feedback_for_prompt({
-            "repair_hints": hints,
-            "invalid_lemmas": [],
-            "useless_lemma_groups": [],
-            "progress_lemmas": [],
-            "unproved_lemmas": [],
-            "routing": {},
-        })
-        assert "C1:" in txt
-        bridge = (
-            "Failed to prove the goal using the above lemmas and produced hints. "
-            "Use these hints to choose the NEXT lemmas:"
+        txt = mate_v.format_solver_feedback_for_prompt(
+            mate_v.load_failed_lemmas(tmp, "template")
         )
-        assert bridge in txt
-        assert txt.index("SOLVER-GUIDED REPAIR") < txt.index("C1:")
-        assert txt.index("C1:") < txt.index(bridge)
+        assert lemma in txt
+        assert "LAST ATTEMPT" in txt
+        assert "C1:" not in txt
+        assert "SOLVER-GUIDED REPAIR" not in txt
+        assert "Use these hints to choose the NEXT lemmas:" not in txt
 
     with tempfile.TemporaryDirectory() as tmp:
         original, _ = mate.extract_original_goal(_PROOF_GOAL_SMT)
@@ -1171,6 +1168,46 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         kinds = [h["kind"] for h in mate.load_failed_lemmas(tmp, "template")["repair_hints"]]
         assert "need_stronger_lemma" not in kinds
         assert "high_difficulty_assertions" in kinds
+        data = mate.load_failed_lemmas(tmp, "template")
+        assert "lemma_usage" not in (data["useless_lemma_groups"][-1] or {})
+        txt = mate.format_solver_feedback_for_prompt(data)
+        assert "[used" not in txt
+        assert "[unused]" not in txt
+        assert lemma in txt
+
+
+def test_usefulness_without_difficulty_omits_lemma_usage() -> None:
+    import Mate_new as mate
+
+    failed = CvcResult(
+        status="timeout",
+        proved=False,
+        elapsed=60.0,
+        stats={"CONJ_TOTAL": 10},
+        difficulty=[],
+    )
+    lemma = "(forall ((x Int)) (P x))"
+    with tempfile.TemporaryDirectory() as tmp:
+        original, _ = mate.extract_original_goal(_PROOF_GOAL_SMT)
+        out = Path(tmp) / "template_with_lemmas.smt2"
+        with patch.dict(os.environ, {
+            "FEEDBACK_PROGRESS": "off",
+            "SOLVER_ROUTING": "off",
+        }), patch("Mate_new.run_cvc_routed", return_value=failed):
+            mate.verify_combined_lemmas(
+                original, [lemma], _PROOF_GOAL_SMT, out,
+                base_path=tmp, goal_name="template",
+            )
+        data = mate.load_failed_lemmas(tmp, "template")
+        group = data["useless_lemma_groups"][-1]
+        assert "lemma_usage" not in group
+        for hint in data.get("repair_hints") or []:
+            assert "lemma_usage" not in hint
+        txt = mate.format_solver_feedback_for_prompt(data)
+        assert lemma in txt
+        assert "[used" not in txt
+        assert "[unused]" not in txt
+        assert "lemma_usage" not in txt
 
 
 def test_usefulness_success_keeps_all_lemmas_without_ucore() -> None:
@@ -1267,6 +1304,7 @@ def main() -> int:
     test_timeout_breaks_no_help_streak()
     test_kind_feedback_switches_after_one_no_help()
     test_usefulness_failure_mix_from_full_timeout_ac_implies_p()
+    test_usefulness_without_difficulty_omits_lemma_usage()
     test_usefulness_success_keeps_all_lemmas_without_ucore()
     test_sidecar_does_not_write_mix_hints()
     print("prove diagnostics tests passed")

@@ -114,7 +114,8 @@ def test_hard_axioms_not_raw_score_topk() -> None:
     _ok(NEGATED_AXIOM in hard, f"negated axiom should stay an axiom: {hard}")
 
 
-def test_axiom_disappear_from_topk_is_drop() -> None:
+def test_axiom_disappear_from_complete_dump_is_drop() -> None:
+    """Unlisted in a non-empty dump is official difficulty 0, so a drop is real."""
     base = CvcResult(
         status="timeout",
         elapsed=3.0,
@@ -130,8 +131,34 @@ def test_axiom_disappear_from_topk_is_drop() -> None:
     _score, signals = compute_progress_score(base, cand)
     _ok(
         any("axiom_difficulty_drop" in s for s in signals),
-        f"axiom leaving top-K should count: {signals}",
+        f"complete dump: leaving the list is 0: {signals}",
     )
+
+
+def test_missing_dump_does_not_count_axiom_disappear() -> None:
+    base = CvcResult(
+        status="timeout",
+        elapsed=3.0,
+        difficulty=[(NESTED_PLUS, 10), (GOAL, 1)],
+        goal_term=GOAL,
+    )
+    cand = CvcResult(
+        status="timeout",
+        elapsed=3.0,
+        difficulty=[],
+        goal_term=GOAL,
+    )
+    _score, signals = compute_progress_score(base, cand)
+    _ok(
+        not any("axiom_difficulty_drop" in s for s in signals),
+        f"empty dump is missing, not all-zero: {signals}",
+    )
+
+
+def test_parse_cvc_difficulty_keeps_full_dump() -> None:
+    entries = "\n".join(f"((P {i}) {20 - i})" for i in range(15))
+    items = parse_cvc_difficulty("unknown\n(\n" + entries + "\n)\n")
+    _ok(len(items) == 15, f"must not cap at 12: {len(items)}")
 
 
 def test_vampire_user_error() -> None:
@@ -204,7 +231,9 @@ def main() -> int:
         test_extract_proof_goal_block,
         test_goal_diff_ignores_front_negated_axiom,
         test_hard_axioms_not_raw_score_topk,
-        test_axiom_disappear_from_topk_is_drop,
+        test_axiom_disappear_from_complete_dump_is_drop,
+        test_missing_dump_does_not_count_axiom_disappear,
+        test_parse_cvc_difficulty_keeps_full_dump,
         test_vampire_user_error,
         test_relative_gain_rate_vs_count,
         test_stat_keys_not_double_counted,

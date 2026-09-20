@@ -110,8 +110,10 @@ from lemma_gates import (
     apply_static_lemma_screen,
     attach_source_lemmas,
     BENIGN_SCREEN_GATES,
+    compact_repair_snapshot,
     drop_failing_members,
-    format_repair_header,
+    format_attempt_feedback_for_prompt,
+    last_screen_records,
     is_invalid_diagnosis_reason,
     lemma_filter_drop_enabled,
     lemma_known_invalid,
@@ -122,7 +124,6 @@ from lemma_gates import (
     parse_final_diagnosis,
     parse_llm_lemmas,
     parse_llm_reason,
-    repair_hint_for_prompt,
     should_append_diagnosis_suffix,
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
@@ -184,6 +185,7 @@ def _empty_failed_data() -> dict:
         "exp_attempts": [],
         "node_outcome": {},
         "last_llm_reason": "",
+        "last_screen": [],
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -207,6 +209,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("exp_attempts", [])
             data.setdefault("node_outcome", {})
             data.setdefault("last_llm_reason", "")
+            data.setdefault("last_screen", [])
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -270,6 +273,17 @@ def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[st
         status=(meta or {}).get("status") if meta else None,
         hint=(meta or {}).get("hint_kind") if meta else None,
     )
+
+
+def save_last_screen(
+    base_path: str,
+    goal_name: str,
+    dropped: Sequence[Tuple[str, str, str]],
+) -> None:
+    """Overwrite the latest static-screen drops for the next LLM prompt."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_screen"] = last_screen_records(dropped)
+    save_failed_lemmas(base_path, goal_name, failed_data)
 
 def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
                        score: float, signals: List[str],
@@ -692,22 +706,13 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
 
     useless_members = _lemmas_in_useless_groups(failed_data)
 
-    if failed_data.get("useless_lemma_groups"):
-        parts.append(
-            "\nPREVIOUS COMBINATIONS: each set below was tried with the axioms and did "
-            "not prove the CURRENT goal within 60s. Some of these lemmas may still "
-            "help, but this set was not enough. Do not emit the exact same set "
-            "unchanged. You may keep any of these lemmas and add new ones:"
-        )
-        for i, group in enumerate(failed_data["useless_lemma_groups"], 1):
-            lemmas = group if isinstance(group, list) else group.get("lemmas", [])
-            meta = "" if isinstance(group, list) else (
-                f" [cvc_status={group.get('status', '?')}; "
-                f"hint={group.get('hint_kind', '')}]"
-            )
-            parts.append(f"  Combination {i}{meta}:")
-            for j, lemma in enumerate(lemmas, 1):
-                parts.append(f"    {j}. {lemma}")
+    attempt_txt = format_attempt_feedback_for_prompt(
+        failed_data,
+        backend="cvc5",
+        include_stuck=repair_hints_enabled(),
+    )
+    if attempt_txt:
+        parts.append(attempt_txt)
 
     if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
         parts.append(
@@ -721,7 +726,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
             profile = record.get("best_profile")
             profile_bit = f", profile={profile}" if profile else ""
             in_group = (
-                ", in a previous combination: you may keep it"
+                ", in the last attempt: you may keep it"
                 if record.get("lemma") in useless_members else ""
             )
             parts.append(
@@ -746,27 +751,6 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
         )
         if routing_txt:
             parts.append(routing_txt)
-
-    if repair_hints_enabled() and failed_data.get("repair_hints"):
-        hints = [h for h in failed_data["repair_hints"] if repair_hint_for_prompt(h)]
-        if hints:
-            parts.extend(format_repair_header("cvc5", hints))
-            for i, hint in enumerate(hints, 1):
-                parts.append(
-                    f"  Repair hint {i} [{hint.get('kind', '?')}]: {hint.get('detail', '')}"
-                )
-                rare = set(hint.get("rarely_instantiated") or [])
-                for ax in (hint.get("hard_axioms") or [])[:3]:
-                    label = (
-                        "Hard axiom (rarely instantiated)"
-                        if ax in rare
-                        else "Hard axiom"
-                    )
-                    parts.append(f"    {label}: {ax[:160]}")
-                for g in (hint.get("goal_fragments") or [])[:2]:
-                    parts.append(f"    Goal fragment: {g[:160]}")
-                for action in hint.get("suggested_actions", [])[:3]:
-                    parts.append(f"    -> {action}")
 
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
@@ -926,22 +910,25 @@ def _write_combined_smt(
     output_path: Path,
     *,
     add_patterns: bool = False,
-) -> None:
+) -> Optional[Path]:
     """Insert lemmas before `; proof goal` (Mate_new historical style).
 
-    ``add_patterns`` only for usefulness-style axiom injection (CVC).
-    Progress / control diagnostics keep bare asserts (default).
+    Always writes a bare combined SMT to ``output_path``. When ``add_patterns``
+    is set, also writes ``stem.__pat.smt2`` with ``:pattern`` on directed eqs
+    and returns that path for the 6-way portfolio contrast.
     """
-    combined_asserts = "\n".join(
-        format_assert_line(a, add_pattern=add_patterns) for a in asserts
+    bare = "\n".join(format_assert_line(a, add_pattern=False) for a in asserts)
+    output_path.write_text(
+        re.sub(r'; proof goal', bare + "\n; proof goal", original_content, count=1)
     )
-    new_content = re.sub(
-        r'; proof goal',
-        combined_asserts + "\n; proof goal",
-        original_content,
-        count=1,
+    if not add_patterns:
+        return None
+    patterned = "\n".join(format_assert_line(a, add_pattern=True) for a in asserts)
+    pat_path = output_path.with_name(output_path.stem + ".__pat.smt2")
+    pat_path.write_text(
+        re.sub(r'; proof goal', patterned + "\n; proof goal", original_content, count=1)
     )
-    output_path.write_text(new_content)
+    return pat_path
 
 
 def _first_datatype_name(smt_content: str) -> Optional[str]:
@@ -1151,9 +1138,18 @@ def verify_combined_lemmas(
     add_patterns = _resolve_cvc_add_patterns(
         base_path, gname if base_path else None, asserts,
     )
-    _write_combined_smt(
+    pattern_smt = _write_combined_smt(
         asserts, original_content, output_path, add_patterns=add_patterns,
     )
+    extra = {}
+    if pattern_smt is not None:
+        extra["pattern_smt2_path"] = pattern_smt
+        log_exp(
+            "cvc_pattern_portfolio",
+            goal=gname,
+            arms=6,
+            pattern_file=str(pattern_smt),
+        )
     state = load_routing_state(base_path, gname) if base_path else GoalSearchState()
     if solver_profile:
         set_routing_candidates(
@@ -1171,6 +1167,7 @@ def verify_combined_lemmas(
         state=state,
         collect_stats=True,
         collect_difficulty=True,
+        **extra,
     )
     record_solver_attempt(
         base_path,
@@ -1199,7 +1196,7 @@ def verify_combined_lemmas(
 
     progressive: List[str] = []
     if base_path and goal_name:
-        meta = {"status": full.status}
+        meta: Dict[str, Any] = {"status": full.status}
         _record_failed_usefulness_mix(base_path, gname, full, asserts)
         if progress_feedback_enabled():
             progressive, _baseline = analyze_lemma_progress(
@@ -1233,6 +1230,11 @@ def verify_combined_lemmas(
                     "Do not emit the exact same set unchanged; you may keep members and add lemmas.",
                 ],
             }], asserts, context="usefulness_check"))
+        snapshot = compact_repair_snapshot(
+            load_failed_lemmas(base_path, goal_name).get("repair_hints") or []
+        )
+        if snapshot:
+            meta["repair_hints"] = snapshot
         add_useless_lemma_group(
             base_path,
             goal_name,
@@ -1256,19 +1258,31 @@ def perform_initial_verification(
     logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
     routing_state = load_routing_state(str(goal_smt_file.parent), goal_smt_file.stem)
     smt_path = goal_smt_file
+    pattern_smt = None
     if base_path and lemma_library_enabled():
         n_lib = len(load_lemma_library(base_path))
         log_library_inject(base_path, goal_name, n_lib, log_event)
         add_patterns = _resolve_cvc_add_patterns(base_path, goal_name)
         smt_path = materialize_smt_with_library(
-            goal_smt_file, base_path, add_patterns=add_patterns,
+            goal_smt_file, base_path, add_patterns=False,
         )
+        if add_patterns:
+            pattern_smt = materialize_smt_with_library(
+                goal_smt_file,
+                base_path,
+                add_patterns=True,
+                dest=smt_path.with_name(smt_path.stem + ".__pat.smt2"),
+            )
+    extra = {}
+    if pattern_smt is not None:
+        extra["pattern_smt2_path"] = pattern_smt
     result = run_cvc_routed(
         smt_path,
         default_timeout,
         state=routing_state,
         collect_stats=True,
         collect_difficulty=True,
+        **extra,
     )
     if log_event == "initial_prove" and routing_enabled() and base_path and goal_name:
         record_solver_attempt(
@@ -2183,9 +2197,8 @@ def quick_run(
     smt_file_path = Path(base_path)
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
     smt_content = goal_smt_file.read_text()
-    add_patterns = _resolve_cvc_add_patterns(base_path, goal_smt_name)
     solver_content = solver_smt_content(
-        smt_content, base_path, add_patterns=add_patterns,
+        smt_content, base_path, add_patterns=False,
     )
     _store_harvest_dispatch(base_path, goal_smt_name, {})
     if base_path and lemma_library_enabled():
@@ -2249,6 +2262,7 @@ def quick_run(
         library_items=library_items,
         ancestor_stack=ancestor_stack,
     )
+    save_last_screen(base_path, goal_smt_name, dropped)
     for lemma, reason, gate in dropped:
         if gate == "same_as_ancestor":
             log_exp(
@@ -2670,12 +2684,12 @@ def _prove_run_body(
     goal_smt_file = Path(base_path) / f"{base_name}.smt2"
     current_formula: Optional[str] = None
     try:
-        add_patterns = _resolve_cvc_add_patterns(base_path, base_name)
+        add_patterns = False
         _a, current_formula = extract_original_goal(
             solver_smt_content(
                 goal_smt_file.read_text(encoding="utf-8"),
                 base_path,
-                add_patterns=add_patterns,
+                add_patterns=False,
             )
         )
     except Exception:

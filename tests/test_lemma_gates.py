@@ -19,12 +19,15 @@ from exp_flags import resolve_prompt_pack
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    HD_AXIOM_GOAL_HINT,
+    HD_DIFFICULTY_EXPLAIN,
     PARSE_ERR_EMPTY,
     PARSE_ERR_UNMATCHED,
     allow_unmarked_lemma_output,
     apply_static_lemma_screen,
     attach_source_lemmas,
     drop_failing_members,
+    format_attempt_feedback_for_prompt,
     format_repair_header,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
@@ -324,6 +327,139 @@ def test_repair_header_lists_usefulness_lemmas() -> None:
     assert header.index("C1:") < header.index(bridge)
 
 
+def test_last_attempt_omits_lemma_difficulty_tags() -> None:
+    used = "(forall ((x Nat)) (= (plus x zero) x))"
+    unused = "(forall ((x Nat)) true)"
+    axiom = "(forall ((n Nat)) (= (plus zero n) n))"
+    txt = format_attempt_feedback_for_prompt(
+        {
+            "useless_lemma_groups": [{
+                "lemmas": [used, unused],
+                "status": "timeout",
+                "repair_hints": [{
+                    "kind": "high_difficulty_assertions",
+                    "hard_axioms": [axiom, used],
+                    "source_lemmas": [used, unused],
+                }],
+            }],
+        },
+        backend="cvc5",
+    )
+    assert "[used" not in txt
+    assert "[unused]" not in txt
+    assert "[attributed" not in txt
+    assert "high-difficulty axiom:" in txt
+    assert "plus zero n" in txt or "plus zero" in txt
+    assert used not in "\n".join(
+        line for line in txt.splitlines() if "high-difficulty axiom:" in line
+    )
+    assert HD_DIFFICULTY_EXPLAIN in txt
+    assert HD_AXIOM_GOAL_HINT in txt
+    assert "Prefer a constructor/rewrite lemma" not in txt
+    assert "Do not restate the goal" not in txt
+    assert "inductive generalization" not in txt
+
+
+def test_stale_lemma_usage_json_is_not_prompted() -> None:
+    c1 = "(forall ((n Nat)) (= (plus n zero) n))"
+    txt = format_attempt_feedback_for_prompt(
+        {
+            "useless_lemma_groups": [{
+                "lemmas": [c1],
+                "status": "timeout",
+                "lemma_usage": [
+                    {"lemma": c1, "score": 9, "used": True},
+                ],
+                "repair_hints": [{
+                    "kind": "high_difficulty_assertions",
+                    "hard_axioms": [c1],
+                }],
+            }],
+        },
+        backend="cvc5",
+    )
+    assert "1. " + c1 in txt
+    assert "[used" not in txt
+    assert "[unused]" not in txt
+    assert "[attributed" not in txt
+
+
+def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
+    kept = "(forall ((x Nat)) (= (plus x zero) x))"
+    older = "(forall ((x Nat)) true)"
+    lib_dup = "(forall ((y Nat)) (= (plus y zero) y))"
+    axiom = "(forall ((n Nat)) (= (plus n zero) n))"
+    txt = format_attempt_feedback_for_prompt(
+        {
+            "useless_lemma_groups": [
+                {"lemmas": [older], "status": "timeout"},
+                {
+                    "lemmas": [kept],
+                    "status": "timeout",
+                    "repair_hints": [{
+                        "kind": "high_difficulty_assertions",
+                        "hard_axioms": [axiom],
+                        "rarely_instantiated": [axiom],
+                    }, {
+                        "kind": "need_rewrite",
+                        "detail": "should become matching_weak",
+                    }],
+                },
+            ],
+            "last_screen": [
+                {"lemma": lib_dup, "reason": "already_in_library:L3", "gate": "same_as_library"},
+                {"lemma": "(bad)", "reason": "known", "gate": "known_invalid"},
+            ],
+            "repair_hints": [{"kind": "need_rewrite", "detail": "stale global"}],
+        },
+        backend="cvc5",
+    )
+    assert "LAST ATTEMPT" in txt
+    assert "status=timeout" in txt
+    assert kept in txt
+    assert older not in txt
+    assert "Combination 2" not in txt
+    assert "Do not emit the exact same set" not in txt
+    assert "already in lemma library L3" in txt
+    assert "known_invalid" not in txt
+    assert "(bad)" not in txt
+    assert "repair hints:" in txt
+    assert "high-difficulty axiom:" in txt
+    assert HD_DIFFICULTY_EXPLAIN in txt
+    assert HD_AXIOM_GOAL_HINT in txt
+    assert "rarely instantiated:" in txt
+    assert "matching_weak:" not in txt
+    assert "need_rewrite" not in txt
+    assert "should become matching_weak" not in txt
+    assert "stale global" not in txt
+    assert "You may refine kept lemmas or propose a different set." in txt
+
+    initial = format_attempt_feedback_for_prompt(
+        {
+            "repair_hints": [{
+                "kind": "high_difficulty_assertions",
+                "hard_axioms": [axiom],
+            }],
+        },
+        backend="cvc5",
+    )
+    assert "INITIAL SOLVE" in initial
+    assert "high-difficulty axiom:" in initial
+    assert HD_DIFFICULTY_EXPLAIN in initial
+    assert HD_AXIOM_GOAL_HINT in initial
+    hidden = format_attempt_feedback_for_prompt(
+        {
+            "useless_lemma_groups": [{"lemmas": [kept], "status": "timeout"}],
+            "repair_hints": [{"kind": "need_rewrite", "detail": "hidden"}],
+        },
+        backend="cvc5",
+        include_stuck=False,
+    )
+    assert "LAST ATTEMPT" in hidden
+    assert "matching_weak" not in hidden
+    assert "hidden" not in hidden
+
+
 def test_node_attempt_plan_child_cap() -> None:
     pack = resolve_prompt_pack("default", 3)
     with patch.dict(os.environ, {"CHILD_LLM_ATTEMPTS": "2"}):
@@ -404,8 +540,9 @@ def test_tree_status_nested_invalid_does_not_mark_parent() -> None:
 
 
 def test_repair_hint_for_prompt_drops_subgoal_atp() -> None:
-    assert repair_hint_for_prompt({"kind": "need_rewrite", "context": "initial_goal"})
-    assert repair_hint_for_prompt({"kind": "no_progress", "context": "usefulness_check"})
+    assert not repair_hint_for_prompt({"kind": "need_rewrite", "context": "initial_goal"})
+    assert not repair_hint_for_prompt({"kind": "no_progress", "context": "usefulness_check"})
+    assert not repair_hint_for_prompt({"kind": "partial_progress", "context": "usefulness_check"})
     assert not repair_hint_for_prompt({"kind": "subgoal_failed", "context": "subgoal:template_1"})
     assert not repair_hint_for_prompt({
         "kind": "need_rewrite", "context": "subgoal:template_1",
@@ -1252,6 +1389,12 @@ def test_prompt_invalid_not_unproved_and_drops_child_atp() -> None:
             },
             {
                 "kind": "induction_stuck",
+                "context": "initial_goal",
+                "detail": "root stuck",
+                "suggested_actions": [],
+            },
+            {
+                "kind": "induction_stuck",
                 "context": "subgoal:template_1",
                 "detail": "child stuck",
                 "suggested_actions": ["weaken"],
@@ -1268,7 +1411,8 @@ def test_prompt_invalid_not_unproved_and_drops_child_atp() -> None:
     assert "do not weaken" in txt
     assert "plus has no axioms" in txt
     assert "USEFUL BUT UNPROVED" not in txt
-    assert "root rewrite" in txt
+    assert "root stuck" in txt
+    assert "root rewrite" not in txt
     assert "child stuck" not in txt
     assert "child induction" not in txt
 
@@ -1513,6 +1657,9 @@ def main() -> int:
     test_parse_llm_lemmas_xml_and_legacy()
     test_parse_llm_lemmas_salvage_and_paren_repair()
     test_repair_header_lists_usefulness_lemmas()
+    test_last_attempt_omits_lemma_difficulty_tags()
+    test_stale_lemma_usage_json_is_not_prompted()
+    test_last_attempt_prompt_keeps_latest_group_and_drops()
     test_node_attempt_plan_child_cap()
     test_llm_parse_retries_env()
     test_tree_status_sat_is_invalid()

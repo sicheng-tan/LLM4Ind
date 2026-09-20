@@ -16,11 +16,6 @@ from solver_relative_metrics import (
     EMATCHING_PER_CONJ_SOFT,
     INST_OF_MATCHING_MAX,
 )
-from solver_relative_metrics import (
-    EMATCHING_PER_CONJ_MAX,
-    EMATCHING_PER_CONJ_SOFT_MAX,
-    INST_OF_MATCHING_MAX,
-)
 
 
 _TIMEOUT_STATUSES = frozenset({"timeout", "unknown"})
@@ -201,18 +196,16 @@ def ematching_total(stats: Optional[dict]) -> int:
 def v2_pattern_features(failed_data: Optional[dict]) -> Dict[str, Any]:
     """Booleans for the CVC ``:pattern`` gate (independent of prompt mode).
 
-    Full706 log evidence (LLM tasks): usefulness timeout is far more common on
-    failures (≈38%) than on successes (≈5%), and timeout groups almost always
-    already contain directed equalities (constructor / rewrite bridges). By
-    contrast, low ``E_MATCHING/CONJ`` is *more* common on successes, so it is
-    not used as an open trigger (would prefer the wrong set).
+    ``trigger`` is ``rare_inst`` only: a high-difficulty axiom had no
+    formula-shaped instantiations. That is the case where E-matching triggers
+    are actually missing.
 
-    ``trigger`` =
-      useful_timeout
-      ∨ rare_inst
-      ∨ rewrite_scarce   # need_rewrite hint or iom < 0.75 ∧ skol>0
-
-    ``search_explosion`` is not consulted (``FEEDBACK_PROGRESS`` defaults off).
+    ``useful_timeout`` and ``rewrite_scarce`` are still computed for logs, but
+    they do not open the gate. Timeout is common and would spend a 6-way
+    ±pattern contrast (4 CVC profiles + simple/inductive with ``:pattern``)
+    on coverage rather than the scarce QI-rare cases. Low ``E_MATCHING/CONJ``
+    prefers successes on full706, so it is not a trigger either.
+    ``search_explosion`` is not consulted.
     """
     data = failed_data if isinstance(failed_data, dict) else {}
     hints = data.get("repair_hints") or []
@@ -258,8 +251,9 @@ def v2_pattern_features(failed_data: Optional[dict]) -> Dict[str, Any]:
             useful_timeout = True
             break
 
-    # Bridge-timeout / rare-matching axes only (fail-skewed on full706).
-    trigger = bool(useful_timeout or rare_inst or rewrite_scarce)
+    # Instantiation-rare only. Timeout / rewrite-scarce mix are logged but not
+    # used as open triggers (6-way ±pattern contrast is reserved for QI-rare).
+    trigger = bool(rare_inst)
     inst_poor = bool(rare_inst or rewrite_scarce or em_zero)
     return {
         "rare_inst": rare_inst,
@@ -290,12 +284,11 @@ def should_add_cvc_patterns(
 
     ``pattern_on`` =
       patterns_enabled
-      ∧ (useful_timeout ∨ rare_inst ∨ rewrite_scarce)
+      ∧ rare_inst
       ∧ has_directed_eq
 
-    Targets the common failure shape: usefulness ``A∧C⊢G`` timed out while
-    directed equality bridges are already present. Does not use
-    ``¬search_explosion`` (unavailable while progress feedback is off).
+    Opens only when a high-difficulty axiom had no formula-shaped instantiations.
+    ``useful_timeout`` / ``rewrite_scarce`` are not triggers.
     """
     data = failed_data if isinstance(failed_data, dict) else {}
     if enabled is None and "cvc_patterns" in data:
@@ -325,10 +318,6 @@ def v2_should_add_cvc_patterns(
 def pattern_trigger_reasons(failed_data: Optional[dict]) -> List[str]:
     feats = v2_pattern_features(failed_data)
     reasons: List[str] = []
-    if feats["useful_timeout"]:
-        reasons.append("useful_timeout")
     if feats["rare_inst"]:
         reasons.append("rare_inst")
-    if feats["rewrite_scarce"]:
-        reasons.append("rewrite_scarce")
     return reasons

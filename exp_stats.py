@@ -361,11 +361,11 @@ def log_prompt_blocks(
     text = feedback_text or ""
     inv = {
         "has_invalid": "INVALID or CANNOT" in text,
-        "has_useless": "PREVIOUS COMBINATIONS" in text,
+        "has_useless": "LAST ATTEMPT" in text,
         "has_progress": "SOLVER PROGRESS SIGNALS" in text,
         "has_unproved": "USEFUL BUT UNPROVED" in text,
         "has_routing": "SOLVER ROUTING" in text,
-        "has_hints": "SOLVER-GUIDED REPAIR" in text,
+        "has_hints": "  repair hints:" in text or "INITIAL SOLVE" in text,
         "has_lib": "already proved" in text or "LEMMA LIBRARY" in text,
         "has_tree": "Last obligation tree" in text,
     }

@@ -226,9 +226,11 @@ def test_prompt_hides_disabled_feedback_sections() -> None:
         on_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
     assert "SOLVER PROGRESS SIGNALS" in on_txt
     assert "USEFUL BUT UNPROVED" in on_txt
-    assert "SOLVER-GUIDED REPAIR" in on_txt
+    assert "LAST ATTEMPT" in on_txt
+    assert "matching_weak:" not in on_txt
+    assert "need_rewrite" not in on_txt
     assert "SOLVER ROUTING" in on_txt
-    assert "Combination" in on_txt
+    assert "Combination" not in on_txt
 
     with patch.dict(os.environ, {
         "FEEDBACK_REPAIR_HINTS": "off",
@@ -239,9 +241,9 @@ def test_prompt_hides_disabled_feedback_sections() -> None:
         off_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
     assert "SOLVER PROGRESS SIGNALS" not in off_txt
     assert "USEFUL BUT UNPROVED" not in off_txt
-    assert "SOLVER-GUIDED REPAIR" not in off_txt
+    assert "matching_weak:" not in off_txt
     assert "SOLVER ROUTING" not in off_txt
-    assert "Combination" in off_txt
+    assert "LAST ATTEMPT" in off_txt
 
 
 def test_add_repair_and_progress_respect_flags() -> None:
@@ -359,10 +361,11 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
     import Mate_new_vampire as mate_v
 
     txt = mate_v.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
-    assert "SOLVER-GUIDED REPAIR" in txt
+    assert "LAST ATTEMPT" in txt
+    assert "need_rewrite:" not in txt
     with patch.dict(os.environ, {"FEEDBACK_REPAIR_HINTS": "off", "FEEDBACK_PROGRESS": "off"}):
         off_txt = mate_v.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
-    assert "SOLVER-GUIDED REPAIR" not in off_txt
+    assert "need_rewrite:" not in off_txt
     assert "SOLVER PROGRESS SIGNALS" not in off_txt
 
     calls: list[str] = []
