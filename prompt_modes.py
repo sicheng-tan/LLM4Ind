@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from exp_flags import is_v2_strategy_mode
+from exp_flags import is_v2_strategy_mode, prompt_advice_enabled
 from obligation_tree import compact_formula, last_normal_tree
 from cvc5_runner import classify_difficulty_term
 from solver_relative_metrics import (
@@ -126,6 +126,8 @@ def advice_from_failed_data(
     """Pick at most one v2 CVC advice from the last attempt / baseline."""
     data = failed_data if isinstance(failed_data, dict) else {}
     if str(backend or "").lower() != "cvc5":
+        return None
+    if not prompt_advice_enabled():
         return None
     if not is_v2_strategy_mode(str(data.get("strategy_mode") or "default")):
         return None

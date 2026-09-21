@@ -6,6 +6,9 @@ Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
 ``LEMMA_LIBRARY_LOCAL``, and ``OBLIGATION_TREE``.
 
+``PROMPT_ADVICE`` (default on) controls v2 LAST ATTEMPT advice labels and is
+independent of ``v2`` / ``v2_simple`` strategy mode (HD-only ablation).
+
 ``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
 ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
 """
@@ -48,6 +51,16 @@ def progress_feedback_enabled() -> bool:
 def prompt_retarget_enabled() -> bool:
     """Pick / switch generation templates from hint families and consecutive no-help."""
     return _flag_enabled("PROMPT_RETARGET")
+
+
+def prompt_advice_enabled() -> bool:
+    """Emit v2 LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
+
+    Default on. Independent of ``v2`` / ``v2_simple`` strategy mode so ablations
+    can keep the lemma_general template while turning advice text off
+    (``PROMPT_ADVICE=off`` → HD / local-vs-parent feedback without ``advice:``).
+    """
+    return _flag_enabled("PROMPT_ADVICE")
 
 
 def unproved_not_invalid_enabled() -> bool:

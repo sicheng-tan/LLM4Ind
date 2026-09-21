@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -92,6 +93,20 @@ def test_v2_simple_keeps_advice() -> None:
     }
     adv = advice_from_failed_data(data)
     assert adv is not None and adv.name == ADVICE_TRIGGER
+
+
+def test_prompt_advice_flag_off_skips_advice() -> None:
+    """Ablation: v2 template + HD without explicit advice: lines."""
+    data = {
+        "strategy_mode": "v2_simple",
+        "repair_hints": [_hd(rarely_instantiated=[AX])],
+    }
+    with patch.dict(os.environ, {"PROMPT_ADVICE": "off"}):
+        assert advice_from_failed_data(data) is None
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    assert "advice:" not in txt
+    assert HD_AXIOM_GOAL_HINT in txt
+    assert "high-difficulty axiom" in txt
 
 
 def test_vampire_backend_skips_advice() -> None:
@@ -239,7 +254,7 @@ def test_local_vs_parent_contrast_in_last_attempt() -> None:
         "obligation": {
             "attempts": [{
                 "id": 1,
-                "kind": "normal",
+                "kind": "obligation_tree",
                 "tree": {
                     "id": "G",
                     "role": "goal",
@@ -510,6 +525,7 @@ def main() -> int:
     test_trigger_from_rare_inst()
     test_default_simple_has_no_advice()
     test_v2_simple_keeps_advice()
+    test_prompt_advice_flag_off_skips_advice()
     test_vampire_backend_skips_advice()
     test_prune_uses_conj_inst_log_gain_and_goal_not_drop()
     test_generalize_needs_child_and_structure()

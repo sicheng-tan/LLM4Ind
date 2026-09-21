@@ -19,6 +19,7 @@ from exp_flags import (
     normalize_strategy_mode,
     paper_schedule_prompt,
     progress_feedback_enabled,
+    prompt_advice_enabled,
     prompt_retarget_active,
     prompt_retarget_enabled,
     repair_hints_enabled,
@@ -36,6 +37,7 @@ _FLAG_NAMES = (
     "FEEDBACK_REPAIR_HINTS",
     "FEEDBACK_PROGRESS",
     "PROMPT_RETARGET",
+    "PROMPT_ADVICE",
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
     "LEMMA_DEFINED_SYMBOLS",
@@ -85,6 +87,7 @@ def test_flags_default_on() -> None:
         assert repair_hints_enabled() is True
         assert progress_feedback_enabled() is False
         assert prompt_retarget_enabled() is True
+        assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
         assert defined_symbols_enabled() is True
@@ -99,6 +102,8 @@ def test_flags_default_on() -> None:
             assert progress_feedback_enabled() is False
         with patch.dict(os.environ, {"PROMPT_RETARGET": val}):
             assert prompt_retarget_enabled() is False
+        with patch.dict(os.environ, {"PROMPT_ADVICE": val}):
+            assert prompt_advice_enabled() is False
         with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": val}):
             assert unproved_not_invalid_enabled() is False
         with patch.dict(os.environ, {"SUBGOAL_SAT_ABORT": val}):
