@@ -82,6 +82,9 @@ def setup_environment():
     raw_llm_retries = os.getenv('LLM_MAX_RETRIES')
     llm_max_retries = int(raw_llm_retries) if raw_llm_retries not in (None, '') else None
     enable_thinking = _parse_optional_bool(os.getenv('ENABLE_THINKING'), 'ENABLE_THINKING')
+    reasoning_effort = _parse_optional_effort(
+        os.getenv('REASONING_EFFORT'), 'REASONING_EFFORT'
+    )
     max_tokens = _parse_optional_int(os.getenv('MAX_TOKENS'), 'MAX_TOKENS')
 
     # 代理配置
@@ -143,6 +146,7 @@ def setup_environment():
         'LLM_TIMEOUT': llm_timeout,
         'LLM_MAX_RETRIES': llm_max_retries,
         'ENABLE_THINKING': enable_thinking,
+        'REASONING_EFFORT': reasoning_effort,
         'MAX_TOKENS': max_tokens,
     }
 
@@ -171,8 +175,56 @@ def _parse_optional_int(raw, name):
         raise ValueError(f"{name} must be an integer (got {raw!r})") from exc
 
 
+# DeepSeek V4 Chat Completions: low / high / max. medium+xhigh map to high (API compat).
+_EFFORT_VALUES = frozenset({"low", "high", "max", "medium", "xhigh"})
+_EFFORT_ALIAS = {"medium": "high", "xhigh": "high"}
+
+
+def _parse_optional_effort(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    key = str(raw).strip().lower()
+    if key not in _EFFORT_VALUES:
+        raise ValueError(
+            f"{name} must be low/high/max (got {raw!r}; medium/xhigh map to high)"
+        )
+    return _EFFORT_ALIAS.get(key, key)
+
+
+def thinking_api_style(config) -> str:
+    """Which thinking wire format to emit: ``deepseek_v4`` | ``qwen`` | ``none``.
+
+    - DeepSeek V4 (Flash/Pro): ``thinking.type`` + ``reasoning_effort``
+    - Qwen3 / ``MODEL_TYPE=qwen``: ``enable_thinking`` bool only
+    - Other providers: do not invent vendor-specific thinking fields
+    """
+    model_type = str(config.get("MODEL_TYPE") or "").strip().lower()
+    model_name = str(config.get("OPENAI_MODEL") or "").strip().lower()
+    blob = f"{model_type} {model_name}"
+
+    if "qwen" in blob:
+        return "qwen"
+    # V4 / V4.1 Flash|Pro (and gateway aliases like deepseek-ai/DeepSeek-V4-Flash).
+    if "deepseek-v4" in blob or "deepseek_v4" in blob or "deepseekv4" in blob:
+        return "deepseek_v4"
+    # Official deepseek-chat path and generic deepseek-* model ids on OpenAI-compat
+    # gateways use the same V4 thinking object when thinking is configured.
+    if model_type == "deepseek" or model_name.startswith("deepseek"):
+        return "deepseek_v4"
+    return "none"
+
+
 def _llm_call_kwargs(config):
-    """Optional ChatOpenAI request knobs: timeout, retries, max_tokens, thinking."""
+    """Optional ChatOpenAI request knobs: timeout, retries, max_tokens, thinking.
+
+    Thinking fields are vendor-specific (see ``thinking_api_style``):
+    - DeepSeek V4: ``extra_body.thinking.type`` (+ ``reasoning_effort`` when on).
+      Provider default is thinking **on** at high effort; we default to
+      **disabled** unless ``ENABLE_THINKING=true`` (or only ``REASONING_EFFORT``
+      is set, which opts into enabled + that effort, defaulting effort to low).
+    - Qwen: ``extra_body.enable_thinking`` bool only; ``REASONING_EFFORT`` ignored
+    - Other: no thinking fields (even if ENABLE_THINKING is set)
+    """
     kwargs = {}
     timeout = config.get('LLM_TIMEOUT')
     if timeout:
@@ -183,21 +235,44 @@ def _llm_call_kwargs(config):
     max_tokens = config.get('MAX_TOKENS')
     if max_tokens is not None:
         kwargs['max_tokens'] = max_tokens
+
     thinking = config.get('ENABLE_THINKING')
-    if thinking is not None:
-        extra = dict(kwargs.get('extra_body') or {})
-        extra['enable_thinking'] = thinking
-        kwargs['extra_body'] = extra
+    effort = config.get('REASONING_EFFORT')
+    style = thinking_api_style(config)
+    if style == "none":
+        return kwargs
+
+    extra = dict(kwargs.get('extra_body') or {})
+    if style == "qwen":
+        # Qwen3 OpenAI-compat: boolean only. Effort is a DeepSeek-V4 knob.
+        if thinking is None:
+            return kwargs
+        extra['enable_thinking'] = bool(thinking)
+    else:
+        # deepseek_v4 — default off (provider would otherwise use high thinking).
+        if thinking is True or (thinking is None and effort is not None):
+            extra['thinking'] = {'type': 'enabled'}
+            extra['reasoning_effort'] = effort or 'low'
+        else:
+            # False, or both unset → explicitly disable.
+            extra['thinking'] = {'type': 'disabled'}
+    kwargs['extra_body'] = extra
     return kwargs
 
 def setup_model(config):
     """根据配置初始化模型"""
     call_kwargs = _llm_call_kwargs(config)
     if "max_tokens" in call_kwargs or "extra_body" in call_kwargs:
+        extra = call_kwargs.get("extra_body") or {}
+        thinking = extra.get("thinking") or {}
         logging.info(
-            "LLM request knobs: max_tokens=%s enable_thinking=%s",
+            "LLM request knobs: style=%s max_tokens=%s thinking=%s "
+            "reasoning_effort=%s enable_thinking=%s",
+            thinking_api_style(config),
             call_kwargs.get("max_tokens"),
-            (call_kwargs.get("extra_body") or {}).get("enable_thinking"),
+            thinking.get("type"),
+            extra.get("reasoning_effort"),
+            extra.get("enable_thinking"),
         )
     if config['MODEL_TYPE'] == 'deepseek':
         llm = ChatOpenAI(

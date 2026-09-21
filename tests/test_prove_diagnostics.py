@@ -713,8 +713,9 @@ def test_cvc_prompt_labels_rarely_instantiated() -> None:
     assert "rarely instantiated:" in txt
     assert "high-difficulty axiom:" in txt
     assert "Add a rewrite lemma" not in txt
-    assert "extra runtime" in txt
-    assert "two ends of a gap" in txt
+    assert "not proof necessity" in txt
+    assert "help prove the CURRENT goal" in txt
+    assert "share symbols" not in txt
     assert "inductive generalization" not in txt
 
 

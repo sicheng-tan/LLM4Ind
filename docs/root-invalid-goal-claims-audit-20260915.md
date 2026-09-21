@@ -1,7 +1,7 @@
 # 根节点 `INVALID_GOAL` 声称核实（全量 skip 跑 + 失败重测）
 
 - **对象实验**
-  - 全量：`experiments/results/ours_full706_deepseekv4flash_cvc5_local_skip`（2026-09-11）
+  - 全量：`experiments/results/ours_full706_deepseekv4flash_cvc5_local_skip_thinking_high`（2026-09-11）
   - 失败重测：`experiments/results/failed89_ancestor_hints_on`（2026-09-15，hints on）
 - **背景**：自提交 `1349a8b` 起，根节点即使输出 `; INVALID_GOAL:` 也不会被标成 `node_outcome=invalid`，而是按 **`空引理输出` 做 parse retry**。因此这里核实的是 **LLM 在根上的诊断是否说对**，不是系统是否宣判整题 invalid。
 - **方法**：读 SMT 公理 → 按模型给出的实例逐步重写/赋值 → 检查是否与定义性公理矛盾。不以「原文件直接丢给 CVC5」的 `unknown`/`timeout` 为最终裁决（全称目标上常见）。

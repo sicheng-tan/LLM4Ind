@@ -107,6 +107,7 @@ _FLAG_ENV = (
     "MODEL_TYPE",
     "OPENAI_MODEL",
     "ENABLE_THINKING",
+    "REASONING_EFFORT",
     "MAX_TOKENS",
 )
 
@@ -434,6 +435,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "MODEL_TYPE": "gpt-4o",
         "OPENAI_MODEL": "openai/gpt-5",
         "ENABLE_THINKING": "",
+        "REASONING_EFFORT": "",
         "MAX_TOKENS": "",
     }
     return {name: os.getenv(name, defaults[name]).strip() for name in _FLAG_ENV}

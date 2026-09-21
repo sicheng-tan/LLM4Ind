@@ -26,6 +26,7 @@ from prompt_modes import (
     PRUNE_CONSTRAINT,
     advice_from_failed_data,
     format_advice_lines,
+    format_local_vs_parent_lines,
     select_prompt_advice,
 )
 
@@ -220,6 +221,77 @@ def test_generalize_action_split() -> None:
     assert "weaken" in mixed.hint
     assert "generalize variables" in mixed.hint
     assert "action:" not in "\n".join(format_advice_lines(mixed))
+
+
+def test_local_vs_parent_contrast_in_last_attempt() -> None:
+    """Proved locals + open parent appear under repair hints (tree_Flatten3-style)."""
+    proved_local = (
+        "(forall ((a Tree) (b Tree)) "
+        "(= (flatten3 (Node a b)) (app (flatten3 a) (flatten3 b))))"
+    )
+    failed_local = (
+        "(forall ((t Tree)) (= (flatten3 t) (flatten3 t)))"
+    )
+    parent = "(forall ((t Tree)) (= (flatten3 t) (flatten0 t)))"
+    data = {
+        "strategy_mode": "v2_simple",
+        "baseline_diag": {"goal_term": parent},
+        "obligation": {
+            "attempts": [{
+                "id": 1,
+                "kind": "normal",
+                "tree": {
+                    "id": "G",
+                    "role": "goal",
+                    "formula": None,
+                    "status": "open",
+                    "children": [
+                        {
+                            "id": "L1",
+                            "role": "lemma",
+                            "status": "proved",
+                            "formula": proved_local,
+                            "children": [],
+                        },
+                        {
+                            "id": "L2",
+                            "role": "lemma",
+                            "status": "failed",
+                            "formula": failed_local,
+                            "children": [],
+                        },
+                    ],
+                },
+            }],
+        },
+        "useless_lemma_groups": [{
+            "lemmas": [KEPT],
+            "status": "timeout",
+            "repair_hints": [_hd()],
+        }],
+    }
+    contrast = "\n".join(format_local_vs_parent_lines(data))
+    assert "already proved (local):" in contrast
+    assert "flatten3 (Node" in contrast or "flatten3" in contrast
+    assert "still open (parent):" in contrast
+    assert "flatten0" in contrast
+    assert "do not resend proved locals" in contrast
+
+    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    assert "already proved (local):" in txt
+    assert "still open (parent):" in txt
+    assert txt.index("already proved (local):") < txt.index("still open (parent):")
+
+    adv = select_prompt_advice(
+        has_kept=True,
+        hard_axioms=[AX],
+        goal_fragments=[GOAL],
+        failed_children=[CHILD],
+        proved_children=[proved_local],
+    )
+    assert adv is not None and adv.name == ADVICE_GENERALIZE
+    assert "already proved locally" in adv.because
+    assert "open parent" in adv.hint
 
 
 def test_localize_and_bridge() -> None:
@@ -442,6 +514,7 @@ def main() -> int:
     test_prune_uses_conj_inst_log_gain_and_goal_not_drop()
     test_generalize_needs_child_and_structure()
     test_generalize_action_split()
+    test_local_vs_parent_contrast_in_last_attempt()
     test_localize_and_bridge()
     test_initial_solve_skips_prune_and_bridge()
     test_last_attempt_v2_trigger_keeps_lemmas_only()

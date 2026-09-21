@@ -21,7 +21,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import _flag_enabled
 from obligation_tree import compact_formula, lemmas_equivalent, normalize_lemma_formula
-from prompt_modes import advice_from_failed_data, format_advice_lines
+from prompt_modes import (
+    advice_from_failed_data,
+    format_advice_lines,
+    format_local_vs_parent_lines,
+)
 
 _DECLARE_FUN = re.compile(
     r"\(declare-fun\s+([A-Za-z_][A-Za-z0-9_+*/<>=!?-]*)"
@@ -82,11 +86,12 @@ _VERDICT_LINE = re.compile(
 MAX_REASON_CHARS = 200
 MAX_MIX_SOURCE_LEMMAS = 6
 HD_DIFFICULTY_EXPLAIN = (
-    "difficulty: CVC5's estimate of extra runtime around that assertion (hotspot on its literals). "
+    "difficulty: search hotspot intensity from the last solver run; "
+    "d= is that intensity, not proof necessity. "
 )
 HD_AXIOM_GOAL_HINT = (
-    "hint: the listed high-difficulty axiom and the CURRENT goal are two ends "
-    "of a gap; propose a lemma using functions that appear in both."
+    "hint: listed axioms are possible starting points; propose lemmas that "
+    "help prove the CURRENT goal (a hotspot need not be used)."
 )
 MAX_PARSE_RETRY_SNIPPET = 1500
 PARSE_RETRY_USER = (
@@ -671,6 +676,7 @@ def compact_repair_snapshot(hints: Sequence[dict]) -> List[dict]:
         "context",
         "detail",
         "hard_axioms",
+        "hard_axiom_scores",
         "rarely_instantiated",
         "goal_fragments",
         "induction_focus",
@@ -763,8 +769,28 @@ def format_stuck_lines(
             shown_hd = _exclude_source_lemmas(
                 hint.get("hard_axioms") or [], sources,
             )
+            scores = hint.get("hard_axiom_scores") or {}
+            if not isinstance(scores, dict):
+                scores = {}
             for ax in shown_hd:
-                lines.append(f"    high-difficulty axiom: {compact_formula(ax)}")
+                score = scores.get(str(ax))
+                if score is None:
+                    # Parallel list form: same order as hard_axioms before exclude.
+                    raw_hd = [str(x) for x in (hint.get("hard_axioms") or []) if x]
+                    raw_sc = hint.get("hard_axiom_score_list") or []
+                    if (
+                        isinstance(raw_sc, list)
+                        and len(raw_sc) == len(raw_hd)
+                        and str(ax) in raw_hd
+                    ):
+                        score = raw_sc[raw_hd.index(str(ax))]
+                if score is not None:
+                    lines.append(
+                        f"    high-difficulty axiom (d={int(score)}): "
+                        f"{compact_formula(ax)}"
+                    )
+                else:
+                    lines.append(f"    high-difficulty axiom: {compact_formula(ax)}")
             for ax in (hint.get("rarely_instantiated") or [])[:2]:
                 if any(lemmas_equivalent(ax, src) for src in sources):
                     continue
@@ -822,10 +848,11 @@ def format_attempt_feedback_for_prompt(
     stuck_lines = format_stuck_lines(
         hints, backend, omit_axiom_goal_hint=advice is not None,
     ) if include_stuck else []
+    local_lines = format_local_vs_parent_lines(data) if include_stuck else []
     advice_lines = format_advice_lines(advice) if include_stuck else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
     has_attempt = bool(kept or drop_lines)
-    if not has_attempt and not stuck_lines and not advice_lines:
+    if not has_attempt and not stuck_lines and not local_lines and not advice_lines:
         return ""
 
     parts: List[str] = []
@@ -841,9 +868,10 @@ def format_attempt_feedback_for_prompt(
         if drop_lines:
             parts.append("  dropped:")
             parts.extend(drop_lines)
-        if stuck_lines or advice_lines:
+        if stuck_lines or local_lines or advice_lines:
             parts.append("  repair hints:")
             parts.extend(stuck_lines)
+            parts.extend(local_lines)
             parts.extend(advice_lines)
         parts.append("  You may refine kept lemmas or propose a different set.")
         return "\n".join(parts)
@@ -853,6 +881,7 @@ def format_attempt_feedback_for_prompt(
     )
     parts.append("  repair hints:")
     parts.extend(stuck_lines)
+    parts.extend(local_lines)
     parts.extend(advice_lines)
     parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
     return "\n".join(parts)

@@ -129,6 +129,49 @@ def test_hard_axioms_not_raw_score_topk() -> None:
     _ok(NEGATED_AXIOM in hard, f"negated axiom should stay an axiom: {hard}")
 
 
+def test_hard_axioms_rank_by_difficulty_and_keep_scores() -> None:
+    """Hard axioms stay difficulty-ordered; scores stay available for the prompt."""
+    from cvc5_runner import hard_axiom_entries_from_difficulty
+    from lemma_gates import format_attempt_feedback_for_prompt
+
+    goal = "(forall ((t Tree)) (= (mirror (mirror t)) t))"
+    mirror_ax = (
+        "(forall ((a Tree) (b Tree)) "
+        "(= (mirror (Node a b)) (Node (mirror b) (mirror a))))"
+    )
+    rotate_ax = (
+        "(forall ((x Nat) (y Lst)) "
+        "(= (rotate (succ x) y) "
+        "(rotate x (append y (cons (head y) nil)))))"
+    )
+    difficulty = [
+        (rotate_ax, 90),
+        (mirror_ax, 50),
+        ("(forall ((x Nat)) (= (plus x zero) x))", 40),
+        ("(forall ((x Nat)) (= (plus zero x) x))", 30),
+        ("(forall ((x Nat)) (= (succ (pred x)) x))", 20),
+    ]
+    entries = hard_axiom_entries_from_difficulty(difficulty, goal, limit=4)
+    ordered = [t for t, _s in entries]
+    _ok(
+        ordered[0] == rotate_ax,
+        f"highest difficulty should rank first: {ordered}",
+    )
+    _ok(mirror_ax in ordered, f"lower-d axiom still listed: {ordered}")
+    scores = {t: s for t, s in entries}
+    _ok(scores.get(rotate_ax) == 90, f"rotate score missing: {scores}")
+    hints = derive_repair_hints(
+        CvcResult(status="timeout", elapsed=1.0, difficulty=difficulty, goal_term=goal)
+    )
+    _ok(hints and hints[0].get("hard_axiom_scores"), f"scores not on hint: {hints}")
+    txt = format_attempt_feedback_for_prompt({"repair_hints": hints}, backend="cvc5")
+    _ok("d=90" in txt and "d=50" in txt, f"prompt should show d= scores: {txt}")
+    _ok(txt.index("d=90") < txt.index("d=50"), f"difficulty order in prompt: {txt}")
+    _ok("not proof necessity" in txt, f"neutral difficulty explain missing: {txt}")
+    _ok("help prove the CURRENT goal" in txt, f"useful-lemma HD hint missing: {txt}")
+    _ok("share symbols" not in txt, f"symbol-sharing wording should be gone: {txt}")
+
+
 def test_axiom_disappear_from_complete_dump_is_drop() -> None:
     """Unlisted in a non-empty dump is official difficulty 0, so a drop is real."""
     base = CvcResult(
@@ -247,6 +290,7 @@ def main() -> int:
         test_extract_proof_goal_block,
         test_goal_diff_ignores_front_negated_axiom,
         test_hard_axioms_not_raw_score_topk,
+        test_hard_axioms_rank_by_difficulty_and_keep_scores,
         test_axiom_disappear_from_complete_dump_is_drop,
         test_missing_dump_does_not_count_axiom_disappear,
         test_parse_cvc_difficulty_keeps_full_dump,

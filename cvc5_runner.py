@@ -1661,20 +1661,40 @@ def hard_axioms_from_difficulty(
     *,
     limit: int = 4,
 ) -> List[str]:
-    """Hard axioms for LLM prompts: same goal/axiom split as derive_repair_hints."""
+    """Hard axioms for LLM prompts: in-problem cutoff, then difficulty desc.
+
+    Returns formula strings only; use ``hard_axiom_entries_from_difficulty``
+    when scores are needed for the prompt. No goal-symbol overlap reordering:
+    surface token overlap is an unreliable relevance signal (bound vars, shared
+    ctors) and truncating on it can drop indirect hotspots from feedback/advice.
+    """
+    return [t for t, _s in hard_axiom_entries_from_difficulty(
+        difficulty, goal_term, limit=limit
+    )]
+
+
+def hard_axiom_entries_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+    *,
+    limit: int = 4,
+) -> List[Tuple[str, int]]:
+    """Like ``hard_axioms_from_difficulty``, but keep ``(formula, score)`` pairs."""
     axiom_scores = [
         s
         for t, s in (difficulty or [])
         if s > 0 and classify_difficulty_term(t, goal_term) == "axiom"
     ]
     cutoff = in_problem_hard_cutoff(axiom_scores)
-    return [
-        t
+    entries = [
+        (t, int(s))
         for t, s in (difficulty or [])
         if s > 0
         and classify_difficulty_term(t, goal_term) == "axiom"
         and s >= cutoff
-    ][:limit]
+    ]
+    entries.sort(key=lambda pair: -pair[1])
+    return entries[:limit]
 
 
 def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
@@ -1695,7 +1715,11 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
         for t, s in result.difficulty
         if s > 0
     ]
-    hard_axioms = hard_axioms_from_difficulty(result.difficulty, result.goal_term)
+    hard_entries = hard_axiom_entries_from_difficulty(
+        result.difficulty, result.goal_term
+    )
+    hard_axioms = [t for t, _s in hard_entries]
+    hard_scores = {t: s for t, s in hard_entries}
     goal_bits = [t for t, s, role in roles if role == "goal"][:2]
     rare = rarely_instantiated_axioms(hard_axioms, result.instantiations)
 
@@ -1708,10 +1732,12 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                 "(lemma-literal-all), not proof dependencies or instantiation counts."
             ),
             "hard_axioms": hard_axioms,
+            "hard_axiom_scores": hard_scores,
             "rarely_instantiated": rare,
             "goal_fragments": goal_bits,
             "suggested_actions": [
-                "Propose a lemma using functions from a hotspot axiom and the CURRENT goal",
+                "Listed axioms are possible starting points; propose lemmas "
+                "that help prove the CURRENT goal (a hotspot need not be used).",
             ],
         })
         if rare:

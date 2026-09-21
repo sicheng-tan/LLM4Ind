@@ -65,6 +65,11 @@ class PromptAdvice:
     constraint: Optional[str] = None
 
 
+_LOCAL_VS_PARENT_NOTE = (
+    "prefer lemmas that help close the open parent; do not resend proved locals."
+)
+
+
 def format_advice_lines(advice: Optional[PromptAdvice]) -> List[str]:
     if advice is None:
         return []
@@ -79,6 +84,36 @@ def format_advice_lines(advice: Optional[PromptAdvice]) -> List[str]:
             lines.append(f"    shape: {advice.shape}")
     if advice.constraint:
         lines.append(f"    constraint: {advice.constraint}")
+    return lines
+
+
+def format_local_vs_parent_lines(
+    failed_data: Optional[dict],
+    *,
+    limit_proved: int = 2,
+) -> List[str]:
+    """Contrast proved local children with the still-open parent goal.
+
+    Shown under LAST ATTEMPT / INITIAL SOLVE when the obligation tree has proved
+    lemma children while the parent goal remains open. Caps proved formulas to
+    keep the block short.
+    """
+    data = failed_data if isinstance(failed_data, dict) else {}
+    tree = last_normal_tree(data.get("obligation"))
+    if isinstance(tree, dict) and str(tree.get("status") or "") == "proved":
+        return []
+    proved = _proved_child_formulas(data)[: max(0, int(limit_proved))]
+    if not proved:
+        return []
+    parent = _open_parent_formula(data)
+    lines = ["    already proved (local):"]
+    for formula in proved:
+        lines.append(f"      {compact_formula(formula)}")
+    if parent:
+        lines.append(f"    still open (parent): {compact_formula(parent)}")
+    else:
+        lines.append("    still open (parent): CURRENT goal")
+    lines.append(f"    note: {_LOCAL_VS_PARENT_NOTE}")
     return lines
 
 
@@ -101,6 +136,7 @@ def advice_from_failed_data(
     hints = _attempt_hints(data, group)
     hd, rare, goals, sources = _hint_terms(hints)
     failed_children = _failed_child_formulas(data)
+    proved_children = _proved_child_formulas(data)
     mix_stats = _group_stats(group)
     base_stats = _diag_stats(data.get("baseline_diag"))
     dump_ok = _dumps_complete(data, group)
@@ -115,6 +151,7 @@ def advice_from_failed_data(
         goal_fragments=goals,
         source_lemmas=sources,
         failed_children=failed_children,
+        proved_children=proved_children,
         baseline_stats=base_stats,
         mix_stats=mix_stats,
         conj_mix_stats=conj_mix,
@@ -136,6 +173,7 @@ def select_prompt_advice(
     goal_fragments: Sequence[str] = (),
     source_lemmas: Sequence[str] = (),
     failed_children: Sequence[str] = (),
+    proved_children: Sequence[str] = (),
     baseline_stats: Optional[dict] = None,
     mix_stats: Optional[dict] = None,
     dump_complete: bool = False,
@@ -168,13 +206,25 @@ def select_prompt_advice(
     parents = hd + list(source_lemmas) + goals
     if children and _shares_constructors(parents, children):
         child = compact_formula(children[0])
+        proved_locals = [x for x in proved_children if x]
+        because = (
+            f"failed child {child} shares constructors with the CURRENT "
+            "goal or a hotspot axiom."
+        )
+        hint = _HINT_GENERALIZE
+        if proved_locals:
+            because += (
+                " Some sibling children are already proved locally while the "
+                "parent goal is still open."
+            )
+            hint = (
+                f"{_HINT_GENERALIZE} Prefer closing the open parent over "
+                "resending already-proved locals."
+            )
         picked = PromptAdvice(
             name=ADVICE_GENERALIZE,
-            because=(
-                f"failed child {child} shares constructors with the CURRENT "
-                "goal or a hotspot axiom."
-            ),
-            hint=_HINT_GENERALIZE,
+            because=because,
+            hint=hint,
             reason="ctor_failed_child",
         )
     elif hd and rare:
@@ -200,9 +250,10 @@ def select_prompt_advice(
                 "CURRENT-goal difficulty did not drop."
             ),
             hint=(
-                "keep the direction and split a more local intermediate equality "
-                "using functions that appear in both a hotspot axiom and the "
-                "CURRENT goal."
+                "Connect the CURRENT goal to a relevant part of the previous "
+                "candidate or hotspot, possibly through an intermediate "
+                "function or invariant. Prefer a small step whose role in the "
+                "remaining proof is explicit."
             ),
             reason="named_attributed_no_goal_drop",
         )
@@ -489,13 +540,25 @@ def _localize_signal(
 
 
 def _failed_child_formulas(data: dict) -> List[str]:
+    return _lemma_child_formulas(data, status="failed")
+
+
+def _proved_child_formulas(data: dict) -> List[str]:
+    return _lemma_child_formulas(data, status="proved")
+
+
+def _lemma_child_formulas(data: dict, *, status: str) -> List[str]:
     tree = last_normal_tree(data.get("obligation"))
     out: List[str] = []
+    want = str(status or "")
 
     def walk(node: Any) -> None:
         if not isinstance(node, dict):
             return
-        if str(node.get("role") or "") == "lemma" and str(node.get("status") or "") == "failed":
+        if (
+            str(node.get("role") or "") == "lemma"
+            and str(node.get("status") or "") == want
+        ):
             formula = str(node.get("formula") or "").strip()
             if formula:
                 out.append(formula)
@@ -504,3 +567,20 @@ def _failed_child_formulas(data: dict) -> List[str]:
 
     walk(tree)
     return out
+
+
+def _open_parent_formula(data: dict) -> Optional[str]:
+    """Best available formula for the still-open parent / CURRENT goal."""
+    tree = last_normal_tree(data.get("obligation"))
+    if isinstance(tree, dict):
+        if str(tree.get("status") or "") == "proved":
+            return None
+        formula = str(tree.get("formula") or "").strip()
+        if formula:
+            return formula
+    diag = data.get("baseline_diag")
+    if isinstance(diag, dict):
+        goal = str(diag.get("goal_term") or "").strip()
+        if goal:
+            return goal
+    return None

@@ -154,6 +154,7 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "MODEL_TYPE=" in compact
     assert "OPENAI_MODEL=" in compact
     assert "ENABLE_THINKING=" in compact
+    assert "REASONING_EFFORT=" in compact
     assert "MAX_TOKENS=" in compact
     assert "LLM_PARSE_RETRIES=" in compact
     assert "CHILD_LLM_ATTEMPTS=" in compact

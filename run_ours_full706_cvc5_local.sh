@@ -1,8 +1,9 @@
 #!/bin/bash
-# CVC5 全量 706：DeepSeek-v4-flash + local harvest。
+# CVC5 全量 706：DeepSeek-v4-flash + local harvest（thinking disabled by default）。
 # MAX_PARALLEL_TASKS=20（原 40；ProcessPoolExecutor 读 env，不必改 run_exp_folder.py）。
 # LLM_TIMEOUT=180、LLM_MAX_RETRIES=1、HARVEST_RETRY_TIMEOUT=2。
 # 排除已知错误定理：在 env 里设 SKIP_PROBLEMS_FILE=experiments/configs/skip_nontheorems.txt
+# 历史对照：results/ours_full706_deepseekv4flash_cvc5_local_skip_thinking_high（默认 high）。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,7 @@ fi
 
 export DOTENV_PATH="$ENV_FILE"
 
-RESULT_DIR="$SCRIPT_DIR/experiments/results/ours_full706_deepseekv4flash_cvc5_local"
+RESULT_DIR="$SCRIPT_DIR/experiments/results/ours_full706_deepseekv4flash_cvc5_local_thinking_disabled"
 LOG_DIR="$RESULT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
