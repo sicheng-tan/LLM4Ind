@@ -188,7 +188,21 @@ MAX_PARSE_LEMMAS = 400
 MAX_STORED_LEMMAS = 80
 MAX_FORMULA_SAMPLES = 4
 MAX_HOTSPOT_SAMPLES = 2
-MAX_GOAL_SAMPLES = 1
+MAX_SKOLEM_SAMPLES = 1
+# Display-priority weights (not usefulness / success probability).
+SCORE_W_RELEVANCE = 0.6
+SCORE_W_HOTNESS = 0.3
+SCORE_W_COMPACT = 0.1
+_LEMMA_INSTANCE_SOURCES = frozenset({
+    "QUANTIFIERS_INST_E_MATCHING",
+    "QUANTIFIERS_INST_E_MATCHING_SIMPLE",
+    "QUANTIFIERS_INST_CBQI_PROP",
+    "QUANTIFIERS_INST_CBQI_CONFLICT",
+    "DATATYPES_INST",
+})
+_SORT_LIKE_SYMBOLS = frozenset({
+    "Int", "Real", "Bool", "Nat", "Lst", "Tree", "Pair", "ZLst",
+})
 _LEMMA_SKIP_SOURCES = frozenset({
     "COMBINATION_SPLIT",
 })
@@ -1209,20 +1223,170 @@ def _relate_formula(
     quants = _source_quantifiers(formula)
     for axiom in hard_axioms:
         if any(terms_match(quant, axiom) for quant in quants):
-            goal_hit = bool(goal_term and smt_fun_symbols(formula) & smt_fun_symbols(goal_term))
+            goal_hit = bool(
+                goal_term
+                and _applied_fun_symbols(formula) & _applied_fun_symbols(goal_term)
+            )
             return "matched_quantifier", axiom, goal_hit
-    funs = smt_fun_symbols(formula)
-    goal_hit = bool(goal_term and funs & smt_fun_symbols(goal_term))
+    funs = _applied_fun_symbols(formula)
+    goal_hit = bool(goal_term and funs & _applied_fun_symbols(goal_term))
     best_ax = ""
     best_n = 0
     for axiom in hard_axioms:
-        shared = funs & smt_fun_symbols(axiom)
+        shared = funs & _applied_fun_symbols(axiom)
         if len(shared) > best_n:
             best_n = len(shared)
             best_ax = axiom
     if best_ax:
         return "shared_symbols", best_ax, goal_hit
     return "unlinked", "", goal_hit
+
+
+def _strip_lets(formula: str) -> str:
+    body = (formula or "").strip()
+    seen = set()
+    while body.startswith("(") and body not in seen:
+        seen.add(body)
+        kids = _sexpr_children(body)
+        if kids and kids[0] == "let" and len(kids) >= 3:
+            body = kids[-1]
+            continue
+        break
+    return body
+
+
+def _applied_fun_symbols(term: str) -> Set[str]:
+    """Function symbols in applications; skip binders, lets, and sorts."""
+    expr = (term or "").strip()
+    if not expr.startswith("("):
+        return set()
+    kids = _sexpr_children(expr)
+    if not kids:
+        return set()
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        return _applied_fun_symbols(kids[-1])
+    if head == "let" and len(kids) >= 3:
+        return _applied_fun_symbols(kids[-1])
+    if head == "!" and len(kids) >= 2:
+        return _applied_fun_symbols(kids[1])
+    names: Set[str] = set()
+    rest = kids[1:]
+    if not str(head).startswith("("):
+        if (
+            head not in _SMT_CORE_SYMBOLS
+            and head not in _SORT_LIKE_SYMBOLS
+            and not str(head).startswith("@")
+            and not str(head).startswith("_let")
+            and not str(head).startswith("BOUND_VARIABLE")
+        ):
+            names.add(head)
+    else:
+        rest = kids
+    for kid in rest:
+        if str(kid).startswith("("):
+            names |= _applied_fun_symbols(kid)
+    return names
+
+
+def _relevance_term(formula: str) -> Tuple[str, str]:
+    """Term used for R: instance consequent when ``Q => Q[t/x]``, else full formula."""
+    body = _strip_lets(formula)
+    kids = _sexpr_children(body)
+    if kids and kids[0] in ("=>", "implies") and len(kids) >= 3:
+        if _head_symbol(kids[1]) in ("forall", "exists"):
+            return kids[2], "instance"
+    return body, "full"
+
+
+def _fun_jaccard(term: str, goal_term: Optional[str]) -> float:
+    left = _applied_fun_symbols(term)
+    right = _applied_fun_symbols(goal_term or "")
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _axiom_hotness_ranks(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str],
+) -> Dict[str, int]:
+    """Dense rank (1 = hottest) among this profile's axiom difficulty scores."""
+    best: Dict[str, int] = {}
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        if classify_difficulty_term(str(term), goal_term) != "axiom":
+            continue
+        key = canonical_smt_term(str(term))
+        best[key] = max(best.get(key, 0), int(score))
+    ordered = sorted(best.items(), key=lambda item: -item[1])
+    ranks: Dict[str, int] = {}
+    prev: Optional[int] = None
+    rank = 0
+    for key, score in ordered:
+        if score != prev:
+            rank += 1
+            prev = score
+        ranks[key] = rank
+    return ranks
+
+
+def _compactness_scores(sizes: Sequence[int]) -> List[float]:
+    """Relative compactness in this candidate set: shorter → closer to 1."""
+    if not sizes:
+        return []
+    uniq = sorted(set(int(n) for n in sizes))
+    if len(uniq) == 1:
+        return [1.0] * len(sizes)
+    rank = {n: i for i, n in enumerate(uniq)}
+    denom = len(uniq) - 1
+    return [1.0 - (rank[int(n)] / denom) for n in sizes]
+
+
+def _primary_applied_fun(term: str) -> str:
+    body = _strip_lets(term)
+    kids = _sexpr_children(body)
+    target = kids[1] if kids and kids[0] == "=" and len(kids) >= 2 else body
+    head = _head_symbol(target)
+    if (
+        head
+        and not str(head).startswith("(")
+        and head not in _SMT_CORE_SYMBOLS
+        and head not in _SORT_LIKE_SYMBOLS
+        and not str(head).startswith("@")
+    ):
+        return head
+    names = sorted(_applied_fun_symbols(body))
+    return names[0] if names else ""
+
+
+def _formula_key(formula: str) -> str:
+    text = formula or ""
+    return canonical_smt_term(text) if text.startswith("(") else text
+
+
+def _is_skolem_split(row: dict) -> bool:
+    source = str(row.get("source") or "")
+    if "SKOLEMIZE" in source:
+        return True
+    return (
+        str(row.get("relevance_scope") or "") == "full"
+        and bool(row.get("goal_related"))
+        and len(str(row.get("formula") or "")) > 240
+    )
+
+
+def _is_primary_instance(row: dict) -> bool:
+    if _is_skolem_split(row):
+        return False
+    if row.get("relation") == "matched_quantifier":
+        return True
+    return (
+        str(row.get("source") or "") in _LEMMA_INSTANCE_SOURCES
+        and str(row.get("relevance_scope") or "") == "instance"
+        and float(row.get("goal_relevance") or 0.0) >= 0.25
+    )
 
 
 def _lemma_records_by_profile(result: CvcResult) -> List[Tuple[str, List[dict], List[Tuple[str, int]]]]:
@@ -1255,89 +1419,173 @@ def _lemma_records_by_profile(result: CvcResult) -> List[Tuple[str, List[dict], 
 
 
 def select_formula_evidence_samples(result: CvcResult) -> List[dict]:
-    """Pick up to 4 samples: hotspot, goal, then a diverse leftover.
+    """Pick up to 4 samples by display priority, then diversity quotas.
 
-    Difficulty and lemmas are associated only within the same profile. Empty
-    slots are filled from other categories. Absence of a sample is not
-    evidence that instantiations did not occur.
+    ``selection_score`` is how worth showing a formula is, not usefulness or
+    proof contribution. Difficulty ranks apply only to matched origin axioms.
     """
     classified: List[dict] = []
     goal_term = result.goal_term
     for profile, lemmas, difficulty in _lemma_records_by_profile(result):
         hard_axioms = hard_axioms_from_difficulty(difficulty, goal_term)
+        ranks = _axiom_hotness_ranks(difficulty, goal_term)
         for rec in lemmas:
             formula = str(rec.get("formula") or "")
             if not formula:
                 continue
-            relation, related, goal_hit = _relate_formula(formula, hard_axioms, goal_term)
+            relation, related, goal_hit = _relate_formula(
+                formula, hard_axioms, goal_term,
+            )
+            rel_term, rel_scope = _relevance_term(formula)
+            relevance = _fun_jaccard(rel_term, goal_term)
+            hotspot_known = relation == "matched_quantifier" and bool(related)
+            hotness = 0.0
+            if hotspot_known:
+                rank = ranks.get(canonical_smt_term(related))
+                if rank:
+                    hotness = 1.0 / float(rank)
+            funs = _applied_fun_symbols(rel_term)
+            origin_key = canonical_smt_term(related) if hotspot_known else ""
             classified.append({
                 "profile": profile,
                 "source": str(rec.get("source") or ""),
                 "formula": formula,
-                "related_axiom": related,
+                "related_axiom": related if relation != "unlinked" else "",
                 "relation": relation,
                 "goal_related": goal_hit,
+                "goal_relevance": relevance,
+                "origin_hotness": hotness,
+                "hotspot_known": hotspot_known,
+                "relevance_scope": rel_scope,
+                "origin_match": relation,
+                "applied_funs": funs,
+                "primary_fun": _primary_applied_fun(rel_term),
+                "shape_key": (origin_key, tuple(sorted(funs))),
+                "size": len(formula),
             })
 
-    hotspot: List[dict] = []
-    goal_rows: List[dict] = []
-    rest: List[dict] = []
+    best_by_key: Dict[str, dict] = {}
     for row in classified:
-        if row["relation"] == "matched_quantifier" or (
-            row["relation"] == "shared_symbols" and row.get("related_axiom")
+        key = _formula_key(row["formula"])
+        prev = best_by_key.get(key)
+        if prev is None:
+            best_by_key[key] = row
+            continue
+        if (
+            float(row["goal_relevance"]),
+            float(row["origin_hotness"]),
+            -int(row["size"]),
+        ) > (
+            float(prev["goal_relevance"]),
+            float(prev["origin_hotness"]),
+            -int(prev["size"]),
         ):
-            hotspot.append(row)
-        elif row.get("goal_related"):
-            goal_rows.append(row)
-        else:
-            rest.append(row)
-
-    selected: List[dict] = []
-    seen = set()
-
-    def _take(pool: List[dict], limit: int) -> None:
-        taken = 0
-        for row in pool:
-            if taken >= limit or len(selected) >= MAX_FORMULA_SAMPLES:
-                return
-            key = canonical_smt_term(row["formula"]) if row["formula"].startswith("(") else row["formula"]
-            if key in seen:
-                continue
-            seen.add(key)
-            selected.append(row)
-            taken += 1
-
-    _take(hotspot, MAX_HOTSPOT_SAMPLES)
-    _take(goal_rows, MAX_GOAL_SAMPLES)
-
-    def _is_diverse(row: dict) -> bool:
-        if not selected:
-            return True
-        sources = {item.get("source") for item in selected}
-        funs = smt_fun_symbols(row["formula"])
-        selected_funs = set()
-        for item in selected:
-            selected_funs |= smt_fun_symbols(item["formula"])
-        return (
-            row.get("source") not in sources
-            or (funs and not funs <= selected_funs)
+            best_by_key[key] = row
+    rows = list(best_by_key.values())
+    compact = _compactness_scores([int(item["size"]) for item in rows])
+    for row, compact_s in zip(rows, compact):
+        row["compactness"] = compact_s
+        row["selection_score"] = (
+            SCORE_W_RELEVANCE * float(row["goal_relevance"])
+            + SCORE_W_HOTNESS * float(row["origin_hotness"])
+            + SCORE_W_COMPACT * compact_s
         )
+    rows.sort(
+        key=lambda item: (
+            -float(item["selection_score"]),
+            -float(item["goal_relevance"]),
+            int(item["size"]),
+        ),
+    )
+    return _select_diverse_formula_samples(rows)
 
-    diverse = [row for row in rest + goal_rows + hotspot if _is_diverse(row)]
-    _take(diverse, 1)
-    leftover = rest + goal_rows + hotspot
-    _take(leftover, MAX_FORMULA_SAMPLES - len(selected))
 
-    samples: List[dict] = []
-    for row in selected:
-        samples.append({
-            "profile": row.get("profile") or "",
-            "source": row.get("source") or "",
-            "formula": row["formula"],
-            "related_axiom": row.get("related_axiom") or "",
-            "relation": row.get("relation") or "unlinked",
-        })
-    return samples
+def _public_sample(row: dict) -> dict:
+    rec = {
+        "profile": row.get("profile") or "",
+        "source": row.get("source") or "",
+        "formula": row["formula"],
+        "related_axiom": row.get("related_axiom") or "",
+        "relation": row.get("relation") or "unlinked",
+        "selection_score": round(float(row.get("selection_score") or 0.0), 4),
+        "goal_relevance": round(float(row.get("goal_relevance") or 0.0), 4),
+        "origin_hotness": round(float(row.get("origin_hotness") or 0.0), 4),
+        "compactness": round(float(row.get("compactness") or 0.0), 4),
+        "origin_match": row.get("origin_match") or row.get("relation") or "unlinked",
+        "hotspot_known": bool(row.get("hotspot_known")),
+        "relevance_scope": row.get("relevance_scope") or "full",
+    }
+    return rec
+
+
+def _select_diverse_formula_samples(rows: Sequence[dict]) -> List[dict]:
+    selected: List[dict] = []
+    seen_shapes: Set = set()
+
+    def _take(row: dict, *, ignore_shape: bool = False) -> bool:
+        if len(selected) >= MAX_FORMULA_SAMPLES:
+            return False
+        key = _formula_key(row["formula"])
+        if any(_formula_key(item["formula"]) == key for item in selected):
+            return False
+        shape = row.get("shape_key")
+        if not ignore_shape and shape in seen_shapes:
+            return False
+        selected.append(row)
+        seen_shapes.add(shape)
+        return True
+
+    primary_funs: Set[str] = set()
+    for row in rows:
+        n_primary = sum(1 for item in selected if _is_primary_instance(item))
+        if n_primary >= MAX_HOTSPOT_SAMPLES:
+            break
+        if not _is_primary_instance(row):
+            continue
+        fun = str(row.get("primary_fun") or "")
+        if fun and fun in primary_funs:
+            continue
+        if _take(row):
+            if fun:
+                primary_funs.add(fun)
+
+    skolem_n = 0
+    for row in rows:
+        if skolem_n >= MAX_SKOLEM_SAMPLES:
+            break
+        if not _is_skolem_split(row):
+            continue
+        if _take(row):
+            skolem_n += 1
+
+    selected_funs: Set[str] = set()
+    for item in selected:
+        selected_funs |= set(item.get("applied_funs") or [])
+    for row in rows:
+        if len(selected) >= MAX_FORMULA_SAMPLES:
+            break
+        if _is_skolem_split(row) and skolem_n >= MAX_SKOLEM_SAMPLES:
+            continue
+        funs = set(row.get("applied_funs") or [])
+        if row.get("hotspot_known") and funs and funs <= selected_funs:
+            continue
+        if _take(row):
+            selected_funs |= funs
+            break
+
+    def _fill(*, ignore_shape: bool) -> None:
+        for row in rows:
+            if len(selected) >= MAX_FORMULA_SAMPLES:
+                return
+            if _is_skolem_split(row) and skolem_n >= MAX_SKOLEM_SAMPLES:
+                continue
+            _take(row, ignore_shape=ignore_shape)
+
+    _fill(ignore_shape=False)
+    if len(selected) < MAX_FORMULA_SAMPLES:
+        _fill(ignore_shape=True)
+
+    return [_public_sample(row) for row in selected]
 
 
 
