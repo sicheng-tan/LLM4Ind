@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from solver_relative_metrics import log_gain
+from exp_flags import progress_feedback_enabled
 from theory_features import TheoryFeatures
 
 
@@ -429,11 +430,23 @@ def rank_profiles_for_attempt(
     extra_signals: Sequence[str] = (),
     probe_utilities: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
-    """Static + hint rank, then 3s progress rerank, then top-k.
+    """Static + hint rank, then optional 3s-sidecar rerank, then top-k.
+
+    暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): ignore leftover
+    ``progress_lemmas`` / ``progress_routing_signals`` / ``no_progress``
+    sidecar hints so they cannot rerank profiles. Mix HD ``progress_signals``
+    on remaining repair hints still apply.
 
     Probe scores apply only before any lemma-failure sidecar exists; after that
     they must not override keep / switch / try-next.
     """
+    if not progress_feedback_enabled():
+        progress_lemmas = ()
+        extra_signals = ()
+        hints = [
+            h for h in hints
+            if str((h or {}).get("kind") or "") not in _LEMMA_FEEDBACK_HINTS
+        ]
     ranked, reasons = recommend_profiles(
         backend, features, hints, parent_profile=parent_profile
     )

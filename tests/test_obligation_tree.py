@@ -280,6 +280,8 @@ def test_diagnosis_tree_prompt_omits_library_and_generation_legend() -> None:
     with _patch_flags("on", "on"):
         text = format_diagnosis_tree_prompt(obligation)
         mixed = format_obligation_prompt(library, obligation, for_diagnosis=True)
+    with _patch_flags("on", "off"):
+        assert format_diagnosis_tree_prompt(obligation) == ""
     assert "Last obligation tree" in text
     assert "L1  invalid [plus has no axioms]" in text
     assert "do not propose lemmas" in text
@@ -423,12 +425,12 @@ def _sample_obligation():
     return library, append_attempt({}, "obligation_tree", tree)
 
 
-def test_flags_default_on_and_off_synonyms() -> None:
+def test_flags_default_and_off_synonyms() -> None:
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("LEMMA_LIBRARY", None)
         os.environ.pop("OBLIGATION_TREE", None)
         assert lemma_library_enabled() is True
-        assert obligation_tree_enabled() is True
+        assert obligation_tree_enabled() is False  # temporarily unused, default off
     for val in ("on", "ON", "true", "1", "yes"):
         with _patch_flags(val, val):
             assert lemma_library_enabled() is True
@@ -599,7 +601,7 @@ def main() -> int:
     test_diagnosis_tree_prompt_omits_library_and_generation_legend()
     test_compact_atp_keeps_actionable_hints()
     test_harvest_retry_timeout_s_default_and_override()
-    test_flags_default_on_and_off_synonyms()
+    test_flags_default_and_off_synonyms()
     test_library_flag_controls_persist_and_inject()
     test_prompt_flags_distinguish_library_and_tree()
     test_mate_feedback_and_recording_respect_flags()

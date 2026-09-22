@@ -63,13 +63,17 @@ def setup_environment():
         os.getenv('SOLVER_ROUTING_LLM_MIN_CONFIDENCE', '0.55')
     )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
-    obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
+    # 暂时弃用 (default off): stale failed splits vs growing library / INVALID.
+    obligation_tree = os.getenv('OBLIGATION_TREE', 'off')
     lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
     usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
     harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
     feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
+    # 暂时弃用 (default off): 3s sidecar + progress lemmas; do not enable casually.
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
+    # 暂时弃用 (default off): advice labels are bias, not a next-step.
+    prompt_advice = os.getenv('PROMPT_ADVICE', 'off')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
     subgoal_sat_abort = os.getenv('SUBGOAL_SAT_ABORT', 'on')
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
@@ -136,6 +140,7 @@ def setup_environment():
         'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROMPT_RETARGET': prompt_retarget,
+        'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,
         'SUBGOAL_SAT_ABORT': subgoal_sat_abort,
         'LEMMA_DEFINED_SYMBOLS': lemma_defined_symbols,

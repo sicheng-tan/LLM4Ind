@@ -39,6 +39,14 @@ STEP_CHILD = "(forall ((n Nat) (m Nat)) (= (plus (succ n) m) (plus n (succ m))))
 KEPT = "(forall ((x Nat)) (= (plus x x) (plus x x)))"
 
 
+def _advice_on():
+    return patch.dict(os.environ, {"PROMPT_ADVICE": "on"})
+
+
+def _tree_on():
+    return patch.dict(os.environ, {"OBLIGATION_TREE": "on"})
+
+
 def _hd(**extra):
     hint = {
         "kind": "high_difficulty_assertions",
@@ -65,9 +73,10 @@ def test_trigger_from_rare_inst() -> None:
         "strategy_mode": "v2",
         "repair_hints": [_hd(rarely_instantiated=[AX])],
     }
-    adv = advice_from_failed_data(data)
-    assert adv is not None and adv.name == ADVICE_TRIGGER
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    with _advice_on():
+        adv = advice_from_failed_data(data)
+        assert adv is not None and adv.name == ADVICE_TRIGGER
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
     assert "INITIAL SOLVE" in txt
     assert "advice: TRIGGER" in txt
     assert "because:" in txt
@@ -91,7 +100,8 @@ def test_v2_simple_keeps_advice() -> None:
         "strategy_mode": "v2_simple",
         "repair_hints": [_hd(rarely_instantiated=[AX])],
     }
-    adv = advice_from_failed_data(data)
+    with _advice_on():
+        adv = advice_from_failed_data(data)
     assert adv is not None and adv.name == ADVICE_TRIGGER
 
 
@@ -285,17 +295,18 @@ def test_local_vs_parent_contrast_in_last_attempt() -> None:
             "repair_hints": [_hd()],
         }],
     }
-    contrast = "\n".join(format_local_vs_parent_lines(data))
-    assert "already proved (local):" in contrast
-    assert "flatten3 (Node" in contrast or "flatten3" in contrast
-    assert "still open (parent):" in contrast
-    assert "flatten0" in contrast
-    assert "do not resend proved locals" in contrast
+    with _tree_on():
+        contrast = "\n".join(format_local_vs_parent_lines(data))
+        assert "already proved (local):" in contrast
+        assert "flatten3 (Node" in contrast or "flatten3" in contrast
+        assert "still open (parent):" in contrast
+        assert "flatten0" in contrast
+        assert "do not resend proved locals" in contrast
 
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
-    assert "already proved (local):" in txt
-    assert "still open (parent):" in txt
-    assert txt.index("already proved (local):") < txt.index("still open (parent):")
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+        assert "already proved (local):" in txt
+        assert "still open (parent):" in txt
+        assert txt.index("already proved (local):") < txt.index("still open (parent):")
 
     adv = select_prompt_advice(
         has_kept=True,
@@ -355,7 +366,8 @@ def test_initial_solve_skips_prune_and_bridge() -> None:
             "stats": {"CONJ_TOTAL": 1, "INST_TOTAL": 0, "QUANTIFIERS_SKOLEMIZE": 0},
         },
     }
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    with _advice_on():
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
     assert "INITIAL SOLVE" in txt
     assert "advice: PRUNE" not in txt
     assert "advice: BRIDGE" not in txt
@@ -370,7 +382,8 @@ def test_last_attempt_v2_trigger_keeps_lemmas_only() -> None:
             "repair_hints": [_hd(rarely_instantiated=[AX], source_lemmas=[KEPT])],
         }],
     }
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    with _advice_on():
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
     assert "LAST ATTEMPT" in txt
     assert KEPT in txt
     assert "advice: TRIGGER" in txt
@@ -395,7 +408,8 @@ def test_missing_dump_skips_prune_bridge() -> None:
         }],
         "baseline_diag": {"difficulty": []},
     }
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    with _advice_on():
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
     assert "advice: PRUNE" not in txt
     assert "advice: BRIDGE" not in txt
     assert "[unused]" not in txt
@@ -444,10 +458,11 @@ def test_per_profile_attribution_not_prune_advice() -> None:
             },
         },
     }
-    adv = advice_from_failed_data(data)
-    assert adv is not None and adv.name == ADVICE_BRIDGE
-    assert adv.constraint is None
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+    with _advice_on():
+        adv = advice_from_failed_data(data)
+        assert adv is not None and adv.name == ADVICE_BRIDGE
+        assert adv.constraint is None
+        txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
     assert "advice: PRUNE" not in txt
     assert "advice: BRIDGE" in txt
 

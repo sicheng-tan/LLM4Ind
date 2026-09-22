@@ -28,6 +28,7 @@ from lemma_gates import (
     attach_source_lemmas,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
+    format_diagnosis_invalid_prompt,
     format_repair_header,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
@@ -203,9 +204,14 @@ def test_parse_llm_reason() -> None:
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
         assert should_run_final_diagnosis(1) is True
         assert should_run_final_diagnosis(0) is False
-        assert should_run_final_diagnosis(1, has_tree=False) is False
+        assert should_run_final_diagnosis(1, has_invalid=False) is False
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert should_run_final_diagnosis(1) is False
+    assert "CURRENT goal is also invalid" in format_diagnosis_invalid_prompt({
+        "invalid_lemmas": [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}],
+    })
+    assert format_diagnosis_invalid_prompt({"invalid_lemmas": []}) == ""
+    assert format_diagnosis_invalid_prompt({}) == ""
 
 
 def test_parse_llm_lemmas_xml_and_legacy() -> None:
@@ -818,9 +824,10 @@ def test_diagnosis_suffix_flag() -> None:
         assert "do not use <lemma> tags" in final[1]["content"]
         assert "FINAL CHECK" in final[1]["content"]
         assert "propose different lemmas" not in final[1]["content"]
-        assert "Using the obligation tree" in final[1]["content"]
+        assert "Using INVALID child lemmas" in final[1]["content"]
         assert "output invalid" in final[1]["content"]
         assert "output failed." in final[1]["content"]
+        assert "obligation tree" not in final[1]["content"]
         assert "still_open" not in final[1]["content"]
         assert "prior attempts" not in final[1]["content"]
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
@@ -1275,6 +1282,7 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         data = mate._empty_failed_data()
         data["obligation"] = append_attempt({}, "obligation_tree", tree)
+        data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
         mate.save_failed_lemmas(tmp, "template", data)
         with patch.dict(os.environ, {
             "OBLIGATION_TREE": "on",
@@ -1300,8 +1308,10 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
         assert judge in child_extra
         assert judge in child[1]["content"]
         assert "INVALID_GOAL: <short explanation>" in child[1]["content"]
-        assert judge in final_extra
+        assert "Invalid lemma 1 (plus has no axioms)" in final_extra
+        assert "Last obligation tree" not in final_extra
         assert "INVALID_GOAL: <short explanation>" in final[1]["content"]
+        assert "Using INVALID child lemmas" in final[1]["content"]
 
 
 def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
@@ -1367,7 +1377,8 @@ def test_cancelled_invalid_child_keeps_reason() -> None:
             tmp, "template_1_2",
             kind="invalid", reason="plus has no axioms", source="llm",
         )
-        node = mate._child_obligation_node(tmp, "template_1_2", formula, "cancelled")
+        with patch.dict(os.environ, {"OBLIGATION_TREE": "on"}):
+            node = mate._child_obligation_node(tmp, "template_1_2", formula, "cancelled")
         assert node["status"] == "invalid"
         assert "plus" in (node.get("reason") or "")
 
@@ -1434,7 +1445,10 @@ def test_invalid_child_does_not_stop_parent_attempts() -> None:
         calls["n"] += 1
         return True, ["template_1"], [PLUS_LEMMA]
 
-    def fake_parallel(*_args, **_kwargs):
+    def fake_parallel(base_path, *_args, **_kwargs):
+        mate.add_invalid_lemma(
+            base_path, "template", PLUS_LEMMA, "plus has no axioms",
+        )
         return False, [child]
 
     def fake_gen(*_args, diagnosis_only=False, **_kwargs):
@@ -1452,6 +1466,7 @@ def test_invalid_child_does_not_stop_parent_attempts() -> None:
             "SUBGOAL_SAT_ABORT": "off",
             "LEMMA_LIBRARY": "off",
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "OBLIGATION_TREE": "off",
         }), patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
         ), patch(
@@ -1469,7 +1484,7 @@ def test_invalid_child_does_not_stop_parent_attempts() -> None:
         assert outcome.get("kind") != "invalid"
 
 
-def test_final_diagnosis_prompt_is_tree_only() -> None:
+def test_final_diagnosis_prompt_is_invalid_only() -> None:
     import Mate_new as mate
     from obligation_tree import append_attempt, make_child_node, make_goal_tree
 
@@ -1516,14 +1531,17 @@ def test_final_diagnosis_prompt_is_tree_only() -> None:
             )
         text = messages[1]["content"]
         assert "FINAL CHECK" in text
-        assert "Last obligation tree" in extra
-        assert "L1  invalid [plus has no axioms]" in extra
-        assert "The following lemmas are INVALID or CANNOT" not in text
+        assert "Using INVALID child lemmas" in text
+        assert "Invalid lemma 1 (plus has no axioms)" in extra
+        assert "The following lemmas are INVALID or CANNOT" in extra
+        assert "Last obligation tree" not in extra
+        assert "L1  invalid" not in extra
         assert "USEFUL BUT UNPROVED" not in text
+        assert "USEFUL BUT UNPROVED" not in extra
         assert "SOLVER-GUIDED REPAIR" not in extra
+        assert "root rewrite" not in extra
         assert "Previous empty output reason" not in text
         assert "Previous empty output reason" not in gen_extra
-        assert "generate lemmas for the CURRENT goal only" not in extra
         assert "The following lemmas are INVALID or CANNOT" in gen_extra
         assert "Last obligation tree" in gen_extra
 
@@ -1542,6 +1560,12 @@ def test_final_diagnosis_marks_goal_invalid() -> None:
     def fake_quick(*_args, **_kwargs):
         return True, ["template_1"], [PLUS_LEMMA]
 
+    def fake_parallel(base_path, *_args, **_kwargs):
+        mate.add_invalid_lemma(
+            base_path, "template", PLUS_LEMMA, "plus has no defining axioms",
+        )
+        return False, [child]
+
     def fake_gen(*_args, diagnosis_only=False, **_kwargs):
         if diagnosis_only:
             mate._store_last_llm_reason(
@@ -1558,13 +1582,14 @@ def test_final_diagnosis_marks_goal_invalid() -> None:
             "SUBGOAL_SAT_ABORT": "off",
             "LEMMA_LIBRARY": "off",
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "OBLIGATION_TREE": "off",
         }), patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
         ), patch(
             "Mate_new_vampire.quick_run", side_effect=fake_quick
         ), patch(
             "Mate_new_vampire.prove_subgoals_parallel",
-            return_value=(False, [child]),
+            side_effect=fake_parallel,
         ), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen
         ):
@@ -1576,9 +1601,8 @@ def test_final_diagnosis_marks_goal_invalid() -> None:
         assert outcome.get("source") == "llm_final"
 
 
-def test_final_diagnosis_skipped_without_tree() -> None:
+def test_final_diagnosis_skipped_without_invalid() -> None:
     import Mate_new_vampire as mate
-    from obligation_tree import last_normal_tree
 
     diag = {"n": 0}
 
@@ -1600,7 +1624,7 @@ def test_final_diagnosis_skipped_without_tree() -> None:
             "SUBGOAL_SAT_ABORT": "off",
             "LEMMA_LIBRARY": "off",
             "LLM_LEMMA_DIAGNOSIS": "on",
-            "OBLIGATION_TREE": "on",
+            "OBLIGATION_TREE": "off",
         }), patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
         ), patch(
@@ -1611,8 +1635,7 @@ def test_final_diagnosis_skipped_without_tree() -> None:
             ok = mate.prove_run(tmp, "template", depth=1)
         assert ok is False
         assert diag["n"] == 0
-        obligation = mate.load_failed_lemmas(tmp, "template").get("obligation") or {}
-        assert last_normal_tree(obligation) is None
+        assert mate.load_failed_lemmas(tmp, "template").get("invalid_lemmas") in ([], None)
         outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
         assert outcome.get("kind") != "invalid"
 
@@ -1694,9 +1717,9 @@ def main() -> int:
     test_cancelled_invalid_child_keeps_reason()
     test_prompt_invalid_not_unproved_and_drops_child_atp()
     test_invalid_child_does_not_stop_parent_attempts()
-    test_final_diagnosis_prompt_is_tree_only()
+    test_final_diagnosis_prompt_is_invalid_only()
     test_final_diagnosis_marks_goal_invalid()
-    test_final_diagnosis_skipped_without_tree()
+    test_final_diagnosis_skipped_without_invalid()
     test_final_diagnosis_skipped_at_root()
     print("lemma gate tests passed")
     return 0

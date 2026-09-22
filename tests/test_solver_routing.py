@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -522,16 +523,31 @@ def test_progress_routing_keep_switch_next() -> None:
 
 def test_lemma_feedback_overrides_probe_utility() -> None:
     adt = analyze_smt("(set-logic UFDT)\n(declare-datatypes ((nat 0)) (((zero))))")
-    _ranked, candidates, reasons = rank_profiles_for_attempt(
-        "cvc5",
-        adt,
-        [{"kind": "no_progress"}],
-        current_profile="adt_structural",
-        extra_signals=["no_measurable_progress"],
-        probe_utilities={"adt_structural": 9.0, "cvc5_inductive": 0.1},
-    )
+    with patch.dict("os.environ", {"FEEDBACK_PROGRESS": "on"}):
+        _ranked, candidates, reasons = rank_profiles_for_attempt(
+            "cvc5",
+            adt,
+            [{"kind": "no_progress"}],
+            current_profile="adt_structural",
+            extra_signals=["no_measurable_progress"],
+            probe_utilities={"adt_structural": 9.0, "cvc5_inductive": 0.1},
+        )
     _ok(candidates[0] != "adt_structural", candidates)
     _ok("progress:try_next_profile" in reasons, reasons)
+
+
+def test_progress_flag_off_ignores_sidecar_hints() -> None:
+    adt = analyze_smt("(set-logic UFDT)\n(declare-datatypes ((nat 0)) (((zero))))")
+    with patch.dict("os.environ", {"FEEDBACK_PROGRESS": "off"}):
+        _ranked, _candidates, reasons = rank_profiles_for_attempt(
+            "cvc5",
+            adt,
+            [{"kind": "no_progress"}],
+            current_profile="adt_structural",
+            extra_signals=["no_measurable_progress"],
+            probe_utilities={"adt_structural": 9.0, "cvc5_inductive": 0.1},
+        )
+    _ok("progress:try_next_profile" not in reasons, reasons)
 
 
 def main() -> int:
@@ -554,6 +570,7 @@ def main() -> int:
         test_failed_pair_has_no_winner,
         test_progress_routing_keep_switch_next,
         test_lemma_feedback_overrides_probe_utility,
+        test_progress_flag_off_ignores_sidecar_hints,
     ]
     failed = 0
     for fn in tests:

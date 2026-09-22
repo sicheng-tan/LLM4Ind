@@ -1,5 +1,8 @@
 """v2 LAST ATTEMPT advice: last-round diagnosis → next lemma bias.
 
+暂时弃用: ``PROMPT_ADVICE`` defaults off, so
+``advice_from_failed_data`` returns None unless the flag is set ``on``.
+
 Not pipeline states (STOP / CHILD-FIRST / CONTINUE). Not solver routing.
 ``advice: TRIGGER`` is a matchable equational bridge, not SMT ``:pattern``.
 
@@ -16,7 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from exp_flags import is_v2_strategy_mode, prompt_advice_enabled
-from obligation_tree import compact_formula, last_normal_tree
+from obligation_tree import compact_formula, last_normal_tree, obligation_tree_enabled
 from cvc5_runner import classify_difficulty_term
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
@@ -99,6 +102,10 @@ def format_local_vs_parent_lines(
     keep the block short.
     """
     data = failed_data if isinstance(failed_data, dict) else {}
+    # Temporarily unused with OBLIGATION_TREE (default off): do not surface
+    # proved-local / open-parent from a stale tree when the flag is off.
+    if not obligation_tree_enabled():
+        return []
     tree = last_normal_tree(data.get("obligation"))
     if isinstance(tree, dict) and str(tree.get("status") or "") == "proved":
         return []
@@ -127,6 +134,7 @@ def advice_from_failed_data(
     data = failed_data if isinstance(failed_data, dict) else {}
     if str(backend or "").lower() != "cvc5":
         return None
+    # Temporarily unused: PROMPT_ADVICE defaults off (no TRIGGER/BRIDGE/...).
     if not prompt_advice_enabled():
         return None
     if not is_v2_strategy_mode(str(data.get("strategy_mode") or "default")):
@@ -550,6 +558,10 @@ def _proved_child_formulas(data: dict) -> List[str]:
 
 
 def _lemma_child_formulas(data: dict, *, status: str) -> List[str]:
+    # Temporarily unused with OBLIGATION_TREE: do not walk leftover trees
+    # for GENERALIZE / local-vs-parent when the flag is off.
+    if not obligation_tree_enabled():
+        return []
     tree = last_normal_tree(data.get("obligation"))
     out: List[str] = []
     want = str(status or "")

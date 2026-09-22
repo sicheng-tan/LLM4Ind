@@ -4,10 +4,20 @@ Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
-``LEMMA_LIBRARY_LOCAL``, and ``OBLIGATION_TREE``.
+and ``LEMMA_LIBRARY_LOCAL``.
 
-``PROMPT_ADVICE`` (default on) controls v2 LAST ATTEMPT advice labels and is
-independent of ``v2`` / ``v2_simple`` strategy mode (HD-only ablation).
+暂时弃用 (default **off**; set ``on`` to re-enable — do not turn these on
+by accident):
+- ``PROMPT_ADVICE``: v2 LAST ATTEMPT labels (TRIGGER/BRIDGE/GENERALIZE/...).
+  Kept off so advice is not treated as a causal next-step, and so HD-only
+  ablations stay clean.
+- ``OBLIGATION_TREE``: last well-formed split tree in the prompt / json.
+  Kept off because failed-tree history goes stale as the lemma library and
+  invalid list grow; durable signal stays in the library + INVALID.
+- ``FEEDBACK_PROGRESS``: 3s usefulness sidecar, progress lemmas in the prompt,
+  and sidecar-driven profile rerank (``no_progress`` / ``partial_progress``).
+  Mix / HD hints still come from the failed 60s A∧C→P prove.
+  Do not turn this on unless you are deliberately ablating the sidecar.
 
 ``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
 ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
@@ -43,7 +53,10 @@ def repair_hints_enabled() -> bool:
 def progress_feedback_enabled() -> bool:
     """Run the 3s usefulness sidecar and inject progress lemmas into the prompt.
 
-    Default off: mix hints come from the failed 60s A∧C→P prove, not the sidecar.
+    暂时弃用: default **off**. Do not enable casually — the sidecar is extra
+    solver work and leftover ``progress_lemmas`` / ``no_progress`` hints can
+    rerank profiles. Mix / HD still come from the failed 60s A∧C→P prove.
+    ``FEEDBACK_PROGRESS=on`` restores the sidecar.
     """
     return _flag_enabled("FEEDBACK_PROGRESS", default="off")
 
@@ -56,11 +69,11 @@ def prompt_retarget_enabled() -> bool:
 def prompt_advice_enabled() -> bool:
     """Emit v2 LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
 
-    Default on. Independent of ``v2`` / ``v2_simple`` strategy mode so ablations
-    can keep the lemma_general template while turning advice text off
-    (``PROMPT_ADVICE=off`` → HD / local-vs-parent feedback without ``advice:``).
+    暂时弃用: default **off**. Independent of ``v2`` / ``v2_simple``.
+    ``PROMPT_ADVICE=on`` restores ``advice:`` lines; off keeps HD / library /
+    INVALID without those labels.
     """
-    return _flag_enabled("PROMPT_ADVICE")
+    return _flag_enabled("PROMPT_ADVICE", default="off")
 
 
 def unproved_not_invalid_enabled() -> bool:

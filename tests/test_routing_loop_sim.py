@@ -106,7 +106,8 @@ def test_select_try_next_after_no_progress() -> None:
         data["repair_hints"] = [{"kind": "no_progress", "detail": "sim"}]
         data["progress_routing_signals"] = ["no_measurable_progress"]
         mate.save_failed_lemmas(tmp, "template", data)
-        state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+            state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
         _ok(decision.profile != current, decision)
         _ok("progress:try_next_profile" in state.routing_reasons, state.routing_reasons)
 
@@ -126,7 +127,8 @@ def test_select_keep_after_difficulty_drop() -> None:
             "signals": ["goal_difficulty_drop(9->3,67%)"],
         }]
         mate.save_failed_lemmas(tmp, "template", data)
-        state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+            state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
         _ok(decision.profile == current, decision)
         _ok("progress:keep_profile" in state.routing_reasons, state.routing_reasons)
 
@@ -140,7 +142,8 @@ def test_select_explosion_switches_profile() -> None:
         data["repair_hints"] = [{"kind": "no_progress", "detail": "sim"}]
         data["progress_routing_signals"] = ["search_explosion"]
         mate.save_failed_lemmas(tmp, "template", data)
-        state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+            state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
         _ok(decision.profile == "controlled_conjecture", decision)
         _ok("progress:search_explosion" in state.routing_reasons, state.routing_reasons)
 
@@ -216,7 +219,8 @@ def test_quick_run_simulated_llm_and_3s_feedback() -> None:
         pair = mate.load_routing_state(tmp, "template").pair_history[-1]
         _ok(pair["utility"] is None, pair)
         _ok(pair["proved"] is False, pair)
-        state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
+        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+            state, decision = mate.select_attempt_action(tmp, "template", PROMPTS)
         _ok(decision.profile == "controlled_conjecture", decision)
         _ok("progress:search_explosion" in state.routing_reasons, state.routing_reasons)
 

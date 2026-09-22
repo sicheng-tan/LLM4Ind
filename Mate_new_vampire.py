@@ -60,7 +60,6 @@ from obligation_tree import (
     append_attempt,
     classify_failed_attempt,
     format_obligation_prompt,
-    format_diagnosis_tree_prompt,
     last_normal_tree,
     lemma_library_enabled,
     load_lemma_library,
@@ -106,6 +105,7 @@ from lemma_gates import (
     compact_repair_snapshot,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
+    format_diagnosis_invalid_prompt,
     last_screen_records,
     is_invalid_diagnosis_reason,
     lemma_filter_drop_enabled,
@@ -287,7 +287,10 @@ def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
                        score: float, signals: List[str],
                        *, profile: Optional[str] = None,
                        profile_scores: Optional[dict] = None):
-    """记录对卡住目标有“进展”但尚未证出的引理（供下一轮优先复用/强化）"""
+    """记录对卡住目标有“进展”但尚未证出的引理（供下一轮优先复用/强化）。
+
+    暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no-op.
+    """
     if not progress_feedback_enabled():
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
@@ -426,6 +429,7 @@ def _record_obligation_attempt(
         "has_tree": bool(tree),
         "n_children": len((tree or {}).get("children") or []) if tree else 0,
     })
+    # 暂时弃用: OBLIGATION_TREE defaults off (stale failed splits).
     if obligation_tree_enabled():
         failed_data["obligation"] = append_attempt(
             failed_data.get("obligation"), kind, tree
@@ -445,6 +449,13 @@ def _child_obligation_node(
     depth: int = 0,
     attempt: int = 0,
 ) -> dict:
+    """Pin proved lemmas; nest last_normal_tree only when OBLIGATION_TREE is on.
+
+    Temporarily unused (default off): skip disk nest / failed-status remap
+    when the flag is off. Remap only changes the tree node's shown status
+    (failed/cancelled → invalid if this child is SAT / diagnosed invalid).
+    ``add_proved_lemma`` still runs — the library is independent of the tree.
+    """
     children: List[dict] = []
     lib_id = None
     tree_status = status
@@ -454,19 +465,23 @@ def _child_obligation_node(
             base_path, formula, origin=subgoal, attempt=attempt, depth=depth,
             role="pin",
         )
-        nested = last_normal_tree(load_failed_lemmas(base_path, subgoal).get("obligation"))
-        if nested:
-            children = list(nested.get("children") or [])
-    elif status in ("failed", "cancelled"):
-        child_data = load_failed_lemmas(base_path, subgoal)
-        nested = last_normal_tree(child_data.get("obligation"))
-        if nested:
-            children = list(nested.get("children") or [])
-        remapped, remapped_reason = tree_status_from_child_data(child_data)
-        if remapped == "invalid":
-            tree_status, tree_reason = remapped, remapped_reason
-        elif status == "failed":
-            tree_status, tree_reason = remapped, remapped_reason
+    if obligation_tree_enabled():
+        if status == "proved" and formula:
+            nested = last_normal_tree(
+                load_failed_lemmas(base_path, subgoal).get("obligation")
+            )
+            if nested:
+                children = list(nested.get("children") or [])
+        elif status in ("failed", "cancelled"):
+            child_data = load_failed_lemmas(base_path, subgoal)
+            nested = last_normal_tree(child_data.get("obligation"))
+            if nested:
+                children = list(nested.get("children") or [])
+            remapped, remapped_reason = tree_status_from_child_data(child_data)
+            if remapped == "invalid":
+                tree_status, tree_reason = remapped, remapped_reason
+            elif status == "failed":
+                tree_status, tree_reason = remapped, remapped_reason
     return make_child_node(
         node_id=subgoal,
         formula=formula,
@@ -474,6 +489,41 @@ def _child_obligation_node(
         lib=lib_id,
         reason=tree_reason,
         children=children,
+    )
+
+
+def _record_subgoal_split(
+    base_path: str,
+    base_name: str,
+    *,
+    proved: bool,
+    order: Sequence[str],
+    pre_proved: dict,
+    rec_nodes: Sequence[dict],
+) -> None:
+    """Log the split attempt; assemble/store a tree only when OBLIGATION_TREE is on."""
+    if not obligation_tree_enabled():
+        _record_obligation_attempt(base_path, base_name, "obligation_tree")
+        return
+    rec_map = {node.get("id"): node for node in rec_nodes}
+    children = []
+    for name in order:
+        if name in pre_proved:
+            children.append(make_child_node(
+                node_id=name,
+                formula=(pre_proved.get(name) or {}).get("formula"),
+                status="proved",
+                lib=(pre_proved.get(name) or {}).get("lib"),
+            ))
+        elif name in rec_map:
+            children.append(rec_map[name])
+    if not children:
+        children = list(rec_nodes)
+    _record_obligation_attempt(
+        base_path,
+        base_name,
+        "obligation_tree",
+        tree=make_goal_tree(base_name, children, proved=proved),
     )
 
 
@@ -736,6 +786,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
         if routing_txt:
             parts.append(routing_txt)
 
+    # Library still injects when OBLIGATION_TREE is off (temporarily unused).
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
             load_lemma_library(base_path),
@@ -781,7 +832,9 @@ def create_prompt(
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
         if diagnosis_only:
-            failed_info = format_diagnosis_tree_prompt(failed_data.get("obligation"))
+            # Extra invalid-check: INVALID child write-back only (same signal as
+            # in-loop diagnosis). Not the obligation tree.
+            failed_info = format_diagnosis_invalid_prompt(failed_data)
         else:
             failed_info += format_solver_feedback_for_prompt(
                 failed_data, base_path=base_path, depth=depth,
@@ -945,7 +998,10 @@ def analyze_lemma_progress(
     goal_name: str,
     base_path: str,
 ) -> Tuple[List[str], VampireResult]:
-    """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove)."""
+    """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove).
+
+    暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no extra diagnostics.
+    """
     if not progress_feedback_enabled():
         return [], VampireResult(status="unknown")
     diag = _diag_profile(base_path, goal_name)
@@ -1385,14 +1441,15 @@ def select_attempt_action(
         for item in state.profile_history
         if item.get("profile") and item.get("utility") is not None
     }
+    sidecar = progress_feedback_enabled()
     ranked, candidates, reasons = rank_profiles_for_attempt(
         "vampire",
         features,
         hints,
         parent_profile=parent_profile,
         current_profile=state.active_profile,
-        progress_lemmas=failed_data.get("progress_lemmas") or [],
-        extra_signals=failed_data.get("progress_routing_signals") or [],
+        progress_lemmas=(failed_data.get("progress_lemmas") or []) if sidecar else [],
+        extra_signals=(failed_data.get("progress_routing_signals") or []) if sidecar else [],
         probe_utilities=utilities or None,
     )
     if llm_selector_enabled():
@@ -2414,16 +2471,24 @@ def _run_final_goal_diagnosis(
     pack: Dict[str, Any],
     prompt_strategy: Optional[str],
 ) -> bool:
-    """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?"""
+    """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?
+
+    Uses accumulated ``invalid_lemmas`` (child write-back), not the obligation
+    tree. Skip when that list is empty — same evidence as in-loop diagnosis.
+    """
     if not should_run_final_diagnosis(depth):
         return False
     failed_data = load_failed_lemmas(base_path, base_name)
     existing = failed_data.get("node_outcome") or {}
     if str(existing.get("kind") or "") == "invalid":
         return True
-    if last_normal_tree(failed_data.get("obligation")) is None:
-        logging.info("子目标 %s 无可用义务树，跳过最终鉴定", base_name)
-        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_tree")
+    invalid = [
+        item for item in (failed_data.get("invalid_lemmas") or [])
+        if isinstance(item, dict) and str(item.get("lemma") or "").strip()
+    ]
+    if not should_run_final_diagnosis(depth, has_invalid=bool(invalid)):
+        logging.info("子目标 %s 无 INVALID 子引理，跳过最终鉴定", base_name)
+        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_invalid")
         return False
     smt_path = Path(base_path) / f"{base_name}.smt2"
     if not smt_path.exists():
@@ -2432,7 +2497,7 @@ def _run_final_goal_diagnosis(
     if not strat:
         return False
     logging.info("子目标 %s attempts 用尽，额外鉴定当前目标是否 invalid", base_name)
-    log_exp("final_diagnosis", goal=base_name, depth=depth)
+    log_exp("final_diagnosis", goal=base_name, depth=depth, n_invalid=len(invalid))
     try:
         generate_lemmas_with_llm(
             smt_path.read_text(encoding="utf-8"),
@@ -2686,21 +2751,9 @@ def _prove_run_body(
                 # 成功证明的情况，没有subgoal了
                 if not new_subgoals:
                     if pre_proved:
-                        children = [
-                            make_child_node(
-                                node_id=name,
-                                formula=(pre_proved.get(name) or {}).get("formula"),
-                                status="proved",
-                                lib=(pre_proved.get(name) or {}).get("lib"),
-                            )
-                            for name in order
-                            if name in pre_proved
-                        ]
-                        _record_obligation_attempt(
-                            base_path,
-                            base_name,
-                            "obligation_tree",
-                            tree=make_goal_tree(base_name, children, proved=True),
+                        _record_subgoal_split(
+                            base_path, base_name, proved=True,
+                            order=order, pre_proved=pre_proved, rec_nodes=[],
                         )
                     logging.info(f"🏆 子目标 {base_name} 完成证明！")
                     return _done(True, "llm_no_subgoals")
@@ -2719,25 +2772,9 @@ def _prove_run_body(
                     ok, rec_nodes = subgoal_result
                 else:
                     ok, rec_nodes = bool(subgoal_result), []
-                rec_map = {node.get("id"): node for node in rec_nodes}
-                children = []
-                for name in order:
-                    if name in pre_proved:
-                        children.append(make_child_node(
-                            node_id=name,
-                            formula=(pre_proved.get(name) or {}).get("formula"),
-                            status="proved",
-                            lib=(pre_proved.get(name) or {}).get("lib"),
-                        ))
-                    elif name in rec_map:
-                        children.append(rec_map[name])
-                if not children:
-                    children = rec_nodes
-                _record_obligation_attempt(
-                    base_path,
-                    base_name,
-                    "obligation_tree",
-                    tree=make_goal_tree(base_name, children, proved=ok),
+                _record_subgoal_split(
+                    base_path, base_name, proved=ok,
+                    order=order, pre_proved=pre_proved, rec_nodes=rec_nodes,
                 )
                 if ok:
                     logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")

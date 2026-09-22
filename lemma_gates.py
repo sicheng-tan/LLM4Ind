@@ -6,9 +6,11 @@ LEMMA_FILTER_DROP keeps remaining members after screening and continues
 usefulness; paper.env sets it off so any failing member aborts the group.
 The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
-judges whether the CURRENT goal is invalid from the last well-formed obligation
-tree only (no invalid/unproved/repair/progress/routing blocks). Skip the extra
-call when that tree does not exist.
+judges whether the CURRENT goal is invalid from the parent's accumulated
+``invalid_lemmas`` (child write-back), same signal as in-loop diagnosis —
+not the obligation tree (``OBLIGATION_TREE`` temporarily unused). Skip when
+that INVALID list is empty. ``PROMPT_ADVICE`` / ``FEEDBACK_PROGRESS`` are
+also temporarily unused (default off).
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 """
@@ -19,8 +21,13 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from exp_flags import _flag_enabled
-from obligation_tree import compact_formula, lemmas_equivalent, normalize_lemma_formula
+from exp_flags import _flag_enabled, prompt_advice_enabled
+from obligation_tree import (
+    compact_formula,
+    lemmas_equivalent,
+    normalize_lemma_formula,
+    obligation_tree_enabled,
+)
 from prompt_modes import (
     advice_from_failed_data,
     format_advice_lines,
@@ -65,9 +72,12 @@ DIAGNOSIS_PROMPT_SUFFIX = (
 
 FINAL_DIAGNOSIS_PROMPT_SUFFIX = (
     "\nFINAL CHECK (do not propose lemmas; do not use <lemma> tags).\n"
-    "Using the obligation tree "
-    "(especially child lemmas marked invalid and their reasons), "
+    "Using INVALID child lemmas and their reasons "
+    "(written back when a proposed helper was refuted), "
     "decide whether the CURRENT goal is a theorem of the given axioms.\n"
+    "If a previously proposed child lemma is marked invalid, use that mark "
+    "and its reason to decide whether the CURRENT goal is also invalid "
+    "(e.g. it depends on the same missing definition or contradiction).\n"
     "If it is INVALID (not a theorem), output invalid and write one line:\n"
     "; INVALID_GOAL: <short explanation>\n"
     "If it MAY still be a theorem, output failed.\n"
@@ -195,17 +205,42 @@ def node_attempt_plan(depth: int, pack: Dict[str, Any]) -> Tuple[int, int]:
     return capped, per_capped
 
 
-def should_run_final_diagnosis(depth: int = 0, *, has_tree: bool = True) -> bool:
+def should_run_final_diagnosis(depth: int = 0, *, has_invalid: bool = True) -> bool:
     """Extra invalid-check LLM call after child attempts are exhausted.
 
-    Requires a last well-formed obligation tree. Empty / invalid / useless
-    attempts do not create one, and the extra call is skipped.
+    Requires at least one INVALID lemma on this node (typically written back
+    when a child subgoal was refuted). No INVALID evidence → skip the call.
+    Independent of ``OBLIGATION_TREE``.
     """
     return (
         int(depth or 0) >= 1
         and llm_lemma_diagnosis_enabled()
-        and bool(has_tree)
+        and bool(has_invalid)
     )
+
+
+def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
+    """INVALID-only block for the extra invalid-check LLM call.
+
+    Same records as the in-loop INVALID section (child write-back / static
+    gates). Omits unproved, repair, progress, routing, and the obligation tree.
+    """
+    data = failed_data if isinstance(failed_data, dict) else {}
+    records = [
+        item for item in (data.get("invalid_lemmas") or [])
+        if isinstance(item, dict) and str(item.get("lemma") or "").strip()
+    ]
+    if not records:
+        return ""
+    parts = [
+        "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
+        "Do not generate these lemmas, and do not weaken them; use the reason "
+        "to judge whether the CURRENT goal is also invalid:"
+    ]
+    for i, record in enumerate(records, 1):
+        reason = str(record.get("reason") or "").strip() or "invalid"
+        parts.append(f"  Invalid lemma {i} ({reason}): {record.get('lemma')}")
+    return "\n".join(parts)
 
 
 def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
@@ -844,12 +879,18 @@ def format_attempt_feedback_for_prompt(
     hints: Sequence[dict] = (
         group_hints if group_hints is not None else (data.get("repair_hints") or [])
     )
-    advice = advice_from_failed_data(data, backend=backend, has_kept=bool(kept))
+    # Temporarily unused: PROMPT_ADVICE / OBLIGATION_TREE default off.
+    want_advice = include_stuck and prompt_advice_enabled()
+    want_local = include_stuck and obligation_tree_enabled()
+    advice = (
+        advice_from_failed_data(data, backend=backend, has_kept=bool(kept))
+        if want_advice else None
+    )
     stuck_lines = format_stuck_lines(
         hints, backend, omit_axiom_goal_hint=advice is not None,
     ) if include_stuck else []
-    local_lines = format_local_vs_parent_lines(data) if include_stuck else []
-    advice_lines = format_advice_lines(advice) if include_stuck else []
+    local_lines = format_local_vs_parent_lines(data) if want_local else []
+    advice_lines = format_advice_lines(advice) if want_advice else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
     has_attempt = bool(kept or drop_lines)
     if not has_attempt and not stuck_lines and not local_lines and not advice_lines:
@@ -946,7 +987,12 @@ def format_repair_header(backend: str, hints: Sequence[dict]) -> List[str]:
 
 
 def tree_status_from_child_data(failed_data: Optional[dict]) -> Tuple[str, str]:
-    """Status of THIS child goal only. A nested invalid descendant is not inherited."""
+    """Map this child's json to invalid vs failed. Nested descendants are not inherited.
+
+    Two callers:
+    - obligation-tree node status (only when ``OBLIGATION_TREE`` is on)
+    - parent INVALID vs unproved (independent of the tree flag)
+    """
     data = failed_data or {}
     outcome = data.get("node_outcome") or {}
     kind = str(outcome.get("kind") or "")
