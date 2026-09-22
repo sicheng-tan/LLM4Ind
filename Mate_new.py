@@ -713,12 +713,14 @@ def _result_has_stats(result: CvcResult) -> bool:
 
 
 def _usefulness_has_mix_signal(result: CvcResult) -> bool:
-    """True when the failed A∧C→P run can yield a mix / difficulty hint."""
+    """True when the failed A∧C→P run can yield a mix / difficulty / formula hint."""
     if result.proved:
         return False
     if _result_has_stats(result):
         return True
-    return bool(result.difficulty)
+    if result.difficulty:
+        return True
+    return bool(getattr(result, "lemmas", None))
 
 
 def _record_failed_usefulness_mix(
@@ -727,10 +729,10 @@ def _record_failed_usefulness_mix(
     result: CvcResult,
     lemmas: Optional[List[str]] = None,
     candidate_ids: Optional[Dict[str, str]] = None,
-) -> None:
+) -> List[dict]:
     """Single-run mix from the failed full-timeout A∧C→P prove, not the 3s sidecar."""
     if not _usefulness_has_mix_signal(result):
-        return
+        return []
     name_map = dict(candidate_ids or {})
     witness = pick_advice_witness(result)
     if name_map:
@@ -742,20 +744,20 @@ def _record_failed_usefulness_mix(
             stats=dict(witness.stats or {}),
             difficulty=expand_named_difficulty(witness.difficulty, name_map),
             instantiations=list(witness.instantiations or []),
+            lemmas=list(getattr(witness, "lemmas", None) or []),
             goal_term=witness.goal_term,
             portfolio_results=witness.portfolio_results,
             stdout=witness.stdout,
             stderr=witness.stderr,
             error=witness.error,
         )
-    add_repair_hints(
-        base_path, goal_name,
-        attach_source_lemmas(
-            derive_repair_hints(witness, context="usefulness_check"),
-            lemmas,
-            context="usefulness_check",
-        ),
+    hints = attach_source_lemmas(
+        derive_repair_hints(witness, context="usefulness_check"),
+        lemmas,
+        context="usefulness_check",
     )
+    add_repair_hints(base_path, goal_name, hints)
+    return hints
 
 
 def record_solver_attempt(
@@ -1328,7 +1330,7 @@ def verify_combined_lemmas(
     progressive: List[str] = []
     if base_path and goal_name:
         meta: Dict[str, Any] = {"status": full.status}
-        _record_failed_usefulness_mix(
+        mix_hints = _record_failed_usefulness_mix(
             base_path, gname, full, asserts, candidate_ids=candidate_ids,
         )
         baseline_mix = _load_cached_diag(base_path, gname, "baseline_diag")
@@ -1389,9 +1391,12 @@ def verify_combined_lemmas(
                     "Do not emit the exact same set unchanged; you may keep members and add lemmas.",
                 ],
             }], asserts, context="usefulness_check"))
-        snapshot = compact_repair_snapshot(
-            load_failed_lemmas(base_path, goal_name).get("repair_hints") or []
-        )
+        if mix_hints:
+            snapshot = compact_repair_snapshot(mix_hints)
+        else:
+            snapshot = compact_repair_snapshot(
+                load_failed_lemmas(base_path, goal_name).get("repair_hints") or []
+            )
         if snapshot:
             meta["repair_hints"] = snapshot
         add_useless_lemma_group(

@@ -1,6 +1,7 @@
 """Ablation switches for features added on top of the original PaperMate loop.
 
 Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
+``FEEDBACK_FORMULA_EVIDENCE`` defaults off (no ``-o lemmas`` samples).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
@@ -48,6 +49,16 @@ def _flag_enabled(name: str, default: str = "on") -> bool:
 def repair_hints_enabled() -> bool:
     """Write solver-derived repair hints into failed_lemmas / the LLM prompt."""
     return _flag_enabled("FEEDBACK_REPAIR_HINTS")
+
+
+def formula_evidence_enabled() -> bool:
+    """Collect ``-o lemmas`` and show concrete solver formulas next to difficulty.
+
+    Default **off**. Enable with ``FEEDBACK_FORMULA_EVIDENCE=on`` for the
+    difficulty + instantiation-sample ablation. Does not emit new advice
+    labels (TRIGGER/BRIDGE/GENERALIZE); samples stay evidence, not diagnoses.
+    """
+    return _flag_enabled("FEEDBACK_FORMULA_EVIDENCE", default="off")
 
 
 def progress_feedback_enabled() -> bool:

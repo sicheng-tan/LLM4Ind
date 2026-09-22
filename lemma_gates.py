@@ -103,6 +103,15 @@ HD_AXIOM_GOAL_HINT = (
     "hint: listed axioms are possible starting points; propose lemmas that "
     "help prove the CURRENT goal (a hotspot need not be used)."
 )
+FORMULA_EVIDENCE_KIND = "solver_formula_evidence"
+MAX_FORMULA_EVIDENCE_CHARS = 400
+FORMULA_EVIDENCE_EXPLAIN = (
+    "Use hotspots as possible starting points, not mandatory dependencies. "
+    "Inspect formula conditions and recursive-call arguments. "
+    "These samples do not establish that a condition is missing or that "
+    "generalization is required. Other axioms may provide essential "
+    "intermediate connections."
+)
 MAX_PARSE_RETRY_SNIPPET = 1500
 PARSE_RETRY_USER = (
     "FORMAT ERROR: no usable lemma (missing tags, empty <output>, or unmatched "
@@ -717,6 +726,8 @@ def compact_repair_snapshot(hints: Sequence[dict]) -> List[dict]:
         "induction_focus",
         "induction_formulas",
         "source_lemmas",
+        "attempt_id",
+        "samples",
     )
     for hint in hints or []:
         if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
@@ -790,6 +801,13 @@ def format_stuck_lines(
 ) -> List[str]:
     """Compact solver-stuck lines. ``need_rewrite`` is not shown (disabled)."""
     del backend
+    evidence_ids = {
+        str(hint.get("attempt_id") or "")
+        for hint in (hints or [])
+        if isinstance(hint, dict)
+        and str(hint.get("kind") or "") == FORMULA_EVIDENCE_KIND
+        and hint.get("attempt_id")
+    }
     lines: List[str] = []
     for hint in hints or []:
         if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
@@ -797,6 +815,9 @@ def format_stuck_lines(
         kind = str(hint.get("kind") or "")
         if kind in _STUCK_SKIP_KINDS:
             continue
+        if kind == "high_difficulty_assertions" and evidence_ids:
+            if str(hint.get("attempt_id") or "") not in evidence_ids:
+                continue
         if kind == "high_difficulty_assertions":
             sources = [
                 str(item) for item in (hint.get("source_lemmas") or []) if item
@@ -842,6 +863,42 @@ def format_stuck_lines(
                 lines.append(f"    {HD_DIFFICULTY_EXPLAIN}")
                 if not omit_axiom_goal_hint:
                     lines.append(f"    {HD_AXIOM_GOAL_HINT}")
+            continue
+        if kind == FORMULA_EVIDENCE_KIND:
+            samples = [
+                item for item in (hint.get("samples") or [])
+                if isinstance(item, dict) and item.get("formula")
+            ]
+            if not samples:
+                continue
+            lines.append("    selected solver formulas:")
+            for sample in samples[:4]:
+                relation = str(sample.get("relation") or "unlinked")
+                profile = str(sample.get("profile") or "")
+                source = str(sample.get("source") or "")
+                bits = [bit for bit in (profile, source, relation) if bit]
+                if relation == "matched_quantifier":
+                    label = "instance of the hotspot assertion"
+                elif relation == "shared_symbols":
+                    label = "shares functions with a hotspot; source unconfirmed"
+                else:
+                    label = "not linked to a hotspot assertion"
+                meta = ", ".join(bits)
+                lines.append(
+                    f"      {compact_formula(sample.get('formula'), MAX_FORMULA_EVIDENCE_CHARS)}"
+                    + (f"  [{meta}]" if meta else "")
+                )
+                lines.append(f"      ({label})")
+                related = str(sample.get("related_axiom") or "").strip()
+                if related and relation == "matched_quantifier":
+                    lines.append(
+                        f"      related axiom: {compact_formula(related)}"
+                    )
+                elif related and relation == "shared_symbols":
+                    lines.append(
+                        f"      shared-function axiom: {compact_formula(related)}"
+                    )
+            lines.append(f"    {FORMULA_EVIDENCE_EXPLAIN}")
             continue
         detail = str(hint.get("detail") or "").strip()
         lines.append(f"    {kind}: {detail}" if detail else f"    {kind}")
