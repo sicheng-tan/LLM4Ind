@@ -432,7 +432,8 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     assert "repair hints:" in txt
     assert "high-difficulty axiom:" in txt
     assert HD_DIFFICULTY_EXPLAIN in txt
-    assert HD_AXIOM_GOAL_HINT in txt
+    assert "advice: TRIGGER" in txt
+    assert HD_AXIOM_GOAL_HINT not in txt
     assert "rarely instantiated:" in txt
     assert "matching_weak:" not in txt
     assert "need_rewrite" not in txt

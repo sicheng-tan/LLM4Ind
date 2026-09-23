@@ -4,11 +4,6 @@ A new attempt still generates lemmas for the *current* goal. Successfully
 discharged lemmas are stored as theorems and injected as axioms. The prompt
 receives one well-formed obligation tree (the latest attempt that actually
 recursed), not empty / invalid / useless attempts.
-
-暂时弃用: ``OBLIGATION_TREE`` defaults **off**. Failed nodes on an
-old tree are not durable (a later library may prove the same lemma). Durable
-feedback is the lemma library + INVALID list. Set ``OBLIGATION_TREE=on`` to
-record and show the last tree again.
 """
 
 from __future__ import annotations
@@ -93,12 +88,8 @@ def harvest_retry_timeout_s() -> int:
 
 
 def obligation_tree_enabled() -> bool:
-    """Whether the last well-formed obligation tree is recorded and shown in the prompt.
-
-    暂时弃用: default **off** (stale failed-splits mislead once the
-    library / invalid list have moved on). ``OBLIGATION_TREE=on`` re-enables.
-    """
-    return _flag_enabled("OBLIGATION_TREE", default="off")
+    """Whether the last well-formed obligation tree is recorded and shown in the prompt."""
+    return _flag_enabled("OBLIGATION_TREE")
 
 
 def lemma_library_role(item: Optional[dict]) -> str:
@@ -516,8 +507,6 @@ def format_obligation_prompt(
     if for_diagnosis:
         include_library = False
         if include_tree is None:
-            # Temporarily unused: OBLIGATION_TREE defaults off; leftover disk
-            # trees must not leak into the extra invalid-check prompt.
             include_tree = obligation_tree_enabled()
     elif include_library is None:
         include_library = lemma_library_enabled()
@@ -572,10 +561,7 @@ def format_obligation_prompt(
 
 
 def format_diagnosis_tree_prompt(obligation: Optional[dict]) -> str:
-    """Tree-only block for the extra invalid-check LLM call.
-
-    Temporarily unused with OBLIGATION_TREE (default off).
-    """
+    """Tree-only block for the extra invalid-check LLM call."""
     if not obligation_tree_enabled():
         return ""
     return format_obligation_prompt(

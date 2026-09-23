@@ -8,9 +8,8 @@ The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIA
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
 judges whether the CURRENT goal is invalid from the parent's accumulated
 ``invalid_lemmas`` (child write-back), same signal as in-loop diagnosis —
-not the obligation tree (``OBLIGATION_TREE`` temporarily unused). Skip when
-that INVALID list is empty. ``PROMPT_ADVICE`` / ``FEEDBACK_PROGRESS`` are
-also temporarily unused (default off).
+not the obligation tree. Skip when that INVALID list is empty.
+``FEEDBACK_PROGRESS`` remains default off.
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 """
@@ -936,7 +935,6 @@ def format_attempt_feedback_for_prompt(
     hints: Sequence[dict] = (
         group_hints if group_hints is not None else (data.get("repair_hints") or [])
     )
-    # Temporarily unused: PROMPT_ADVICE / OBLIGATION_TREE default off.
     want_advice = include_stuck and prompt_advice_enabled()
     want_local = include_stuck and obligation_tree_enabled()
     advice = (

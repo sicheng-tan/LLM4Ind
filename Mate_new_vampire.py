@@ -95,6 +95,7 @@ from lemma_harvest import (
     make_harvest_slots,
     run_usefulness_with_delayed_harvest,
 )
+from prompt_modes import apply_advice_system_instruction
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
@@ -429,7 +430,6 @@ def _record_obligation_attempt(
         "has_tree": bool(tree),
         "n_children": len((tree or {}).get("children") or []) if tree else 0,
     })
-    # 暂时弃用: OBLIGATION_TREE defaults off (stale failed splits).
     if obligation_tree_enabled():
         failed_data["obligation"] = append_attempt(
             failed_data.get("obligation"), kind, tree
@@ -451,8 +451,8 @@ def _child_obligation_node(
 ) -> dict:
     """Pin proved lemmas; nest last_normal_tree only when OBLIGATION_TREE is on.
 
-    Temporarily unused (default off): skip disk nest / failed-status remap
-    when the flag is off. Remap only changes the tree node's shown status
+    When the flag is off, skip disk nest / failed-status remap.
+    Remap only changes the tree node's shown status
     (failed/cancelled → invalid if this child is SAT / diagnosed invalid).
     ``add_proved_lemma`` still runs — the library is independent of the tree.
     """
@@ -786,7 +786,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
         if routing_txt:
             parts.append(routing_txt)
 
-    # Library still injects when OBLIGATION_TREE is off (temporarily unused).
+    # Library still injects when OBLIGATION_TREE is off.
     if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
         obligation_txt = format_obligation_prompt(
             load_lemma_library(base_path),
@@ -815,7 +815,7 @@ def create_prompt(
         raise ValueError("folder path of prompts must be provided")
 
     with open(f"{folder_path}/{prompt_mode}/system_prompt.txt", "r", encoding="utf-8") as file:
-        system_prompt_content = file.read()
+        system_prompt_content = apply_advice_system_instruction(file.read())
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
     # 添加失败引理 + Vampire solver-guided 反馈

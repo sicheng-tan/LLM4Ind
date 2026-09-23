@@ -1,7 +1,8 @@
-"""v2 LAST ATTEMPT advice: last-round diagnosis → next lemma bias.
+"""LAST ATTEMPT advice: last-round diagnosis → next lemma bias.
 
-暂时弃用: ``PROMPT_ADVICE`` defaults off, so
-``advice_from_failed_data`` returns None unless the flag is set ``on``.
+Works for every ``--strategy-mode`` (default / naive / v2 / …). Gated only by
+``PROMPT_ADVICE`` (and CVC backend). ``advice_from_failed_data`` returns None
+when the flag is off.
 
 Not pipeline states (STOP / CHILD-FIRST / CONTINUE). Not solver routing.
 ``advice: TRIGGER`` is a matchable equational bridge, not SMT ``:pattern``.
@@ -18,7 +19,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from exp_flags import is_v2_strategy_mode, prompt_advice_enabled
+from exp_flags import prompt_advice_enabled
 from obligation_tree import compact_formula, last_normal_tree, obligation_tree_enabled
 from cvc5_runner import classify_difficulty_term
 from solver_relative_metrics import (
@@ -73,6 +74,20 @@ _LOCAL_VS_PARENT_NOTE = (
 )
 
 
+ADVICE_SYSTEM_FOLLOW = (
+    "If LAST ATTEMPT lists advice, follow that bias; "
+    "GENERALIZE's hint is a set of possible directions, not a closed menu. "
+)
+
+
+def apply_advice_system_instruction(system_prompt: str) -> str:
+    """Drop the follow-advice sentence when ``PROMPT_ADVICE`` is off."""
+    text = system_prompt or ""
+    if prompt_advice_enabled():
+        return text
+    return text.replace(ADVICE_SYSTEM_FOLLOW, "")
+
+
 def format_advice_lines(advice: Optional[PromptAdvice]) -> List[str]:
     if advice is None:
         return []
@@ -102,8 +117,6 @@ def format_local_vs_parent_lines(
     keep the block short.
     """
     data = failed_data if isinstance(failed_data, dict) else {}
-    # Temporarily unused with OBLIGATION_TREE (default off): do not surface
-    # proved-local / open-parent from a stale tree when the flag is off.
     if not obligation_tree_enabled():
         return []
     tree = last_normal_tree(data.get("obligation"))
@@ -130,14 +143,11 @@ def advice_from_failed_data(
     backend: str = "cvc5",
     has_kept: Optional[bool] = None,
 ) -> Optional[PromptAdvice]:
-    """Pick at most one v2 CVC advice from the last attempt / baseline."""
+    """Pick at most one CVC advice from the last attempt / baseline."""
     data = failed_data if isinstance(failed_data, dict) else {}
     if str(backend or "").lower() != "cvc5":
         return None
-    # Temporarily unused: PROMPT_ADVICE defaults off (no TRIGGER/BRIDGE/...).
     if not prompt_advice_enabled():
-        return None
-    if not is_v2_strategy_mode(str(data.get("strategy_mode") or "default")):
         return None
     group = _last_group(data)
     kept = _group_lemmas(group)
@@ -558,8 +568,6 @@ def _proved_child_formulas(data: dict) -> List[str]:
 
 
 def _lemma_child_formulas(data: dict, *, status: str) -> List[str]:
-    # Temporarily unused with OBLIGATION_TREE: do not walk leftover trees
-    # for GENERALIZE / local-vs-parent when the flag is off.
     if not obligation_tree_enabled():
         return []
     tree = last_normal_tree(data.get("obligation"))

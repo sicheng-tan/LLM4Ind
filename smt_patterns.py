@@ -2,7 +2,7 @@
 
 Syntax helpers (``infer_trigger_pattern`` / ``format_assert_line``) stay.
 The feedback-gated 6-way ±pattern portfolio is **temporarily deprecated**:
-last-round ``rare_inst`` must not change the next CVC run. v2 LAST ATTEMPT
+last-round ``rare_inst`` must not change the next CVC run. LAST ATTEMPT
 ``advice: TRIGGER`` consumes that evidence instead.
 
 ``CVC_PATTERNS`` / ``--cvc-patterns`` default **off**. Even when set on,

@@ -371,6 +371,7 @@ def log_prompt_blocks(
         "has_hints": "  repair hints:" in text or "INITIAL SOLVE" in text,
         "has_lib": "already proved" in text or "LEMMA LIBRARY" in text,
         "has_tree": "Last obligation tree" in text,
+        "has_advice": "    advice:" in text,
     }
     log_exp("prompt_blocks", goal=goal, prompt=prompt_mode, **inv)
     if folder:
@@ -419,7 +420,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "SOLVER_ROUTING_DECIDER": "relative",
         "SOLVER_ROUTING_PROBES": "on",
         "LEMMA_LIBRARY": "on",
-        "OBLIGATION_TREE": "off",
+        "OBLIGATION_TREE": "on",
         "LEMMA_LIBRARY_LOCAL": "on",
         "USEFULNESS_HARVEST_DELAY_S": "2",
         "HARVEST_RETRY_TIMEOUT": "2",
@@ -427,7 +428,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "FEEDBACK_FORMULA_EVIDENCE": "off",
         "FEEDBACK_PROGRESS": "off",
         "PROMPT_RETARGET": "on",
-        "PROMPT_ADVICE": "off",
+        "PROMPT_ADVICE": "on",
         "CVC_PATTERNS": "off",
         "UNPROVED_NOT_INVALID": "on",
         "SUBGOAL_SAT_ABORT": "on",

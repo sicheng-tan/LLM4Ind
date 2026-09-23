@@ -90,7 +90,7 @@ def test_flags_default_on() -> None:
         assert formula_evidence_enabled() is False
         assert progress_feedback_enabled() is False
         assert prompt_retarget_enabled() is True
-        assert prompt_advice_enabled() is False  # temporarily unused, default off
+        assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
         assert defined_symbols_enabled() is True

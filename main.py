@@ -23,7 +23,7 @@ if __name__ == "__main__":
         help="default: prompts_ours; default_simple: prompts_ours_compact (same two modes); "
         "zero_shot: same as default; naive: prompt_naive × 2N; "
         "v2: prompts_v2 lemma_general × 2N; "
-        "v2_simple: prompts_v2_compact lemma_general × 2N (same advice as v2)",
+        "v2_simple: prompts_v2_compact lemma_general × 2N",
     )
     parser.add_argument(
         "--cvc-patterns",

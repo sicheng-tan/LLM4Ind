@@ -7,18 +7,16 @@ Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
 and ``LEMMA_LIBRARY_LOCAL``.
 
-暂时弃用 (default **off**; set ``on`` to re-enable — do not turn these on
+暂时弃用 (default **off**; set ``on`` to re-enable — do not turn this on
 by accident):
-- ``PROMPT_ADVICE``: v2 LAST ATTEMPT labels (TRIGGER/BRIDGE/GENERALIZE/...).
-  Kept off so advice is not treated as a causal next-step, and so HD-only
-  ablations stay clean.
-- ``OBLIGATION_TREE``: last well-formed split tree in the prompt / json.
-  Kept off because failed-tree history goes stale as the lemma library and
-  invalid list grow; durable signal stays in the library + INVALID.
 - ``FEEDBACK_PROGRESS``: 3s usefulness sidecar, progress lemmas in the prompt,
   and sidecar-driven profile rerank (``no_progress`` / ``partial_progress``).
   Mix / HD hints still come from the failed 60s A∧C→P prove.
   Do not turn this on unless you are deliberately ablating the sidecar.
+
+``PROMPT_ADVICE`` / ``OBLIGATION_TREE`` default on: LAST ATTEMPT advice
+labels and the last well-formed split tree in the prompt / json. Independent
+of ``--strategy-mode``.
 
 ``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
 ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
@@ -78,13 +76,12 @@ def prompt_retarget_enabled() -> bool:
 
 
 def prompt_advice_enabled() -> bool:
-    """Emit v2 LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
+    """Emit LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
 
-    暂时弃用: default **off**. Independent of ``v2`` / ``v2_simple``.
-    ``PROMPT_ADVICE=on`` restores ``advice:`` lines; off keeps HD / library /
-    INVALID without those labels.
+    Independent of ``--strategy-mode``. Off keeps HD / library / INVALID
+    without those labels.
     """
-    return _flag_enabled("PROMPT_ADVICE", default="off")
+    return _flag_enabled("PROMPT_ADVICE")
 
 
 def unproved_not_invalid_enabled() -> bool:
@@ -150,7 +147,7 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
 
 
 def is_v2_strategy_mode(strategy_mode: str) -> bool:
-    """True for ``v2`` and ``v2_simple`` (same advice / lemma_general template)."""
+    """True for ``v2`` and ``v2_simple`` (lemma_general pack)."""
     return normalize_strategy_mode(strategy_mode) in ("v2", "v2_simple")
 
 

@@ -430,7 +430,7 @@ def test_flags_default_and_off_synonyms() -> None:
         os.environ.pop("LEMMA_LIBRARY", None)
         os.environ.pop("OBLIGATION_TREE", None)
         assert lemma_library_enabled() is True
-        assert obligation_tree_enabled() is False  # temporarily unused, default off
+        assert obligation_tree_enabled() is True
     for val in ("on", "ON", "true", "1", "yes"):
         with _patch_flags(val, val):
             assert lemma_library_enabled() is True

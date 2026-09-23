@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v2 LAST ATTEMPT advice classifier and prompt lines."""
+"""LAST ATTEMPT advice classifier and prompt lines."""
 
 from __future__ import annotations
 
@@ -24,8 +24,10 @@ from prompt_modes import (
     ADVICE_LOCALIZE,
     ADVICE_PRUNE,
     ADVICE_TRIGGER,
+    ADVICE_SYSTEM_FOLLOW,
     PRUNE_CONSTRAINT,
     advice_from_failed_data,
+    apply_advice_system_instruction,
     format_advice_lines,
     format_local_vs_parent_lines,
     select_prompt_advice,
@@ -57,15 +59,26 @@ def _hd(**extra):
     return hint
 
 
-def test_default_mode_has_no_advice() -> None:
-    data = {
-        "strategy_mode": "default",
-        "repair_hints": [_hd(rarely_instantiated=[AX])],
-    }
-    assert advice_from_failed_data(data) is None
-    txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
-    assert "advice:" not in txt
-    assert HD_AXIOM_GOAL_HINT in txt
+def test_advice_works_across_strategy_modes() -> None:
+    modes = (
+        "default",
+        "default_simple",
+        "naive",
+        "zero_shot",
+        "v2",
+        "v2_simple",
+        "",
+    )
+    for mode in modes:
+        data: dict = {"repair_hints": [_hd(rarely_instantiated=[AX])]}
+        if mode:
+            data["strategy_mode"] = mode
+        with _advice_on():
+            adv = advice_from_failed_data(data)
+            txt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+        assert adv is not None and adv.name == ADVICE_TRIGGER, mode or "<missing>"
+        assert "advice: TRIGGER" in txt, mode or "<missing>"
+        assert HD_AXIOM_GOAL_HINT not in txt, mode or "<missing>"
 
 
 def test_trigger_from_rare_inst() -> None:
@@ -87,28 +100,24 @@ def test_trigger_from_rare_inst() -> None:
     assert ":pattern" not in txt
 
 
-def test_default_simple_has_no_advice() -> None:
-    data = {
-        "strategy_mode": "default_simple",
-        "repair_hints": [_hd(rarely_instantiated=[AX])],
-    }
-    assert advice_from_failed_data(data) is None
-
-
-def test_v2_simple_keeps_advice() -> None:
-    data = {
-        "strategy_mode": "v2_simple",
-        "repair_hints": [_hd(rarely_instantiated=[AX])],
-    }
+def test_advice_system_instruction_follows_flag() -> None:
+    system = (
+        "Prefer short, local lemmas. "
+        + ADVICE_SYSTEM_FOLLOW
+        + "Otherwise pick the path that fits the goal."
+    )
     with _advice_on():
-        adv = advice_from_failed_data(data)
-    assert adv is not None and adv.name == ADVICE_TRIGGER
+        assert ADVICE_SYSTEM_FOLLOW in apply_advice_system_instruction(system)
+    with patch.dict(os.environ, {"PROMPT_ADVICE": "off"}):
+        stripped = apply_advice_system_instruction(system)
+    assert "advice" not in stripped.lower()
+    assert "Prefer short, local lemmas. Otherwise pick" in stripped
 
 
 def test_prompt_advice_flag_off_skips_advice() -> None:
-    """Ablation: v2 template + HD without explicit advice: lines."""
+    """Ablation: any strategy-mode + HD without explicit advice: lines."""
     data = {
-        "strategy_mode": "v2_simple",
+        "strategy_mode": "default",
         "repair_hints": [_hd(rarely_instantiated=[AX])],
     }
     with patch.dict(os.environ, {"PROMPT_ADVICE": "off"}):
@@ -536,10 +545,9 @@ def test_v2_simple_lemma_general_is_compact() -> None:
 
 
 def main() -> int:
-    test_default_mode_has_no_advice()
+    test_advice_works_across_strategy_modes()
     test_trigger_from_rare_inst()
-    test_default_simple_has_no_advice()
-    test_v2_simple_keeps_advice()
+    test_advice_system_instruction_follows_flag()
     test_prompt_advice_flag_off_skips_advice()
     test_vampire_backend_skips_advice()
     test_prune_uses_conj_inst_log_gain_and_goal_not_drop()

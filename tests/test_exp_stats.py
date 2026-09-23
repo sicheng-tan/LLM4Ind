@@ -194,9 +194,11 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
         "  repair hints:\n"
         "Library (already proved, in axioms):\n"
         "Last obligation tree (attempt 2; for reference only):\n"
+        "    advice: TRIGGER\n"
     )
     inv = log_prompt_blocks(folder, "template", "prove_prompt_term_rewrite", feedback)
     assert inv["has_tree"] is True
+    assert inv["has_advice"] is True
     assert inv["has_lib"] is True
     assert inv["has_hints"] is True
     assert inv["has_progress"] is True
