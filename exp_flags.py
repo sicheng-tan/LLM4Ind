@@ -2,6 +2,8 @@
 
 Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
 ``FEEDBACK_FORMULA_EVIDENCE`` defaults off (no ``-o lemmas`` samples).
+``FEEDBACK_LLM_HINTS`` defaults off (extra LLM call that proposes hints from
+solver observations before lemma generation; requires difficulty).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
@@ -57,6 +59,16 @@ def formula_evidence_enabled() -> bool:
     labels (TRIGGER/BRIDGE/GENERALIZE); samples stay evidence, not diagnoses.
     """
     return _flag_enabled("FEEDBACK_FORMULA_EVIDENCE", default="off")
+
+
+def feedback_llm_hints_enabled() -> bool:
+    """Extra LLM call: propose rejectable hints from difficulty observations.
+
+    Default **off**. Skips when the failed attempt has no difficulty /
+    ``high_difficulty_assertions`` (no SMT re-parse). Stored under
+    ``llm_hints`` and injected as a short rejectable prose note.
+    """
+    return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
 
 
 def progress_feedback_enabled() -> bool:

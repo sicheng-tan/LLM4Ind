@@ -914,11 +914,17 @@ def format_attempt_feedback_for_prompt(
     *,
     backend: str = "cvc5",
     include_stuck: bool = True,
+    suppress_advice: bool = False,
 ) -> str:
     """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
 
     History of older useless groups stays in json; only the last group is shown.
+    When ``llm_hints`` is present, program stuck/advice/local-vs-parent are
+    omitted and SOLVER HINTS is nested under LAST ATTEMPT / INITIAL SOLVE instead.
+    ``suppress_advice`` is kept for callers; llm_hints already implies full replace.
     """
+    from feedback_llm_hints import format_llm_hints_lines
+
     data = failed_data if isinstance(failed_data, dict) else {}
     group = last_useless_group(data)
     kept = _group_lemmas(group)
@@ -935,20 +941,33 @@ def format_attempt_feedback_for_prompt(
     hints: Sequence[dict] = (
         group_hints if group_hints is not None else (data.get("repair_hints") or [])
     )
-    want_advice = include_stuck and prompt_advice_enabled()
-    want_local = include_stuck and obligation_tree_enabled()
+    llm_rec = data.get("llm_hints") if isinstance(data.get("llm_hints"), dict) else {}
+    llm_lines = format_llm_hints_lines(llm_rec, indent="    ")
+    use_llm_hints = bool(llm_lines)
+    # LLM hints replace program stuck / advice / local-vs-parent in the prompt.
+    want_program = include_stuck and not use_llm_hints
+    want_advice = (
+        want_program and prompt_advice_enabled() and not suppress_advice
+    )
+    want_local = want_program and obligation_tree_enabled()
     advice = (
         advice_from_failed_data(data, backend=backend, has_kept=bool(kept))
         if want_advice else None
     )
     stuck_lines = format_stuck_lines(
         hints, backend, omit_axiom_goal_hint=advice is not None,
-    ) if include_stuck else []
+    ) if want_program else []
     local_lines = format_local_vs_parent_lines(data) if want_local else []
     advice_lines = format_advice_lines(advice) if want_advice else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
     has_attempt = bool(kept or drop_lines)
-    if not has_attempt and not stuck_lines and not local_lines and not advice_lines:
+    if (
+        not has_attempt
+        and not stuck_lines
+        and not local_lines
+        and not advice_lines
+        and not llm_lines
+    ):
         return ""
 
     parts: List[str] = []
@@ -964,7 +983,9 @@ def format_attempt_feedback_for_prompt(
         if drop_lines:
             parts.append("  dropped:")
             parts.extend(drop_lines)
-        if stuck_lines or local_lines or advice_lines:
+        if llm_lines:
+            parts.extend(llm_lines)
+        elif stuck_lines or local_lines or advice_lines:
             parts.append("  repair hints:")
             parts.extend(stuck_lines)
             parts.extend(local_lines)
@@ -975,10 +996,13 @@ def format_attempt_feedback_for_prompt(
     parts.append(
         "\nINITIAL SOLVE (no candidate lemmas yet; did not prove CURRENT goal):"
     )
-    parts.append("  repair hints:")
-    parts.extend(stuck_lines)
-    parts.extend(local_lines)
-    parts.extend(advice_lines)
+    if llm_lines:
+        parts.extend(llm_lines)
+    else:
+        parts.append("  repair hints:")
+        parts.extend(stuck_lines)
+        parts.extend(local_lines)
+        parts.extend(advice_lines)
     parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
     return "\n".join(parts)
 

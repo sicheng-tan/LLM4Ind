@@ -110,6 +110,9 @@ from llm_time_budget import (
     usefulness_timeout_s,
 )
 from prompt_modes import apply_advice_system_instruction
+from feedback_llm_hints import (
+    maybe_refresh_llm_hints,
+)
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
@@ -194,6 +197,7 @@ def _empty_failed_data() -> dict:
         "node_outcome": {},
         "last_llm_reason": "",
         "last_screen": [],
+        "llm_hints": {},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -218,6 +222,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("node_outcome", {})
             data.setdefault("last_llm_reason", "")
             data.setdefault("last_screen", [])
+            data.setdefault("llm_hints", {})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
@@ -1776,6 +1781,16 @@ def generate_lemmas_with_llm(
             _assert, formula = extract_original_goal(smt_content)
         except Exception:
             formula = None
+    if not diagnosis_only:
+        maybe_refresh_llm_hints(
+            base_path,
+            goal_name,
+            llm=llm,
+            config=config,
+            load_failed_lemmas=load_failed_lemmas,
+            save_failed_lemmas=save_failed_lemmas,
+            backend="cvc5",
+        )
     messages, feedback = create_prompt(
         smt_content, prompt_strategy, base_path, goal_name, folder_path,
         depth=depth, diagnosis_only=diagnosis_only,

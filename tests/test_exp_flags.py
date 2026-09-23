@@ -24,6 +24,7 @@ from exp_flags import (
     prompt_retarget_enabled,
     repair_hints_enabled,
     formula_evidence_enabled,
+    feedback_llm_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
@@ -37,6 +38,7 @@ from lemma_gates import (
 _FLAG_NAMES = (
     "FEEDBACK_REPAIR_HINTS",
     "FEEDBACK_FORMULA_EVIDENCE",
+    "FEEDBACK_LLM_HINTS",
     "FEEDBACK_PROGRESS",
     "PROMPT_RETARGET",
     "PROMPT_ADVICE",
@@ -88,6 +90,7 @@ def test_flags_default_on() -> None:
     try:
         assert repair_hints_enabled() is True
         assert formula_evidence_enabled() is False
+        assert feedback_llm_hints_enabled() is False
         assert progress_feedback_enabled() is False
         assert prompt_retarget_enabled() is True
         assert prompt_advice_enabled() is True
@@ -103,6 +106,8 @@ def test_flags_default_on() -> None:
             assert repair_hints_enabled() is False
         with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": val}):
             assert formula_evidence_enabled() is False
+        with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": val}):
+            assert feedback_llm_hints_enabled() is False
         with patch.dict(os.environ, {"FEEDBACK_PROGRESS": val}):
             assert progress_feedback_enabled() is False
         with patch.dict(os.environ, {"PROMPT_RETARGET": val}):
@@ -123,6 +128,8 @@ def test_flags_default_on() -> None:
         assert progress_feedback_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": "on"}):
         assert formula_evidence_enabled() is True
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}):
+        assert feedback_llm_hints_enabled() is True
 
 
 def test_resolve_prompt_pack() -> None:

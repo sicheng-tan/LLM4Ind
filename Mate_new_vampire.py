@@ -181,6 +181,7 @@ def _empty_failed_data() -> dict:
         "node_outcome": {},
         "last_llm_reason": "",
         "last_screen": [],
+        "llm_hints": {},
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
@@ -206,6 +207,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("node_outcome", {})
             data.setdefault("last_llm_reason", "")
             data.setdefault("last_screen", [])
+            data.setdefault("llm_hints", {})
             return data
         except Exception as e:
             logging.warning(f"加载失败引理文件出错: {e}")
