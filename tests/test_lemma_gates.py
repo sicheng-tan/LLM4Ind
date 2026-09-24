@@ -30,8 +30,10 @@ from lemma_gates import (
     format_attempt_feedback_for_prompt,
     format_diagnosis_invalid_prompt,
     format_repair_header,
+    drop_equivalent_unproved,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
+    lemma_known_unproved,
     lemma_same_as_goal,
     lemmas_known_invalid,
     llm_parse_retries,
@@ -146,6 +148,44 @@ def test_known_invalid_match_whitespace_not_substring() -> None:
     assert not lemma_known_invalid(SNOC_LEMMA, records)
     assert lemmas_known_invalid([SNOC_LEMMA], records) == []
     assert lemmas_known_invalid([PLUS_LEMMA], []) == []
+
+
+def test_unproved_dedup_whitespace_and_alpha() -> None:
+    formula = "(forall ((x Int)) (P x))"
+    alpha = "(forall ((y Int)) (P y))"
+    spaced = "  " + formula.replace(" ", "  ") + "\n"
+    other = "(forall ((x Int)) (P (s x)))"
+    records = [{"lemma": formula, "status": "timeout"}]
+    assert lemma_known_unproved(formula, records)
+    assert lemma_known_unproved(spaced, records)
+    assert lemma_known_unproved(alpha, records)
+    assert not lemma_known_unproved(other, records)
+    assert not lemma_known_unproved("", records)
+    kept, n_removed = drop_equivalent_unproved(
+        records + [{"lemma": other, "status": "unknown"}], alpha
+    )
+    assert n_removed == 1
+    assert kept == [{"lemma": other, "status": "unknown"}]
+
+
+def test_add_unproved_lemma_dedups_equivalent() -> None:
+    import Mate_new as mate
+
+    formula = "(forall ((x Int)) (P x))"
+    alpha = "(forall ((y Int)) (P y))"
+    other = "(forall ((x Int)) (Q x))"
+    with tempfile.TemporaryDirectory() as tmp:
+        mate.add_unproved_lemma(tmp, "template", formula, {"status": "timeout"})
+        mate.add_unproved_lemma(
+            tmp, "template", "  " + formula + "\n", {"status": "unknown"}
+        )
+        mate.add_unproved_lemma(tmp, "template", alpha, {"status": "timeout"})
+        mate.add_unproved_lemma(tmp, "template", other, {"status": "timeout"})
+        mate.add_unproved_lemma(tmp, "template_1", formula, {"status": "timeout"})
+        records = mate.load_failed_lemmas(tmp, "template")["unproved_lemmas"]
+        assert [item["lemma"] for item in records] == [formula, other]
+        child = mate.load_failed_lemmas(tmp, "template_1")["unproved_lemmas"]
+        assert [item["lemma"] for item in child] == [formula]
 
 
 def test_parse_llm_reason() -> None:

@@ -16,8 +16,10 @@ same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import _flag_enabled, prompt_advice_enabled
@@ -540,6 +542,63 @@ def lemma_known_invalid(lemma: str, invalid_lemmas: Sequence[Any]) -> bool:
     return any(_stored_invalid_formula(record) == key for record in invalid_lemmas or [])
 
 
+def _stored_unproved_formula(record: Any) -> str:
+    stored = record.get("lemma") if isinstance(record, dict) else record
+    return str(stored or "")
+
+
+def lemma_known_unproved(lemma: str, unproved_lemmas: Sequence[Any]) -> bool:
+    """True iff *lemma* is whitespace- or α-equivalent to a stored unproved formula."""
+    if not str(lemma or "").strip():
+        return False
+    return any(
+        lemmas_equivalent(lemma, _stored_unproved_formula(record))
+        for record in unproved_lemmas or []
+    )
+
+
+def drop_equivalent_unproved(
+    records: Sequence[Any], formula: str
+) -> Tuple[List[Any], int]:
+    """Drop unproved records equivalent to *formula*. Returns (kept, n_removed)."""
+    kept: List[Any] = []
+    n_removed = 0
+    for record in records or []:
+        if lemmas_equivalent(formula, _stored_unproved_formula(record)):
+            n_removed += 1
+            continue
+        kept.append(record)
+    return kept, n_removed
+
+
+def purge_unproved_equivalent(base_path: str, formula: str) -> int:
+    """Drop unproved records equivalent to a proved *formula* in failed_lemmas*.json."""
+    if not str(formula or "").strip():
+        return 0
+    root = Path(base_path)
+    if not root.is_dir():
+        return 0
+    total = 0
+    for path in sorted(root.glob("failed_lemmas*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        records = data.get("unproved_lemmas") or []
+        kept, n_removed = drop_equivalent_unproved(records, formula)
+        if n_removed == 0:
+            continue
+        data["unproved_lemmas"] = kept
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        total += n_removed
+    return total
+
+
 def lemmas_known_invalid(
     lemmas: Sequence[str], invalid_lemmas: Sequence[Any]
 ) -> List[str]:
@@ -923,7 +982,7 @@ def format_attempt_feedback_for_prompt(
     omitted and SOLVER HINTS is nested under LAST ATTEMPT / INITIAL SOLVE instead.
     ``suppress_advice`` is kept for callers; llm_hints already implies full replace.
     """
-    from feedback_llm_hints import format_llm_hints_lines
+    from feedback_llm_hints import format_llm_hints_lines, llm_hints_eligible
 
     data = failed_data if isinstance(failed_data, dict) else {}
     group = last_useless_group(data)
@@ -942,7 +1001,10 @@ def format_attempt_feedback_for_prompt(
         group_hints if group_hints is not None else (data.get("repair_hints") or [])
     )
     llm_rec = data.get("llm_hints") if isinstance(data.get("llm_hints"), dict) else {}
-    llm_lines = format_llm_hints_lines(llm_rec, indent="    ")
+    llm_lines = (
+        format_llm_hints_lines(llm_rec, indent="    ")
+        if llm_hints_eligible(data) else []
+    )
     use_llm_hints = bool(llm_lines)
     # LLM hints replace program stuck / advice / local-vs-parent in the prompt.
     want_program = include_stuck and not use_llm_hints

@@ -196,9 +196,8 @@ def add_proved_lemma(
     Returns its library id, or None if empty / local harvest is off. Duplicate
     formulas (whitespace or α-equivalent) keep the existing id; a later pin
     promotes local in place. There is no size cap: pins and locals both append.
+    Equivalent formulas are also dropped from ``unproved_lemmas`` in this folder.
     """
-    if not lemma_library_enabled():
-        return None
     want = "local" if str(role or "pin").strip().lower() == "local" else "pin"
     if want == "local" and not local_lemma_harvest_enabled():
         return None
@@ -206,6 +205,14 @@ def add_proved_lemma(
     if not formula:
         return None
     from exp_stats import log_exp
+    from lemma_gates import purge_unproved_equivalent
+
+    n_drop = purge_unproved_equivalent(base_path, formula)
+    if n_drop:
+        log_exp("unproved_drop", n=n_drop)
+
+    if not lemma_library_enabled():
+        return None
 
     with _LIB_LOCK:
         lemmas = load_lemma_library(base_path)

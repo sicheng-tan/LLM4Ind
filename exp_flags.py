@@ -62,11 +62,12 @@ def formula_evidence_enabled() -> bool:
 
 
 def feedback_llm_hints_enabled() -> bool:
-    """Extra LLM call: propose rejectable hints from difficulty observations.
+    """Extra LLM call: select unproved revival candidates after a useless group.
 
-    Default **off**. Skips when the failed attempt has no difficulty /
-    ``high_difficulty_assertions`` (no SMT re-parse). Stored under
-    ``llm_hints`` and injected as a short rejectable prose note.
+    Default **off**. Requires difficulty, ≥1 useless group (skips first lemma
+    generation), and an opportunity (unproved pool or new library lemmas).
+    Injects under LAST ATTEMPT as no_action (omit), new_direction (text),
+    or revise_candidate (pending formulas plus notes).
     """
     return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
 

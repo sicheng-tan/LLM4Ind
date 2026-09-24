@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from feedback_llm_hints import (
     format_llm_hints_for_prompt,
     format_observation_prompt_body,
     has_difficulty_observations,
+    has_hint_opportunity,
     maybe_refresh_llm_hints,
     parse_llm_feedback_hints,
 )
@@ -174,6 +176,11 @@ def test_pack_prove_invalid_and_unknown() -> None:
     body = format_observation_prompt_body(pack)
     assert "prove=invalid" in body
     assert "prove=unknown" in body
+    revive_ids = {item["formula"] for item in pack["revival_candidates"]}
+    assert lemma_bad not in revive_ids
+    assert lemma_unk in body or "(none)" in body
+    assert "select by id" not in body
+    assert "R1:" not in body
 
 
 def test_parse_plain_and_prompt_block() -> None:
@@ -185,14 +192,118 @@ def test_parse_plain_and_prompt_block() -> None:
     assert diag is not None
     assert "plus-succ hotspot" in diag["text"]
     assert "E1" not in diag["text"]
+    assert diag.get("revive") == []
     txt = format_llm_hints_for_prompt({
         "attempt_id": "x",
         "hints": diag,
     })
     assert "SOLVER HINTS" in txt
     assert "plus-succ hotspot" in txt
+    assert "new direction" in txt
+    assert "pending (" not in txt
     assert "evidence:" not in txt
     assert "hypothesis (" not in txt
+
+
+def test_parse_note_and_revive_json() -> None:
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    invented = "(forall ((n Nat)) false)"
+    pool = [{"id": "R1", "formula": cand, "status": "timeout"}]
+    raw = json.dumps({
+        "mode": "REVISE_CANDIDATE",
+        "note": (
+            "Library now has plus-succ. The zero-case candidate is still unproved; "
+            "decide whether it fits the CURRENT goal. R1"
+        ),
+        "revive": [
+            {"formula": cand, "note": "zero case; still unproved after plus-succ landed"},
+            {"formula": invented, "note": "invented"},
+        ],
+    })
+    diag = parse_llm_feedback_hints(raw, revival_candidates=pool)
+    assert diag is not None
+    assert diag["mode"] == "revise_candidate"
+    assert "plus-succ" in diag["text"]
+    assert "R1" not in diag["text"]
+    assert len(diag["revive"]) == 1
+    assert diag["revive"][0]["formula"] == cand
+    assert diag["revive"][0]["note"] == "zero case; still unproved after plus-succ landed"
+    assert "action" not in diag["revive"][0]
+    txt = format_llm_hints_for_prompt({"hints": diag})
+    assert "pending candidates" in txt
+    assert "pending (unproved; not assumed true or useful)" in txt
+    assert "Decide for yourself how to use each one" in txt
+    assert "note: zero case; still unproved after plus-succ landed" in txt
+    assert "[weaken]" not in txt
+    assert "[retry]" not in txt
+    assert cand in txt
+    assert "R1" not in txt
+
+
+def test_parse_revive_still_accepts_pool_id() -> None:
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    pool = [{"id": "R1", "formula": cand, "status": "timeout"}]
+    raw = json.dumps({
+        "mode": "REVISE_CANDIDATE",
+        "note": "The plus-zero candidate is still open now that plus-succ is in the library.",
+        "revive": [{"id": "R1", "note": "library may supply the missing succ step"}],
+    })
+    diag = parse_llm_feedback_hints(raw, revival_candidates=pool)
+    assert diag["revive"][0]["formula"] == cand
+    assert "succ step" in diag["revive"][0]["note"]
+
+
+def test_no_action_not_injected() -> None:
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    raw = json.dumps({
+        "mode": "NO_ACTION",
+        "note": "The last candidate set is still a reasonable try; do not steer.",
+        "revive": [{"formula": cand, "note": "should not appear"}],
+    })
+    diag = parse_llm_feedback_hints(
+        raw, revival_candidates=[{"id": "R1", "formula": cand}],
+    )
+    assert diag["mode"] == "no_action"
+    assert diag["revive"] == []
+    txt = format_llm_hints_for_prompt({"hints": diag})
+    assert txt == ""
+    assert "SOLVER HINTS" not in txt
+
+
+def test_new_direction_text_only() -> None:
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    raw = json.dumps({
+        "mode": "NEW_DIRECTION",
+        "note": "Commutativity and n+0 copies are not worth reviving; try a directed succ-step lemma.",
+        "revive": [{"formula": cand, "note": "should not appear"}],
+    })
+    diag = parse_llm_feedback_hints(
+        raw, revival_candidates=[{"id": "R1", "formula": cand}],
+    )
+    assert diag["mode"] == "new_direction"
+    assert diag["revive"] == []
+    txt = format_llm_hints_for_prompt({"hints": diag})
+    assert "new direction" in txt
+    assert "different lemma shape" in txt
+    assert "succ-step lemma" in txt
+    assert cand not in txt
+    assert "pending (" not in txt
+
+
+def test_legacy_hold_not_injected() -> None:
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    raw = json.dumps({
+        "note": "Keep the unproved plus-zero lemma off the generator prompt this round.",
+        "revive": [{"formula": cand, "action": "hold", "why": "no library bridge yet"}],
+    })
+    diag = parse_llm_feedback_hints(
+        raw, revival_candidates=[{"id": "R1", "formula": cand}],
+    )
+    assert diag["mode"] == "new_direction"
+    assert diag["revive"] == []
+    txt = format_llm_hints_for_prompt({"hints": diag})
+    assert cand not in txt
+    assert "[hold]" not in txt
 
 
 def test_parse_legacy_json_collapsed() -> None:
@@ -211,6 +322,7 @@ def test_parse_legacy_json_collapsed() -> None:
     assert "need a bridge on plus" in diag["text"]
     assert "E1" not in diag["text"]
     assert "Alternative:" in diag["text"]
+    assert diag.get("revive") == []
 
 
 def test_maybe_refresh_skips_without_difficulty(tmp_path: Path) -> None:
@@ -229,13 +341,138 @@ def test_maybe_refresh_skips_without_difficulty(tmp_path: Path) -> None:
     assert mate.load_failed_lemmas(base, "template").get("llm_hints") in ({}, None)
 
 
+def test_maybe_refresh_skips_without_useless_group(tmp_path: Path) -> None:
+    """First-gen gate: HD alone must not trigger hints."""
+    base = str(tmp_path)
+    (tmp_path / "template.smt2").write_text("(assert true)\n", encoding="utf-8")
+    mate.save_failed_lemmas(base, "template", _hd_data())  # empty useless groups
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
+        "feedback_llm_hints.invoke_configured_chat",
+    ) as inv:
+        out = maybe_refresh_llm_hints(
+            base,
+            "template",
+            llm=MagicMock(),
+            config=mate.config,
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        inv.assert_not_called()
+    assert out is None
+
+
+def test_has_hint_opportunity_unproved_or_library_delta() -> None:
+    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    empty = _hd_data(useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}])
+    assert has_hint_opportunity(empty) is False
+    with_unproved = _hd_data(unproved_lemmas=[{"lemma": lemma, "status": "timeout"}])
+    assert has_hint_opportunity(with_unproved) is True
+    lib = [{"id": "lib_1", "formula": AX, "role": "pin"}]
+    assert has_hint_opportunity(empty, library=lib) is False
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_0"]) is True
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_1"]) is False
+
+
+def test_maybe_refresh_skips_without_opportunity(tmp_path: Path) -> None:
+    base = str(tmp_path)
+    data = _hd_data_with_useless()
+    data["unproved_lemmas"] = []
+    mate.save_failed_lemmas(base, "template", data)
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
+        "feedback_llm_hints.invoke_configured_chat",
+    ) as inv:
+        out = maybe_refresh_llm_hints(
+            base,
+            "template",
+            llm=MagicMock(),
+            config=mate.config,
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        inv.assert_not_called()
+    assert out is None
+
+
+def test_maybe_refresh_runs_on_library_delta(tmp_path: Path) -> None:
+    base = str(tmp_path)
+    data = _hd_data_with_useless()
+    data["unproved_lemmas"] = []
+    data["llm_hints"] = {
+        "library_ids": ["lib_0"],
+        "attempt_id": "old",
+        "hints": {"text": "x" * 30, "revive": []},
+    }
+    mate.save_failed_lemmas(base, "template", data)
+    (tmp_path / "lemma_library.json").write_text(
+        json.dumps({
+            "lemmas": [{
+                "id": "lib_1",
+                "formula": AX,
+                "role": "pin",
+                "status": "proved",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    raw = json.dumps({
+        "note": "New plus-succ axiom in the library; try a directed zero-case bridge.",
+        "revive": [],
+    })
+    fake_resp = MagicMock()
+    fake_resp.content = raw
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
+        "feedback_llm_hints.invoke_configured_chat",
+        return_value=(fake_resp, MagicMock(apply=False)),
+    ) as inv:
+        rec = maybe_refresh_llm_hints(
+            base,
+            "template",
+            llm=MagicMock(),
+            config=mate.config,
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        inv.assert_called_once()
+    assert rec is not None
+    assert "plus-succ" in rec["hints"]["text"]
+
+
+def _hd_data_with_useless(**extra):
+    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    data = _hd_data(
+        useless_lemma_groups=[{
+            "lemmas": [lemma],
+            "status": "timeout",
+            "candidate_ids": {"C1": lemma},
+            "attributed_ids": [],
+            "mix_stats": {"CONJ_TOTAL": 1, "INST_TOTAL": 1, "QUANTIFIERS_SKOLEMIZE": 0},
+            "difficulty_dump_complete": True,
+            "repair_hints": [{
+                "kind": "high_difficulty_assertions",
+                "attempt_id": "usefulness:cvc5_simple:1.0:1",
+                "hard_axioms": [AX],
+                "hard_axiom_scores": {AX: 12},
+                "rarely_instantiated": [AX],
+                "goal_fragments": [GOAL],
+            }],
+        }],
+        unproved_lemmas=[{"lemma": lemma, "status": "timeout"}],
+    )
+    data.update(extra)
+    return data
+
+
 def test_maybe_refresh_runs_and_stores(tmp_path: Path) -> None:
     base = str(tmp_path)
-    mate.save_failed_lemmas(base, "template", _hd_data())
-    raw = (
-        "Generalize the accumulator so the inductive hypothesis matches the "
-        "succ case of plus; avoid repeating the previous candidate set."
-    )
+    mate.save_failed_lemmas(base, "template", _hd_data_with_useless())
+    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    raw = json.dumps({
+        "note": (
+            "Generalize the accumulator so the inductive hypothesis matches "
+            "the succ case of plus; avoid repeating the previous candidate set."
+        ),
+        "revive": [cand],
+    })
     fake_resp = MagicMock()
     fake_resp.content = raw
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
@@ -253,6 +490,9 @@ def test_maybe_refresh_runs_and_stores(tmp_path: Path) -> None:
     assert rec is not None
     stored = mate.load_failed_lemmas(base, "template")["llm_hints"]
     assert "Generalize the accumulator" in stored["hints"]["text"]
+    assert stored["hints"]["revive"][0]["formula"] == cand
+    assert stored["hints"]["mode"] == "revise_candidate"
+    assert "action" not in stored["hints"]["revive"][0]
 
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
         "feedback_llm_hints.invoke_configured_chat",
@@ -267,6 +507,24 @@ def test_maybe_refresh_runs_and_stores(tmp_path: Path) -> None:
         )
         inv.assert_not_called()
     assert again["attempt_id"] == stored["attempt_id"]
+
+
+def test_prompt_skips_llm_hints_without_useless_group() -> None:
+    """Stored hints must not inject on INITIAL SOLVE before any useless group."""
+    data = _hd_data(
+        llm_hints={
+            "attempt_id": "initial_goal:x",
+            "hints": {"text": "Should not appear before usefulness failure.", "revive": []},
+        },
+    )
+    with patch.dict(os.environ, {
+        "FEEDBACK_LLM_HINTS": "on",
+        "PROMPT_ADVICE": "on",
+        "FEEDBACK_REPAIR_HINTS": "on",
+    }):
+        txt = mate.format_solver_feedback_for_prompt(data)
+    assert "Should not appear" not in txt
+    assert "SOLVER HINTS" not in txt
 
 
 def test_prompt_llm_hints_replace_program_hints_inside_last_attempt() -> None:
@@ -327,12 +585,25 @@ if __name__ == "__main__":
     test_pack_candidates_attributed_stats_and_prove()
     test_pack_prove_invalid_and_unknown()
     test_parse_plain_and_prompt_block()
+    test_parse_note_and_revive_json()
+    test_parse_revive_still_accepts_pool_id()
+    test_no_action_not_injected()
+    test_new_direction_text_only()
+    test_legacy_hold_not_injected()
     test_parse_legacy_json_collapsed()
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_difficulty(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
+        test_maybe_refresh_skips_without_useless_group(Path(tmp))
+    test_has_hint_opportunity_unproved_or_library_delta()
+    with tempfile.TemporaryDirectory() as tmp:
+        test_maybe_refresh_skips_without_opportunity(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_maybe_refresh_runs_on_library_delta(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_runs_and_stores(Path(tmp))
     test_prompt_llm_hints_replace_program_hints_inside_last_attempt()
+    test_prompt_skips_llm_hints_without_useless_group()
     test_format_attempt_suppress_advice_flag()
     print("feedback_llm_hints tests passed")

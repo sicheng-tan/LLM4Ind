@@ -79,6 +79,56 @@ def test_library_dedup_alpha_renaming(tmp_path: Path) -> None:
         assert len(load_lemma_library(str(tmp_path))) == 1
 
 
+def test_add_proved_lemma_drops_equivalent_unproved(tmp_path: Path) -> None:
+    import json
+
+    proved = "(forall ((x Nat)) (= (plus x zero) x))"
+    alpha = "(forall ((y Nat)) (= (plus y zero) y))"
+    other = "(forall ((x Nat) (y Nat)) (= (plus x y) (plus y x)))"
+    invalid_keep = "(forall ((x Nat)) false)"
+    (tmp_path / "failed_lemmas.json").write_text(
+        json.dumps({
+            "invalid_lemmas": [{"lemma": invalid_keep, "reason": "unsat"}],
+            "unproved_lemmas": [
+                {"lemma": proved, "status": "timeout"},
+                {"lemma": other, "status": "timeout"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "failed_lemmas_1.json").write_text(
+        json.dumps({
+            "unproved_lemmas": [
+                {"lemma": alpha, "status": "unknown"},
+                {"lemma": other, "status": "timeout"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    with _patch_flags("on", "on"):
+        assert add_proved_lemma(str(tmp_path), proved, origin="template_1") == "lib_1"
+    root = json.loads((tmp_path / "failed_lemmas.json").read_text(encoding="utf-8"))
+    child = json.loads((tmp_path / "failed_lemmas_1.json").read_text(encoding="utf-8"))
+    assert [item["lemma"] for item in root["unproved_lemmas"]] == [other]
+    assert root["invalid_lemmas"] == [{"lemma": invalid_keep, "reason": "unsat"}]
+    assert [item["lemma"] for item in child["unproved_lemmas"]] == [other]
+
+
+def test_add_proved_lemma_drops_unproved_when_library_off(tmp_path: Path) -> None:
+    import json
+
+    proved = "(forall ((x Nat)) (= (plus x zero) x))"
+    (tmp_path / "failed_lemmas.json").write_text(
+        json.dumps({"unproved_lemmas": [{"lemma": proved, "status": "timeout"}]}),
+        encoding="utf-8",
+    )
+    with _patch_flags("off", "on"):
+        assert add_proved_lemma(str(tmp_path), proved) is None
+    out = json.loads((tmp_path / "failed_lemmas.json").read_text(encoding="utf-8"))
+    assert out["unproved_lemmas"] == []
+    assert not lemma_library_path(str(tmp_path)).exists()
+
+
 def test_last_normal_tree_skips_empty_invalid_useless() -> None:
     state = {}
     state = append_attempt(state, "empty")

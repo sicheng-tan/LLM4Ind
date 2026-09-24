@@ -128,6 +128,7 @@ from lemma_gates import (
     is_invalid_diagnosis_reason,
     lemma_filter_drop_enabled,
     lemma_known_invalid,
+    lemma_known_unproved,
     lemma_same_as_goal,
     llm_lemma_diagnosis_enabled,
     llm_parse_retries,
@@ -361,10 +362,9 @@ def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optiona
     """
     failed_data = load_failed_lemmas(base_path, goal_name)
     failed_data.setdefault("unproved_lemmas", [])
+    if lemma_known_unproved(lemma, failed_data["unproved_lemmas"]):
+        return
     record = {"lemma": lemma, **(meta or {})}
-    for item in failed_data["unproved_lemmas"]:
-        if item.get("lemma") == lemma:
-            return
     failed_data["unproved_lemmas"].append(record)
     save_failed_lemmas(base_path, goal_name, failed_data)
     log_exp(
