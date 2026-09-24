@@ -22,7 +22,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from exp_flags import _flag_enabled, prompt_advice_enabled
+from exp_flags import _flag_enabled, feedback_llm_hints_enabled, prompt_advice_enabled
 from obligation_tree import (
     compact_formula,
     lemmas_equivalent,
@@ -978,9 +978,9 @@ def format_attempt_feedback_for_prompt(
     """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
 
     History of older useless groups stays in json; only the last group is shown.
-    When ``llm_hints`` is present, program stuck/advice/local-vs-parent are
-    omitted and SOLVER HINTS is nested under LAST ATTEMPT / INITIAL SOLVE instead.
-    ``suppress_advice`` is kept for callers; llm_hints already implies full replace.
+    When ``FEEDBACK_LLM_HINTS`` is on, program HD / repair / advice / local-vs-parent
+    are omitted; SOLVER HINTS is nested under LAST ATTEMPT only if the diagnoser
+    produced an injectable block. ``suppress_advice`` is kept for callers.
     """
     from feedback_llm_hints import format_llm_hints_lines, llm_hints_eligible
 
@@ -1006,8 +1006,13 @@ def format_attempt_feedback_for_prompt(
         if llm_hints_eligible(data) else []
     )
     use_llm_hints = bool(llm_lines)
-    # LLM hints replace program stuck / advice / local-vs-parent in the prompt.
-    want_program = include_stuck and not use_llm_hints
+    # Diagnoser owns HD/repair text. Do not fall back to the program block
+    # when the flag is on (including NO_ACTION / skipped diagnoser).
+    want_program = (
+        include_stuck
+        and not use_llm_hints
+        and not feedback_llm_hints_enabled()
+    )
     want_advice = (
         want_program and prompt_advice_enabled() and not suppress_advice
     )

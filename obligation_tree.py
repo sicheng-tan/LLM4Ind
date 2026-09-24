@@ -402,11 +402,17 @@ def make_child_node(
     return node
 
 
-def make_goal_tree(goal_id: str, children: Sequence[dict], *, proved: bool) -> dict:
+def make_goal_tree(
+    goal_id: str,
+    children: Sequence[dict],
+    *,
+    proved: bool,
+    formula: Optional[str] = None,
+) -> dict:
     return {
         "id": goal_id,
         "role": "goal",
-        "formula": None,
+        "formula": normalize_lemma_formula(formula or "") or None,
         "status": "proved" if proved else "open",
         "lib": None,
         "children": list(children),

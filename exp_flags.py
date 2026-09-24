@@ -64,10 +64,12 @@ def formula_evidence_enabled() -> bool:
 def feedback_llm_hints_enabled() -> bool:
     """Extra LLM call: select unproved revival candidates after a useless group.
 
-    Default **off**. Requires difficulty, ≥1 useless group (skips first lemma
-    generation), and an opportunity (unproved pool or new library lemmas).
-    Injects under LAST ATTEMPT as no_action (omit), new_direction (text),
-    or revise_candidate (pending formulas plus notes).
+    Default **off**. Requires ≥1 useless group (skips first lemma generation)
+    and an opportunity (unproved pool **and** library growth vs the last
+    baseline; the first call compares against an empty library). Difficulty is
+    optional. Injects under LAST ATTEMPT only when the diagnoser produced a
+    block (new_direction / revise_candidate). Program HD / repair hints stay
+    out of the generation prompt while this flag is on.
     """
     return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
 

@@ -1,10 +1,12 @@
 """Optional LLM hints from solver feedback (FEEDBACK_LLM_HINTS).
 
-Default **off**. Requires difficulty observations **and** at least one failed
-usefulness group (so the first lemma-generation call is never steered by
-HD-only hints). After a useless group, the diagnoser runs only if there is an
-unproved revival pool or new library lemmas. Selected formulas re-enter
-generation as pending (may be true or useful, not known to be either).
+Default **off**. Requires at least one failed usefulness group (so the first
+lemma-generation call is never steered by HD-only hints). After a useless
+group, the diagnoser runs only if there is an unproved revival pool **and**
+the lemma library has new ids vs the last baseline (first call compares
+against an empty library, so any proved lemma counts as a change). Difficulty
+is optional: when absent, the observation pack omits hard-axiom / hotspot
+blocks. GOAL is the current proof-node formula.
 The diagnoser chooses no_action (leave generation alone), new_direction
 (text only), or revise_candidate (pending formulas plus notes).
 """
@@ -17,10 +19,15 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from cvc5_runner import classify_difficulty_term
 from exp_flags import feedback_llm_hints_enabled, repair_hints_enabled
 from exp_stats import add_llm_time, log_exp, record_llm_generation
 from llm_time_budget import invoke_configured_chat
-from obligation_tree import compact_formula, load_lemma_library, normalize_lemma_formula
+from obligation_tree import (
+    last_normal_tree,
+    load_lemma_library,
+    normalize_lemma_formula,
+)
 
 HINTS_KIND = "llm_feedback_hints"
 HINT_NO_ACTION = "no_action"
@@ -29,16 +36,18 @@ HINT_REVISE_CANDIDATE = "revise_candidate"
 HINT_MODES = (HINT_NO_ACTION, HINT_NEW_DIRECTION, HINT_REVISE_CANDIDATE)
 MAX_AXIOMS = 4
 MAX_EVIDENCE = 8
-MAX_CANDIDATES = 3
-MAX_FORMULA_CHARS = 280
-# Cap injected SOLVER HINTS prose (note only; revive lines are separate).
 MAX_HINT_CHARS = 900
 MIN_HINT_CHARS = 24
 # Block HD-only steering of the first lemma generation.
 MIN_USELESS_GROUPS_FOR_HINTS = 1
-MAX_REVIVE_CANDIDATES = 5
-MAX_LIBRARY_SHOW = 4
-MAX_REVIVE_OUT = 3
+# Soft ceilings above full706 llmhint maxima (library≤18, cum-unique
+# unproved proxy≤15). Pathological blow-ups still truncated; prefer the
+# newest entries, not random sampling.
+MAX_REVIVE_CANDIDATES = 24
+MAX_LIBRARY_SHOW = 24
+MAX_REVIVE_OUT = 24
+MAX_CANDIDATES = 12
+_HD_USEFULNESS_CONTEXTS = frozenset({"usefulness_check", "usefulness"})
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _ANY_FENCE = re.compile(r"```(?:\w+)?\s*(.*?)\s*```", re.DOTALL)
@@ -52,6 +61,8 @@ Rules:
 - search-change stats are weak signals; for reference only.
 - Revival candidates are unproved. They may be true or false, useful or useless;
   they are not known true and not library axioms. Do not invent formulas.
+- The lemma library has new proved axioms. Re-evaluate the unproved revival candidates
+  in that new context.
 - Choose exactly one mode:
   NO_ACTION: generation should proceed as usual; do not steer it.
   NEW_DIRECTION: none of the revival candidates are worth bringing back;
@@ -70,12 +81,19 @@ Return ONLY one JSON object:
 }}
 NO_ACTION: leave note/revive empty; the generator is not shown this block.
 NEW_DIRECTION: fill note only (no revive). Tell the generator to try a new shape.
-REVISE_CANDIDATE: copy at most {max_revive} formulas verbatim from REVIVAL
-CANDIDATES; optional per-formula note. Unselected pool formulas are omitted.
-Do not assign a required tactic.
+REVISE_CANDIDATE: copy formulas verbatim from REVIVAL CANDIDATES
+(at most {max_revive}; prefer the most relevant); optional per-formula note.
+Unselected pool formulas are omitted.
+LAST CANDIDATE LEMMAS are the previous generation round.
+REVIVAL CANDIDATES are historical unproved lemmas, not only last round.
 
 {body}
 """.replace("{max_revive}", str(MAX_REVIVE_OUT))
+
+
+def _prompt_formula(formula: Optional[str]) -> str:
+    """Whitespace-normalized formula for diagnoser I/O; do not truncate."""
+    return normalize_lemma_formula(formula or "")
 
 
 def _hd_hints(hints: Sequence[dict]) -> List[dict]:
@@ -88,22 +106,26 @@ def _hd_hints(hints: Sequence[dict]) -> List[dict]:
     return out
 
 
+def _is_usefulness_hd(hint: dict) -> bool:
+    ctx = str(hint.get("context") or "")
+    if ctx in _HD_USEFULNESS_CONTEXTS:
+        return True
+    return str(hint.get("attempt_id") or "").startswith("usefulness")
+
+
 def _latest_hd_hint(failed_data: dict) -> Optional[dict]:
-    group = None
+    """HD from the last useless group's usefulness dump only.
+
+    Skip initial-goal / node-level fallbacks: those dumps predate later
+    candidate sets and library growth.
+    """
     groups = failed_data.get("useless_lemma_groups") or []
-    if groups and isinstance(groups[-1], dict) and "repair_hints" in groups[-1]:
-        group = groups[-1]
-    hints: Sequence[dict]
-    if isinstance(group, dict):
-        hints = group.get("repair_hints") or []
-    else:
-        hints = failed_data.get("repair_hints") or []
-    hds = _hd_hints(hints)
-    if hds:
-        return hds[-1]
-    # Fall back to node-level repair_hints (initial solve before any group).
-    hds = _hd_hints(failed_data.get("repair_hints") or [])
-    return hds[-1] if hds else None
+    if not groups or not isinstance(groups[-1], dict):
+        return None
+    for hint in reversed(_hd_hints(groups[-1].get("repair_hints") or [])):
+        if _is_usefulness_hd(hint):
+            return hint
+    return None
 
 
 def has_difficulty_observations(failed_data: Optional[dict]) -> bool:
@@ -130,13 +152,41 @@ def has_hint_opportunity(
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
 ) -> bool:
-    """True when a diagnoser call can break a stall: unproved pool or new library."""
-    if _revival_candidate_items(failed_data or {}):
-        return True
-    prev = [str(x) for x in (prev_library_ids or []) if x]
-    if not prev:
+    """True when unproved revival candidates exist *and* the library grew.
+
+    Missing ``prev_library_ids`` is an empty-library baseline: any current
+    library id counts as a change (the first diagnoser call).
+    """
+    if not _revival_candidate_items(failed_data or {}):
         return False
+    prev = [] if prev_library_ids is None else list(prev_library_ids)
     return bool(_library_show_items(library or [], prev_ids=prev))
+
+
+def _recorded_library_baseline(failed_data: Optional[dict]) -> List[str]:
+    """Last snapshotted library ids; missing record means empty library."""
+    rec = (failed_data or {}).get("llm_hints")
+    if not isinstance(rec, dict) or "library_ids" not in rec:
+        return []
+    return [str(x) for x in (rec.get("library_ids") or []) if x]
+
+
+def _persist_library_baseline(
+    base_path: str,
+    goal_name: str,
+    library: Sequence[dict],
+    *,
+    load_failed_lemmas,
+    save_failed_lemmas,
+) -> None:
+    """Remember current library ids so the next growth can satisfy the AND gate."""
+    ids = _library_ids(library)
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    rec = failed_data.get("llm_hints")
+    rec = dict(rec) if isinstance(rec, dict) else {}
+    rec["library_ids"] = ids
+    failed_data["llm_hints"] = rec
+    save_failed_lemmas(base_path, goal_name, failed_data)
 
 
 def _library_fingerprint(library: Sequence[dict]) -> str:
@@ -163,17 +213,17 @@ def _library_show_items(
     *,
     prev_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, str]]:
-    """Recent library entries; if prev_ids given, only ids not seen last hint."""
-    prev = {str(x) for x in (prev_ids or []) if x}
-    items: List[Dict[str, str]] = []
+    """Library entries to show. ``prev_ids is not None``: only ids not in that baseline."""
     source = list(library or [])
-    if prev:
+    if prev_ids is not None:
+        prev = {str(x) for x in prev_ids if x}
         source = [
             item for item in source
             if isinstance(item, dict) and str(item.get("id") or "") not in prev
         ]
     else:
         source = source[-MAX_LIBRARY_SHOW:]
+    items: List[Dict[str, str]] = []
     for item in source[-MAX_LIBRARY_SHOW:]:
         if not isinstance(item, dict):
             continue
@@ -182,35 +232,19 @@ def _library_show_items(
             continue
         items.append({
             "id": str(item.get("id") or ""),
-            "formula": compact_formula(formula, MAX_FORMULA_CHARS),
+            "formula": _prompt_formula(formula),
             "role": str(item.get("role") or ""),
-            "new": True if prev else False,
+            "new": prev_ids is not None,
         })
     return items
 
 
-def _last_revive_keys(failed_data: dict) -> Set[str]:
-    rec = failed_data.get("llm_hints") if isinstance(failed_data.get("llm_hints"), dict) else {}
-    hints = rec.get("hints") if isinstance(rec, dict) else {}
-    keys: Set[str] = set()
-    for item in (hints.get("revive") or []) if isinstance(hints, dict) else []:
-        formula = ""
-        action = ""
-        if isinstance(item, dict):
-            formula = str(item.get("formula") or "")
-            action = str(item.get("action") or "").strip().lower()
-        else:
-            formula = str(item or "")
-        if action == "hold":
-            continue
-        key = normalize_lemma_formula(formula)
-        if key:
-            keys.add(key)
-    return keys
-
-
 def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
-    """Soft-failed lemmas only (unproved/timeout); never invalid."""
+    """Soft-failed lemmas only (unproved/timeout); never invalid.
+
+    If the pool exceeds ``MAX_REVIVE_CANDIDATES``, keep the newest entries
+    (list tail), not a random sample.
+    """
     invalid_keys: Set[str] = set()
     for rec in failed_data.get("invalid_lemmas") or []:
         if isinstance(rec, dict):
@@ -220,7 +254,6 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
         key = normalize_lemma_formula(raw)
         if key:
             invalid_keys.add(key)
-    cooled = _last_revive_keys(failed_data)
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for rec in failed_data.get("unproved_lemmas") or []:
@@ -236,15 +269,14 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
         if status == "invalid":
             continue
         seen.add(key)
-        rid = f"R{len(out) + 1}"
         out.append({
-            "id": rid,
-            "formula": compact_formula(formula, MAX_FORMULA_CHARS),
+            "formula": _prompt_formula(formula),
             "status": status or "unproved",
-            "cooled": key in cooled,
         })
-        if len(out) >= MAX_REVIVE_CANDIDATES:
-            break
+    if len(out) > MAX_REVIVE_CANDIDATES:
+        out = out[-MAX_REVIVE_CANDIDATES:]
+    for i, item in enumerate(out, 1):
+        item["id"] = f"R{i}"
     return out
 
 
@@ -395,38 +427,65 @@ def _candidate_id_for_formula(group, formula, index):
     return f"C{index}"
 
 
+def _current_node_goal(
+    failed_data,
+    *,
+    current_goal: Optional[str] = None,
+    hd: Optional[dict] = None,
+) -> str:
+    """Full formula of the node currently being proved.
+
+    Prefer the live node formula, then the obligation-tree root, then
+    solver-extracted goal_term. Difficulty ``goal_fragments`` are last:
+    they can be dump pieces rather than the whole current goal.
+    """
+    text = normalize_lemma_formula(current_goal or "")
+    if text:
+        return text
+    tree = last_normal_tree((failed_data or {}).get("obligation"))
+    if isinstance(tree, dict):
+        text = normalize_lemma_formula(str(tree.get("formula") or ""))
+        if text:
+            return text
+    base = (failed_data or {}).get("baseline_diag")
+    if isinstance(base, dict):
+        text = normalize_lemma_formula(str(base.get("goal_term") or ""))
+        if text:
+            return text
+    hd = hd or {}
+    frags = hd.get("goal_fragments") or []
+    if frags:
+        return normalize_lemma_formula(str(frags[0] or ""))
+    return ""
+
+
 def build_observation_pack(
     failed_data,
     *,
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
+    current_goal: Optional[str] = None,
 ):
-    """Pack goal / hard axioms / last candidates / library / revive pool.
+    """Pack goal / optional hard axioms / last candidates / library / revive pool.
 
-    None if no difficulty. Caller should also gate on ``llm_hints_eligible``.
+    Difficulty is optional. None only when there is no goal, no last group,
+    no library delta to show, and no revival pool. Caller should also gate
+    on ``llm_hints_eligible``. Goal comes from the current proof node
+    (``current_goal`` or the obligation-tree root), not from HD.
     """
-    if not has_difficulty_observations(failed_data):
-        return None
     hd = _latest_hd_hint(failed_data) or {}
     base = failed_data.get("baseline_diag") if isinstance(failed_data.get("baseline_diag"), dict) else {}
-    goal = ""
-    if hd.get("goal_fragments"):
-        goal = str((hd.get("goal_fragments") or [""])[0] or "")
-    if not goal:
-        goal = str(base.get("goal_term") or "")
-    axioms = [str(a) for a in (hd.get("hard_axioms") or []) if a][:MAX_AXIOMS]
-    if not axioms and base.get("difficulty"):
-        for item in base.get("difficulty") or []:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                continue
-            term, score = item[0], item[1]
-            if int(score or 0) <= 0:
-                continue
-            axioms.append(str(term))
-            if len(axioms) >= MAX_AXIOMS:
-                break
-    if not axioms and not goal:
-        return None
+    goal = _current_node_goal(failed_data, current_goal=current_goal, hd=hd)
+    axioms: List[str] = []
+    for raw in (hd.get("hard_axioms") or []):
+        term = str(raw or "")
+        if not term:
+            continue
+        if classify_difficulty_term(term, goal) != "axiom":
+            continue
+        axioms.append(term)
+        if len(axioms) >= MAX_AXIOMS:
+            break
 
     scores = hd.get("hard_axiom_scores") if isinstance(hd.get("hard_axiom_scores"), dict) else {}
     rarely = {str(a) for a in (hd.get("rarely_instantiated") or []) if a}
@@ -437,11 +496,11 @@ def build_observation_pack(
     hard_axioms = []
     for i, (ax, score) in enumerate(ranked, 1):
         hard_axioms.append({
-            "formula": compact_formula(ax, MAX_FORMULA_CHARS),
+            "formula": _prompt_formula(ax),
             "rank": i,
             "score": score,
-            "rarely_instantiated": ax in rarely or compact_formula(ax, MAX_FORMULA_CHARS) in {
-                compact_formula(r, MAX_FORMULA_CHARS) for r in rarely
+            "rarely_instantiated": normalize_lemma_formula(ax) in {
+                normalize_lemma_formula(r) for r in rarely
             },
         })
 
@@ -458,15 +517,15 @@ def build_observation_pack(
             cid = _candidate_id_for_formula(group, lemma, i)
             entry = {
                 "id": cid,
-                "formula": compact_formula(lemma, MAX_FORMULA_CHARS),
+                "formula": _prompt_formula(lemma),
                 "group_failed": True,
                 "attributed": cid in attributed,
             }
             prove = prove_lookup.get(lemma)
             if not prove:
-                target = entry["formula"]
+                target = normalize_lemma_formula(lemma)
                 for form, st in prove_lookup.items():
-                    if compact_formula(form, MAX_FORMULA_CHARS) == target:
+                    if normalize_lemma_formula(form) == target:
                         prove = st
                         break
             entry["prove"] = prove or "unknown"
@@ -484,6 +543,14 @@ def build_observation_pack(
 
     lib_items = _library_show_items(library or [], prev_ids=prev_library_ids)
     revive_pool = _revival_candidate_items(failed_data)
+    if not (
+        goal
+        or hard_axioms
+        or candidates
+        or lib_items
+        or revive_pool
+    ):
+        return None
 
     evidence = []
     for i, ax in enumerate(hard_axioms[:MAX_EVIDENCE], 1):
@@ -502,7 +569,7 @@ def build_observation_pack(
         "dump_complete": dump_complete,
         "goal": {
             "id": "G1",
-            "formula": compact_formula(goal, MAX_FORMULA_CHARS) if goal else "",
+            "formula": _prompt_formula(goal) if goal else "",
         },
         "axioms": [
             {"id": f"A{i}", "formula": ax["formula"]}
@@ -512,7 +579,7 @@ def build_observation_pack(
         "evidence": evidence,
         "previous_candidates": candidates,
         "library": lib_items,
-        "library_new": bool(prev_library_ids),
+        "library_new": prev_library_ids is not None,
         "revival_candidates": revive_pool,
         "group_status": str((group or {}).get("status") or base.get("status") or ""),
         "status": str((group or {}).get("status") or base.get("status") or ""),
@@ -526,37 +593,40 @@ def format_observation_prompt_body(pack):
     goal = pack.get("goal") or {}
     lines.append("=== GOAL ===")
     lines.append(f"  {goal.get('formula') or '(unknown)'}")
-    lines.append("")
-    lines.append("=== HARD AXIOMS (difficulty hotspots; not proof dependencies) ===")
+
     hard = pack.get("hard_axioms") or []
-    if hard:
-        for ax in hard:
-            bits = [f"rank {ax.get('rank')}"]
-            if ax.get("score"):
-                bits.append(f"d={ax.get('score')}")
-            if ax.get("rarely_instantiated"):
-                bits.append("rarely instantiated in this dump")
-            lines.append(f"  - {ax.get('formula')}")
-            lines.append(f"    [{', '.join(bits)}]")
-    else:
-        for ax in pack.get("axioms") or []:
-            lines.append(f"  - {ax.get('formula')}")
-        if not pack.get("axioms"):
-            lines.append("  (none)")
+    axioms = pack.get("axioms") or []
+    if hard or axioms:
+        lines.append("")
+        lines.append("=== HARD AXIOMS (last usefulness dump, hotspots not proof dependencies) ===")
+        if hard:
+            for ax in hard:
+                bits = [f"rank {ax.get('rank')}"]
+                if ax.get("score"):
+                    bits.append(f"d={ax.get('score')}")
+                if ax.get("rarely_instantiated"):
+                    bits.append("rarely instantiated in this dump")
+                lines.append(f"  - {ax.get('formula')}")
+                lines.append(f"    [{', '.join(bits)}]")
+        else:
+            for ax in axioms:
+                lines.append(f"  - {ax.get('formula')}")
 
     prev = pack.get("previous_candidates") or []
     if prev:
         lines.append("")
-        lines.append("=== LAST CANDIDATE LEMMAS (usefulness: A ∧ candidates → goal) ===")
+        lines.append("=== LAST CANDIDATE LEMMAS (previous generation round; usefulness: A ∧ these → goal) ===")
         group_status = pack.get("group_status") or pack.get("status") or "?"
-        lines.append(f"  Group result: {group_status} (goal not proved with this set)")
+        lines.append(f"  Group result: {group_status} (goal not proved with this candidates)")
+        show_hotspot = bool(pack.get("hard_axioms") or pack.get("axioms"))
         for item in prev:
             lines.append(f"  - {item.get('formula')}")
             outcome_bits = ["in failed group"]
-            if item.get("attributed"):
-                outcome_bits.append("attributed=yes (touched a hotspot)")
-            else:
-                outcome_bits.append("attributed=no")
+            if show_hotspot:
+                if item.get("attributed"):
+                    outcome_bits.append("attributed=yes (touched a hotspot)")
+                else:
+                    outcome_bits.append("attributed=no")
             prove = item.get("prove") or "unknown"
             # Bare token: proved|failed|timeout|unproved|invalid|unknown.
             outcome_bits.append(f"prove={prove}")
@@ -586,24 +656,20 @@ def format_observation_prompt_body(pack):
     if lib_items:
         for item in lib_items:
             role = item.get("role") or ""
-            lid = item.get("id") or ""
-            prefix = f"{lid} " if lid else ""
             role_bit = f" [{role}]" if role else ""
-            lines.append(f"  - {prefix}{item.get('formula')}{role_bit}")
+            lines.append(f"  - {item.get('formula')}{role_bit}")
     else:
         lines.append("  (no new library lemmas)" if pack.get("library_new") else "  (empty)")
 
     revive_pool = pack.get("revival_candidates") or []
     lines.append("")
     lines.append(
-        "=== REVIVAL CANDIDATES (unproved; may be true or useful, not known; copy verbatim) ==="
+        "=== REVIVAL CANDIDATES (historical unproved lemmas, not only last round) ==="
     )
     if revive_pool:
         for item in revive_pool:
-            bits = [f"status={item.get('status') or 'unproved'}"]
-            if item.get("cooled"):
-                bits.append("shown last round; still unproved")
-            lines.append(f"  - {item.get('formula')}  [{'; '.join(bits)}]")
+            status = item.get("status") or "unproved"
+            lines.append(f"  - {item.get('formula')}  [status={status}]")
     else:
         lines.append("  (none)")
 
@@ -650,9 +716,9 @@ def _text_from_legacy_json(data: dict) -> str:
             chunk = f"{chunk} Goal link: {conn}" if chunk else conn
         if cand:
             chunk = (
-                f"{chunk} Suggested shape: {compact_formula(cand, MAX_FORMULA_CHARS)}"
+                f"{chunk} Suggested shape: {_prompt_formula(cand)}"
                 if chunk
-                else f"Suggested shape: {compact_formula(cand, MAX_FORMULA_CHARS)}"
+                else f"Suggested shape: {_prompt_formula(cand)}"
             )
         if chunk:
             parts.append(chunk)
@@ -672,7 +738,6 @@ def _filter_revive_list(
         return []
     by_id: Dict[str, dict] = {}
     by_norm: Dict[str, dict] = {}
-    by_compact: Dict[str, dict] = {}
     for cand in allowed or []:
         if isinstance(cand, dict):
             formula = str(cand.get("formula") or "").strip()
@@ -684,12 +749,11 @@ def _filter_revive_list(
             continue
         rec = {
             "id": cid,
-            "formula": compact_formula(formula, MAX_FORMULA_CHARS),
+            "formula": _prompt_formula(formula),
         }
         if cid:
             by_id[cid] = rec
         by_norm[normalize_lemma_formula(formula)] = rec
-        by_compact[compact_formula(formula, MAX_FORMULA_CHARS)] = rec
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for item in raw_items:
@@ -710,10 +774,7 @@ def _filter_revive_list(
         if cid and cid in by_id:
             match = by_id[cid]
         elif formula:
-            match = (
-                by_norm.get(normalize_lemma_formula(formula))
-                or by_compact.get(compact_formula(formula, MAX_FORMULA_CHARS))
-            )
+            match = by_norm.get(normalize_lemma_formula(formula))
         if not match:
             continue
         key = normalize_lemma_formula(match["formula"])
@@ -856,7 +917,7 @@ def hint_revive_entries(hints: Any) -> List[Dict[str, str]]:
                 continue
             out.append({
                 "id": str(item.get("id") or ""),
-                "formula": compact_formula(formula, MAX_FORMULA_CHARS),
+                "formula": _prompt_formula(formula),
             })
             note = str(item.get("note") or item.get("why") or "").strip()
             if note:
@@ -866,7 +927,7 @@ def hint_revive_entries(hints: Any) -> List[Dict[str, str]]:
             if formula:
                 out.append({
                     "id": "",
-                    "formula": compact_formula(formula, MAX_FORMULA_CHARS),
+                    "formula": _prompt_formula(formula),
                 })
         if len(out) >= MAX_REVIVE_OUT:
             break
@@ -964,12 +1025,16 @@ def maybe_refresh_llm_hints(
     load_failed_lemmas,
     save_failed_lemmas,
     backend: str = "cvc5",
+    current_goal: Optional[str] = None,
 ) -> Optional[dict]:
-    """Run LLM-hints when flag is on, difficulty exists, and usefulness failed.
+    """Run LLM-hints when flag is on and usefulness failed.
 
-    Skips Vampire, missing difficulty, fewer than ``MIN_USELESS_GROUPS_FOR_HINTS``
-    groups (blocks first-gen HD-only hints), no unproved pool and no new library,
-    and when stored hints already match the current attempt_id.
+    Skips Vampire, fewer than ``MIN_USELESS_GROUPS_FOR_HINTS`` groups,
+    missing unproved pool or missing library growth vs the last baseline
+    (first call: vs empty library),
+    and when stored hints already match the current attempt_id. Difficulty
+    is optional (HD omitted from the pack). ``current_goal`` is the formula
+    of the node being proved.
     """
     if not feedback_llm_hints_enabled():
         return None
@@ -986,42 +1051,24 @@ def maybe_refresh_llm_hints(
             n_groups=len(failed_data.get("useless_lemma_groups") or []),
         )
         return None
-    if not has_difficulty_observations(failed_data):
-        log_exp(
-            "llm_feedback_hints_skip",
-            goal=goal_name,
-            reason="no_difficulty",
-        )
-        return None
     library = load_lemma_library(base_path)
-    prev_ids: List[str] = []
-    existing = failed_data.get("llm_hints")
-    if isinstance(existing, dict):
-        prev_ids = [str(x) for x in (existing.get("library_ids") or []) if x]
-        if not prev_ids:
-            fp = str(existing.get("library_fingerprint") or "")
-            if fp.startswith("lib") and ":" in fp:
-                # fingerprint is count:lastid — not a full id list; treat as unknown delta
-                prev_ids = []
+    baseline = _recorded_library_baseline(failed_data)
     pack = build_observation_pack(
-        failed_data, library=library, prev_library_ids=prev_ids or None,
+        failed_data,
+        library=library,
+        prev_library_ids=baseline,
+        current_goal=current_goal,
     )
     if pack is None:
+        _persist_library_baseline(
+            base_path, goal_name, library,
+            load_failed_lemmas=load_failed_lemmas,
+            save_failed_lemmas=save_failed_lemmas,
+        )
         log_exp(
             "llm_feedback_hints_skip",
             goal=goal_name,
             reason="empty_pack",
-        )
-        return None
-    if not has_hint_opportunity(
-        failed_data, library=library, prev_library_ids=prev_ids or None,
-    ):
-        log_exp(
-            "llm_feedback_hints_skip",
-            goal=goal_name,
-            reason="no_opportunity",
-            n_unproved=len(failed_data.get("unproved_lemmas") or []),
-            library_new=bool(pack.get("library_new")),
         )
         return None
     attempt_id = str(pack.get("attempt_id") or "")
@@ -1032,6 +1079,23 @@ def maybe_refresh_llm_hints(
         and _hints_are_cached(existing.get("hints"))
     ):
         return existing
+    if not has_hint_opportunity(
+        failed_data, library=library, prev_library_ids=baseline,
+    ):
+        _persist_library_baseline(
+            base_path, goal_name, library,
+            load_failed_lemmas=load_failed_lemmas,
+            save_failed_lemmas=save_failed_lemmas,
+        )
+        log_exp(
+            "llm_feedback_hints_skip",
+            goal=goal_name,
+            reason="no_opportunity",
+            n_unproved=len(failed_data.get("unproved_lemmas") or []),
+            library_new=bool(pack.get("library") or []),
+            n_prev_library=len(baseline),
+        )
+        return None
 
     user_body = format_observation_prompt_body(pack)
     messages = [

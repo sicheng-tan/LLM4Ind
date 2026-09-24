@@ -502,6 +502,7 @@ def _record_subgoal_split(
     order: Sequence[str],
     pre_proved: dict,
     rec_nodes: Sequence[dict],
+    formula: Optional[str] = None,
 ) -> None:
     """Log the split attempt; assemble/store a tree only when OBLIGATION_TREE is on."""
     if not obligation_tree_enabled():
@@ -525,7 +526,7 @@ def _record_subgoal_split(
         base_path,
         base_name,
         "obligation_tree",
-        tree=make_goal_tree(base_name, children, proved=proved),
+        tree=make_goal_tree(base_name, children, proved=proved, formula=formula),
     )
 
 
@@ -2756,6 +2757,7 @@ def _prove_run_body(
                         _record_subgoal_split(
                             base_path, base_name, proved=True,
                             order=order, pre_proved=pre_proved, rec_nodes=[],
+                            formula=current_formula,
                         )
                     logging.info(f"🏆 子目标 {base_name} 完成证明！")
                     return _done(True, "llm_no_subgoals")
@@ -2777,6 +2779,7 @@ def _prove_run_body(
                 _record_subgoal_split(
                     base_path, base_name, proved=ok,
                     order=order, pre_proved=pre_proved, rec_nodes=rec_nodes,
+                    formula=current_formula,
                 )
                 if ok:
                     logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
