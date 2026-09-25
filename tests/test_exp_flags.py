@@ -379,6 +379,28 @@ def test_progress_flag_skips_sidecar() -> None:
         diag.assert_not_called()
 
 
+def test_unproved_flag_writes_unproved() -> None:
+    import Mate_new as mate
+    from cvc5_runner import CvcResult
+
+    child = CvcResult(status="timeout", stats={"INST_TOTAL": 2}, strategy="cvc5_inductive")
+    with tempfile.TemporaryDirectory() as tmp:
+        mate._store_cached_diag(tmp, "template_1", "baseline_diag", child)
+        with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": "on"}), patch(
+            "Mate_new.run_cvc_diagnostic"
+        ) as diag:
+            mate._record_subgoal_failure_feedback(
+                tmp, "template", "template_1", ["(assert true)"]
+            )
+        diag.assert_not_called()
+        parent = mate.load_failed_lemmas(tmp, "template")
+        assert parent["invalid_lemmas"] == []
+        assert len(parent["unproved_lemmas"]) == 1
+        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["unproved_lemmas"][0]["status"] == "useful_but_unproved"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
+
+
 def test_unproved_flag_writes_invalid() -> None:
     import Mate_new as mate
     from cvc5_runner import CvcResult
@@ -413,8 +435,9 @@ def test_repair_hints_off_skips_subgoal_diagnostic() -> None:
         diag.assert_not_called()
         parent = mate.load_failed_lemmas(tmp, "template")
         assert parent["repair_hints"] == []
-        assert parent["unproved_lemmas"] == []
         assert parent["invalid_lemmas"] == []
+        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
 
 
 def test_prompt_retarget_off_uses_paper_order() -> None:
@@ -485,6 +508,7 @@ def main() -> int:
     test_prompt_hides_disabled_feedback_sections()
     test_add_repair_and_progress_respect_flags()
     test_progress_flag_skips_sidecar()
+    test_unproved_flag_writes_unproved()
     test_unproved_flag_writes_invalid()
     test_repair_hints_off_skips_subgoal_diagnostic()
     test_prompt_retarget_off_uses_paper_order()

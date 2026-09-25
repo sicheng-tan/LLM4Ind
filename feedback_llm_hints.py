@@ -160,7 +160,25 @@ def has_hint_opportunity(
     if not _revival_candidate_items(failed_data or {}):
         return False
     prev = [] if prev_library_ids is None else list(prev_library_ids)
-    return bool(_library_show_items(library or [], prev_ids=prev))
+    return _library_has_new_ids(library or [], prev_ids=prev)
+
+
+def _library_has_new_ids(
+    library: Sequence[dict],
+    *,
+    prev_ids: Sequence[str],
+) -> bool:
+    """True if library has a formulized id absent from the baseline."""
+    prev = {str(x) for x in prev_ids if x}
+    for item in library or []:
+        if not isinstance(item, dict):
+            continue
+        lid = str(item.get("id") or "")
+        if not lid or lid in prev:
+            continue
+        if str(item.get("formula") or "").strip():
+            return True
+    return False
 
 
 def _recorded_library_baseline(failed_data: Optional[dict]) -> List[str]:
@@ -212,29 +230,29 @@ def _library_show_items(
     library: Sequence[dict],
     *,
     prev_ids: Optional[Sequence[str]] = None,
-) -> List[Dict[str, str]]:
-    """Library entries to show. ``prev_ids is not None``: only ids not in that baseline."""
-    source = list(library or [])
-    if prev_ids is not None:
-        prev = {str(x) for x in prev_ids if x}
-        source = [
-            item for item in source
-            if isinstance(item, dict) and str(item.get("id") or "") not in prev
-        ]
-    else:
-        source = source[-MAX_LIBRARY_SHOW:]
-    items: List[Dict[str, str]] = []
-    for item in source[-MAX_LIBRARY_SHOW:]:
+) -> List[Dict[str, Any]]:
+    """Full library window for the diagnoser; mark ids absent from baseline as NEW.
+
+    ``prev_ids is None``: show recent entries with no NEW marks (tests / no gate).
+    ``prev_ids == []``: first diagnoser baseline (empty library) — every id is NEW.
+    Soft-cap: keep the newest ``MAX_LIBRARY_SHOW`` entries.
+    """
+    source = list(library or [])[-MAX_LIBRARY_SHOW:]
+    mark_new = prev_ids is not None
+    prev = {str(x) for x in (prev_ids or []) if x} if mark_new else set()
+    items: List[Dict[str, Any]] = []
+    for item in source:
         if not isinstance(item, dict):
             continue
         formula = str(item.get("formula") or "").strip()
         if not formula:
             continue
+        lid = str(item.get("id") or "")
         items.append({
-            "id": str(item.get("id") or ""),
+            "id": lid,
             "formula": _prompt_formula(formula),
             "role": str(item.get("role") or ""),
-            "new": prev_ids is not None,
+            "new": bool(mark_new and lid and lid not in prev),
         })
     return items
 
@@ -579,7 +597,7 @@ def build_observation_pack(
         "evidence": evidence,
         "previous_candidates": candidates,
         "library": lib_items,
-        "library_new": prev_library_ids is not None,
+        "library_new": any(bool(item.get("new")) for item in lib_items),
         "revival_candidates": revive_pool,
         "group_status": str((group or {}).get("status") or base.get("status") or ""),
         "status": str((group or {}).get("status") or base.get("status") or ""),
@@ -649,17 +667,21 @@ def format_observation_prompt_body(pack):
 
     lib_items = pack.get("library") or []
     lines.append("")
-    if pack.get("library_new"):
-        lines.append("=== LEMMA LIBRARY (new since last hint; context change) ===")
-    else:
-        lines.append("=== LEMMA LIBRARY (recent proved; context so far) ===")
+    lines.append("=== LEMMA LIBRARY (proved axioms already available) ===")
+    if any(item.get("new") for item in lib_items):
+        lines.append(
+            "  [NEW] = added since the last diagnoser baseline "
+            "(empty library on the first call). Prefer re-evaluating "
+            "revival candidates against NEW axioms."
+        )
     if lib_items:
         for item in lib_items:
             role = item.get("role") or ""
             role_bit = f" [{role}]" if role else ""
-            lines.append(f"  - {item.get('formula')}{role_bit}")
+            new_bit = " [NEW]" if item.get("new") else ""
+            lines.append(f"  - {item.get('formula')}{role_bit}{new_bit}")
     else:
-        lines.append("  (no new library lemmas)" if pack.get("library_new") else "  (empty)")
+        lines.append("  (empty)")
 
     revive_pool = pack.get("revival_candidates") or []
     lines.append("")
@@ -1092,7 +1114,7 @@ def maybe_refresh_llm_hints(
             goal=goal_name,
             reason="no_opportunity",
             n_unproved=len(failed_data.get("unproved_lemmas") or []),
-            library_new=bool(pack.get("library") or []),
+            library_new=bool(pack.get("library_new")),
             n_prev_library=len(baseline),
         )
         return None

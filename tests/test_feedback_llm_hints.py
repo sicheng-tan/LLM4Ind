@@ -151,13 +151,40 @@ def test_pack_keeps_long_formulas() -> None:
     }
     pack = build_observation_pack(data, library=[{
         "id": "lib_9", "formula": long_goal, "role": "pin",
-    }])
+    }], prev_library_ids=[])
     assert pack is not None
     assert pack["goal"]["formula"] == _prompt_formula(long_goal)
     assert not pack["goal"]["formula"].endswith("...")
     body = format_observation_prompt_body(pack)
     assert _prompt_formula(long_goal) in body
     assert "lib_9" not in body
+    assert "[NEW]" in body
+    assert "added since the last diagnoser baseline" in body
+
+
+def test_pack_library_shows_all_and_marks_new() -> None:
+    old = "(forall ((n Nat)) (= (plus n zero) n))"
+    new = AX
+    data = _hd_data_with_useless()
+    pack = build_observation_pack(
+        data,
+        library=[
+            {"id": "lib_1", "formula": old, "role": "pin"},
+            {"id": "lib_2", "formula": new, "role": "local"},
+        ],
+        prev_library_ids=["lib_1"],
+    )
+    assert pack is not None
+    assert pack["library_new"] is True
+    assert len(pack["library"]) == 2
+    assert pack["library"][0]["new"] is False
+    assert pack["library"][1]["new"] is True
+    body = format_observation_prompt_body(pack)
+    assert "=== LEMMA LIBRARY (proved axioms already available) ===" in body
+    assert "added since the last diagnoser baseline" in body
+    assert f"{old} [pin]" in body
+    assert f"{new} [local] [NEW]" in body
+    assert "lib_1" not in body and "lib_2" not in body
 
 
 def test_pack_from_hd_without_smt_parse() -> None:
@@ -671,7 +698,8 @@ def test_maybe_refresh_first_call_nonempty_library_vs_empty(tmp_path: Path) -> N
         )
         inv.assert_called_once()
     user = inv.call_args.args[1][1]["content"]
-    assert "new since last hint" in user
+    assert "[NEW]" in user
+    assert "added since the last diagnoser baseline" in user
     assert AX in user or "plus" in user
     assert "lib_1" not in user
     assert "Re-evaluate the unproved revival candidates" in inv.call_args.args[1][0]["content"]

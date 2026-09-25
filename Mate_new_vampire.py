@@ -384,10 +384,16 @@ def _store_last_llm_reason(base_path: str, goal_name: str, reason: Optional[str]
 def _record_blocking_lemma(
     base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None
 ) -> None:
-    """Situation A is tree-only when the flag is on; otherwise mark the lemma invalid."""
-    if unproved_not_invalid_enabled():
-        return
+    """Situation A: useful for the parent, own proof failed.
+
+    With ``UNPROVED_NOT_INVALID`` on (default), record in ``unproved_lemmas``
+    so revive / USEFUL BUT UNPROVED can see it; never mark invalid.
+    With the flag off, keep the old invalid_lemmas path.
+    """
     status = (meta or {}).get("status") or "useful_but_unproved"
+    if unproved_not_invalid_enabled():
+        add_unproved_lemma(base_path, goal_name, lemma, meta)
+        return
     blocking = (meta or {}).get("blocking_subgoal") or ""
     reason = f"Subgoal proof failed ({blocking or status})"
     add_invalid_lemma(base_path, goal_name, lemma, reason)
@@ -603,7 +609,7 @@ def _record_subgoal_failure_feedback(
     subgoal: str,
     parent_lemmas: List[str],
 ) -> None:
-    """Invalid child lemmas go on the parent. Situation A is library + tree only."""
+    """Invalid child lemmas go on the parent. Situation A goes to unproved_lemmas."""
     child_profile = load_routing_state(base_path, subgoal).active_profile
     blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
     child_data = load_failed_lemmas(base_path, subgoal)

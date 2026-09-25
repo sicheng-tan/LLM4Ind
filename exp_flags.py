@@ -100,7 +100,12 @@ def prompt_advice_enabled() -> bool:
 
 
 def unproved_not_invalid_enabled() -> bool:
-    """When on, a useful-but-unproved subgoal stays off invalid_lemmas (tree-only)."""
+    """Situation A: useful-but-unproved stays off invalid_lemmas (default on).
+
+    When on, blocking subgoals are recorded in ``unproved_lemmas`` (and may
+    appear under USEFUL BUT UNPROVED / LLM-hint revival). When off, they are
+    written to ``invalid_lemmas`` instead.
+    """
     return _flag_enabled("UNPROVED_NOT_INVALID")
 
 

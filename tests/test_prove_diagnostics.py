@@ -267,8 +267,11 @@ def test_subgoal_reuses_child_cache() -> None:
         kinds = [h.get("kind") for h in parent.get("repair_hints") or []]
         assert "subgoal_failed" not in kinds
         assert "need_rewrite" not in kinds
-        assert parent["unproved_lemmas"] == []
         assert parent["invalid_lemmas"] == []
+        assert len(parent["unproved_lemmas"]) == 1
+        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["unproved_lemmas"][0]["status"] == "useful_but_unproved"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
 
 
 def test_subgoal_falls_back_when_cache_missing() -> None:
@@ -287,7 +290,9 @@ def test_subgoal_falls_back_when_cache_missing() -> None:
         assert "subgoal_failed" not in [
             h.get("kind") for h in parent.get("repair_hints") or []
         ]
-        assert parent["unproved_lemmas"] == []
+        assert parent["invalid_lemmas"] == []
+        assert parent["unproved_lemmas"][0]["lemma"] == "(assert false)"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
 
 
 def test_vampire_compact_and_subgoal_cache() -> None:
@@ -315,8 +320,9 @@ def test_vampire_compact_and_subgoal_cache() -> None:
         parent = mv.load_failed_lemmas(tmp, "template")
         kinds = [h.get("kind") for h in parent.get("repair_hints") or []]
         assert "subgoal_failed" not in kinds
-        assert parent["unproved_lemmas"] == []
         assert parent["invalid_lemmas"] == []
+        assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
 
 
 def test_empty_stats_skip_hint_and_utility() -> None:
@@ -559,15 +565,18 @@ def test_blocking_lemma_only_and_unmatched_skips_unproved() -> None:
             tmp, "template", "template_2", ["lemma-a", "lemma-b"]
         )
         parent = mate.load_failed_lemmas(tmp, "template")
-        assert parent["unproved_lemmas"] == []
         assert parent["invalid_lemmas"] == []
+        assert len(parent["unproved_lemmas"]) == 1
+        assert parent["unproved_lemmas"][0]["lemma"] == "lemma-b"
+        assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_2"
 
         mate._store_cached_diag(tmp, "template_1_2", "baseline_diag", child)
         mate._record_subgoal_failure_feedback(
             tmp, "template", "template_1_2", ["lemma-a", "lemma-b"]
         )
         parent = mate.load_failed_lemmas(tmp, "template")
-        assert parent["unproved_lemmas"] == []
+        # Nested id does not map to a parent lemma; pool unchanged.
+        assert len(parent["unproved_lemmas"]) == 1
         assert parent["invalid_lemmas"] == []
 
 
