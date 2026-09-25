@@ -190,7 +190,8 @@ def test_pack_library_shows_all_and_marks_new() -> None:
 
 
 def test_pack_from_hd_without_smt_parse() -> None:
-    pack = build_observation_pack(_hd_data_with_useless())
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "on"}):
+        pack = build_observation_pack(_hd_data_with_useless())
     assert pack is not None
     assert pack["goal"]["id"] == "G1"
     assert pack["hard_axioms"]
@@ -202,6 +203,71 @@ def test_pack_from_hd_without_smt_parse() -> None:
     assert "last usefulness dump" in body
     assert "dump_complete" not in body
     assert "OPTIONAL NOTE" not in body
+
+
+def test_pack_omits_hard_axioms_when_hd_flag_off() -> None:
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "off"}):
+        pack = build_observation_pack(_hd_data_with_useless())
+    assert pack is not None
+    assert pack["hard_axioms"] == []
+    body = format_observation_prompt_body(pack)
+    assert "=== HARD AXIOMS" not in body
+    assert "=== GOAL ===" in body
+
+
+def test_pack_includes_smt_background() -> None:
+    smt = """
+(set-logic ALL)
+(declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
+(define-fun plus ((x Nat) (y Nat)) Nat (match x ((zero y) ((succ n) (succ (plus n y))))))
+(assert (forall ((n Nat)) (= (plus zero n) n)))
+(assert (forall ((n Nat)) (= (plus n zero) n)))
+; proof goal
+(assert (not (forall ((n Nat)) (= (plus n zero) n))))
+; proof goal end
+(assert (not (forall ((m Nat)) false)))
+(check-sat)
+"""
+    data = _hd_data_with_useless()
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "off"}):
+        pack = build_observation_pack(data, current_goal=GOAL, smt_content=smt)
+    assert pack is not None
+    bg = pack["background"]
+    assert any("declare-datatypes" in x for x in bg["datatypes"])
+    assert any("define-fun plus" in x for x in bg["definitions"])
+    assert any("plus zero n" in x for x in bg["axioms"])
+    assert any("plus n zero" in x for x in bg["axioms"])
+    # Goal shells / solver commands omitted from theory background.
+    assert not any("(assert (not" in x for x in bg["axioms"])
+    assert not any("check-sat" in x for x in bg["axioms"])
+    assert not any("set-logic" in x for x in bg["definitions"])
+    body = format_observation_prompt_body(pack)
+    assert "=== PROBLEM BACKGROUND (theory:" in body
+    assert "define-fun plus" in body
+    assert "=== HARD AXIOMS" not in body
+    assert "(check-sat)" not in body
+
+
+def test_extract_theory_keeps_declare_sort() -> None:
+    from feedback_llm_hints import extract_theory_background
+
+    smt = """
+(set-logic UFDT)
+(declare-sort sk_t 0)
+(declare-sort fun1 0)
+(declare-datatypes ((list 0)) (((nil) (cons (head sk_t) (tail list)))))
+(declare-fun f (sk_t) sk_t)
+(assert (forall ((x sk_t)) (= (f x) x)))
+(assert (not (forall ((x sk_t)) (= (f x) x))))
+(check-sat)
+"""
+    bg = extract_theory_background(smt)
+    assert "(declare-sort sk_t 0)" in bg["definitions"]
+    assert "(declare-sort fun1 0)" in bg["definitions"]
+    assert any("declare-datatypes" in x for x in bg["datatypes"])
+    assert any("declare-fun f" in x for x in bg["definitions"])
+    assert any("(= (f x) x)" in x for x in bg["axioms"])
+    assert not any("(assert (not" in x for x in bg["axioms"])
 
 
 def test_pack_skips_initial_and_baseline_hd() -> None:
@@ -246,7 +312,8 @@ def test_pack_filters_goal_terms_from_usefulness_hd() -> None:
     data["useless_lemma_groups"][-1]["repair_hints"][0]["hard_axiom_scores"] = {
         GOAL: 99, AX: 12,
     }
-    pack = build_observation_pack(data, current_goal=GOAL)
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "on"}):
+        pack = build_observation_pack(data, current_goal=GOAL)
     assert pack is not None
     formulas = [item["formula"] for item in pack["hard_axioms"]]
     assert _prompt_formula(AX) in formulas
@@ -299,7 +366,8 @@ def test_pack_candidates_attributed_stats_and_prove() -> None:
             }],
         },
     )
-    pack = build_observation_pack(data)
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "on"}):
+        pack = build_observation_pack(data)
     assert pack is not None
     cands = pack["previous_candidates"]
     assert cands[0]["attributed"] is True
@@ -481,21 +549,33 @@ def test_hints_prompt_has_encoding_shape_menu() -> None:
     assert "Prefer one of" not in HINTS_USER_TEMPLATE
     assert "invent a fitting shape" not in HINTS_USER_TEMPLATE
     assert "Measure-into-arithmetic" in HINTS_USER_TEMPLATE
-    assert "(>= (m x) 0)" in HINTS_USER_TEMPLATE
-    assert "(= (f x e) x)" in HINTS_USER_TEMPLATE
-    assert "(=> (not (R a b)) (Q b a))" in HINTS_USER_TEMPLATE
+    assert "(>= (len x) 0)" in HINTS_USER_TEMPLATE
+    assert "(= (plus n zero) n)" in HINTS_USER_TEMPLATE
+    assert "(=> (not (< a b)) (>= a b))" in HINTS_USER_TEMPLATE or (
+        "(=> (not (lt a b)) (leq b a))" in HINTS_USER_TEMPLATE
+    )
+    assert "(>= (m x) 0)" not in HINTS_USER_TEMPLATE
+    assert "(= (f x e) x)" not in HINTS_USER_TEMPLATE
     assert "lightly adapt" in HINTS_USER_TEMPLATE
+    assert "Drop tautologies" in HINTS_USER_TEMPLATE
+    assert "use NEW_DIRECTION" in HINTS_USER_TEMPLATE
+    assert "or NO_ACTION instead" in HINTS_USER_TEMPLATE
+    assert "verbatim copies" not in HINTS_USER_TEMPLATE
+    assert "shared function/predicate symbols" not in HINTS_USER_TEMPLATE
+    assert "unrelated identities" not in HINTS_USER_TEMPLATE
+    assert "light adaptation" not in HINTS_USER_TEMPLATE
     assert "- NO_ACTION:" in HINTS_USER_TEMPLATE
     assert "- NEW_DIRECTION:" in HINTS_USER_TEMPLATE
     assert "- REVISE_CANDIDATE:" in HINTS_USER_TEMPLATE
     assert "optional per-formula note" not in HINTS_USER_TEMPLATE
-    assert "short note explaining how that formula might help" in HINTS_USER_TEMPLATE
+    assert "Each revive entry needs a short note" in HINTS_USER_TEMPLATE
+    assert "might help the CURRENT goal" in HINTS_USER_TEMPLATE
     assert "from:" not in HINTS_USER_TEMPLATE
     assert "Do not invent pool-external formulas" not in HINTS_USER_TEMPLATE
     assert "no pool anchor" not in HINTS_USER_TEMPLATE
     assert "named benchmark" in HINTS_USER_TEMPLATE
     for banned in (
-        "rotate", "insort", "bubsort", "butlast", "mul3acc", "zip", "len x",
+        "rotate", "insort", "bubsort", "butlast", "mul3acc", "zip",
     ):
         assert banned not in HINTS_SYSTEM
         assert banned not in HINTS_USER_TEMPLATE
@@ -982,6 +1062,8 @@ if __name__ == "__main__":
     test_flag_default_off()
     test_skip_without_difficulty()
     test_pack_from_hd_without_smt_parse()
+    test_pack_omits_hard_axioms_when_hd_flag_off()
+    test_pack_includes_smt_background()
     test_pack_skips_initial_and_baseline_hd()
     test_pack_filters_goal_terms_from_usefulness_hd()
     test_pack_without_difficulty_omits_hard_axioms()

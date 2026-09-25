@@ -16,6 +16,10 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import (
+    collect_difficulty_for_feedback,
+    feedback_llm_hints_enabled,
+    feedback_llm_hints_hd_enabled,
+    formula_evidence_enabled,
     normalize_strategy_mode,
     paper_schedule_prompt,
     progress_feedback_enabled,
@@ -23,8 +27,6 @@ from exp_flags import (
     prompt_retarget_active,
     prompt_retarget_enabled,
     repair_hints_enabled,
-    formula_evidence_enabled,
-    feedback_llm_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
@@ -39,6 +41,7 @@ _FLAG_NAMES = (
     "FEEDBACK_REPAIR_HINTS",
     "FEEDBACK_FORMULA_EVIDENCE",
     "FEEDBACK_LLM_HINTS",
+    "FEEDBACK_LLM_HINTS_HD",
     "FEEDBACK_PROGRESS",
     "PROMPT_RETARGET",
     "PROMPT_ADVICE",
@@ -91,6 +94,7 @@ def test_flags_default_on() -> None:
         assert repair_hints_enabled() is True
         assert formula_evidence_enabled() is False
         assert feedback_llm_hints_enabled() is False
+        assert feedback_llm_hints_hd_enabled() is False
         assert progress_feedback_enabled() is False
         assert prompt_retarget_enabled() is True
         assert prompt_advice_enabled() is True
@@ -108,6 +112,8 @@ def test_flags_default_on() -> None:
             assert formula_evidence_enabled() is False
         with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": val}):
             assert feedback_llm_hints_enabled() is False
+        with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": val}):
+            assert feedback_llm_hints_hd_enabled() is False
         with patch.dict(os.environ, {"FEEDBACK_PROGRESS": val}):
             assert progress_feedback_enabled() is False
         with patch.dict(os.environ, {"PROMPT_RETARGET": val}):
@@ -130,6 +136,39 @@ def test_flags_default_on() -> None:
         assert formula_evidence_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}):
         assert feedback_llm_hints_enabled() is True
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "on"}):
+        assert feedback_llm_hints_hd_enabled() is True
+
+
+def test_collect_difficulty_for_feedback_consumers() -> None:
+    # Program HD path: repair on, LLM hints off → collect.
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "on",
+        "FEEDBACK_LLM_HINTS": "off",
+        "FEEDBACK_LLM_HINTS_HD": "off",
+    }):
+        assert collect_difficulty_for_feedback() is True
+    # LLM-hints-only without HD → skip dump (program HD not injected).
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "on",
+        "FEEDBACK_LLM_HINTS": "on",
+        "FEEDBACK_LLM_HINTS_HD": "off",
+    }):
+        assert collect_difficulty_for_feedback() is False
+    # LLM diagnoser wants HD → collect.
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "on",
+        "FEEDBACK_LLM_HINTS": "on",
+        "FEEDBACK_LLM_HINTS_HD": "on",
+    }):
+        assert collect_difficulty_for_feedback() is True
+    # No feedback consumer → skip.
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "off",
+        "FEEDBACK_LLM_HINTS": "off",
+        "FEEDBACK_LLM_HINTS_HD": "on",
+    }):
+        assert collect_difficulty_for_feedback() is False
 
 
 def test_resolve_prompt_pack() -> None:
@@ -503,6 +542,7 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
 
 def main() -> int:
     test_flags_default_on()
+    test_collect_difficulty_for_feedback_consumers()
     test_resolve_prompt_pack()
     test_paper_schedule_prompt()
     test_prompt_hides_disabled_feedback_sections()

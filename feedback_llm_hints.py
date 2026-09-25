@@ -4,9 +4,11 @@ Default **off**. Requires at least one failed usefulness group (so the first
 lemma-generation call is never steered by HD-only hints). After a useless
 group, the diagnoser runs only if there is an unproved revival pool **and**
 the lemma library has new ids vs the last baseline (first call compares
-against an empty library, so any proved lemma counts as a change). Difficulty
-is optional: when absent, the observation pack omits hard-axiom / hotspot
-blocks. GOAL is the current proof-node formula.
+against an empty library, so any proved lemma counts as a change). The pack
+includes a preprocessed theory background (datatypes / definitions /
+background asserts; goal omitted). HD hotspots are optional via
+``FEEDBACK_LLM_HINTS_HD`` (default off); usefulness skips ``--dump-difficulty``
+unless a feedback consumer needs it. GOAL is the current proof-node formula.
 The diagnoser chooses no_action (leave generation alone), new_direction
 (text only), or revise_candidate (pending formulas plus notes).
 """
@@ -20,7 +22,11 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from cvc5_runner import classify_difficulty_term
-from exp_flags import feedback_llm_hints_enabled, repair_hints_enabled
+from exp_flags import (
+    feedback_llm_hints_enabled,
+    feedback_llm_hints_hd_enabled,
+    repair_hints_enabled,
+)
 from exp_stats import add_llm_time, log_exp, record_llm_generation
 from llm_time_budget import invoke_configured_chat
 from obligation_tree import (
@@ -28,6 +34,7 @@ from obligation_tree import (
     load_lemma_library,
     normalize_lemma_formula,
 )
+from smt_patterns import read_sexpr, sexpr_head_args
 
 HINTS_KIND = "llm_feedback_hints"
 HINT_NO_ACTION = "no_action"
@@ -48,6 +55,25 @@ MAX_LIBRARY_SHOW = 24
 MAX_REVIVE_OUT = 4
 MAX_CANDIDATES = 12
 _HD_USEFULNESS_CONTEXTS = frozenset({"usefulness_check", "usefulness"})
+_PROOF_GOAL_BLOCK = re.compile(
+    r";\s*proof goal\s*.*?;\s*proof goal end",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_LINE_COMMENT = re.compile(r";[^\n]*")
+_THEORY_KEEP = frozenset({
+    "declare-datatypes", "declare-datatype",
+    "declare-sort",
+    "define-fun", "define-fun-rec", "define-funs-rec",
+    "declare-fun", "declare-const",
+    "assert",
+})
+_THEORY_SKIP = frozenset({
+    "set-logic", "set-option", "set-info",
+    "check-sat", "exit", "echo",
+    "push", "pop", "reset", "reset-assertions",
+    "get-model", "get-proof", "get-unsat-core", "get-info", "get-option",
+    "get-value", "get-assignment", "get-assertions",
+})
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _ANY_FENCE = re.compile(r"```(?:\w+)?\s*(.*?)\s*```", re.DOTALL)
@@ -61,6 +87,9 @@ Rules:
 - search-change stats are weak signals; for reference only.
 - Revival candidates are unproved. They may be true or false, useful or useless;
   they are not known true and not library axioms.
+- PROBLEM BACKGROUND is the theory encoding extracted from the SMT file
+  (datatypes, definitions, background asserts). The goal itself is omitted;
+  see GOAL. This is not a difficulty dump and not proof necessity.
 - The lemma library has new proved axioms. Re-evaluate the unproved revival candidates
   in that new context.
 - Choose exactly one mode:
@@ -83,20 +112,26 @@ Return ONLY one JSON object:
 - NO_ACTION: leave note/revive empty; the generator is not shown this block.
 - NEW_DIRECTION: fill note only (no revive). Tell the generator to try a new lemma shape.
   Shape examples (illustrative; other different-but-fitting shapes are fine):
-  1) Measure-into-arithmetic. Recursive m:T->Int/Real (base ~0, step ~1+m(tail))
-     often needs (forall ((x T)) (>= (m x) 0)). If LAST is already a homomorphism
-     for m and GOAL still uses m in arithmetic, try this domain fact — do not
-     strengthen the same homomorphism.
+  1) Measure-into-arithmetic. Common measures like len/size (nil->0, cons->1+...)
+     often need (forall ((x Lst)) (>= (len x) 0)). If LAST is already a
+     homomorphism for len (e.g. len(append)=len+len) and GOAL still uses len
+     in arithmetic, try this domain fact — do not strengthen the same
+     homomorphism.
   2) Missing unit of a recursive binary op. Axioms often give the
-     constructor-side unit; the other side (forall ((x T)) (= (f x e) x)) is a
-     different shape, not more associativity/commutativity.
-  3) Bridge two order encodings only if BOTH comparison symbols appear:
-     (=> (not (R a b)) (Q b a)). Skip if the file has only one comparison.
+     constructor-side unit, e.g. (plus zero n)=n; the other side
+     (forall ((n Nat)) (= (plus n zero) n)) is a different shape, not more
+     associativity/commutativity.
+  3) Bridge two order encodings only if BOTH comparison symbols appear,
+     e.g. (=> (not (< a b)) (>= a b)) or (=> (not (lt a b)) (leq b a)).
+     Skip if the file has only one comparison.
   Quote at most one adapted example formula. Do not suggest algorithm
   equivalences, language-algebra identities, or named benchmark lemmas.
 - REVISE_CANDIDATE: put up to {max_revive} non-empty formulas in revive (copy or
-  lightly adapt from REVIVAL CANDIDATES when helpful). Each revive entry needs a
-  short note explaining how that formula might help the CURRENT goal.
+  lightly adapt from REVIVAL CANDIDATES when helpful). Drop tautologies,
+  formulas that repeat the GOAL up to renaming, and lemmas whose symbols are
+  unrelated to the goal. If nothing in the pool is relevant, use NEW_DIRECTION
+  or NO_ACTION instead. Each revive entry needs a short note explaining how
+  that formula might help the CURRENT goal.
 LAST CANDIDATE LEMMAS are the previous generation round.
 REVIVAL CANDIDATES are historical unproved lemmas, not only last round.
 
@@ -490,33 +525,113 @@ def _current_node_goal(
     return ""
 
 
+def _smt_without_goal_block(smt_content: str) -> str:
+    text = _PROOF_GOAL_BLOCK.sub("\n", smt_content or "")
+    return _LINE_COMMENT.sub("", text)
+
+
+def _is_negated_goal_assert(expr: str) -> bool:
+    """True for ``(assert (not ...))`` forms often used as the proof goal."""
+    head, args = sexpr_head_args(expr)
+    if str(head or "").strip() != "assert" or not args:
+        return False
+    inner_head, _inner_args = sexpr_head_args(str(args[0]))
+    return str(inner_head or "").strip() == "not"
+
+
+def extract_theory_background(smt_content: Optional[str]) -> Dict[str, List[str]]:
+    """Extract datatypes / definitions / background asserts from an SMT file.
+
+    Drops the ``; proof goal ... ; proof goal end`` block, solver commands
+    (``set-logic``, ``check-sat``, …), and ``(assert (not …))`` goal shells.
+    Keeps full declarations with **no** per-item soft caps or truncation —
+    hint calls are rare, so completeness beats token trimming here.
+    """
+    empty: Dict[str, List[str]] = {
+        "datatypes": [], "definitions": [], "axioms": [],
+    }
+    if not (smt_content or "").strip():
+        return empty
+    body = _smt_without_goal_block(smt_content or "")
+    datatypes: List[str] = []
+    definitions: List[str] = []
+    axioms: List[str] = []
+    seen: Set[str] = set()
+    i = 0
+    while True:
+        expr, next_i = read_sexpr(body, i)
+        if expr is None:
+            break
+        if next_i <= i:
+            break
+        i = next_i
+        if not str(expr).startswith("("):
+            continue
+        head, _args = sexpr_head_args(str(expr))
+        head = str(head or "").strip()
+        if head in _THEORY_SKIP or head not in _THEORY_KEEP:
+            continue
+        if head == "assert" and _is_negated_goal_assert(str(expr)):
+            continue
+        compact = normalize_lemma_formula(str(expr))
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        if head in ("declare-datatypes", "declare-datatype"):
+            datatypes.append(compact)
+        elif head == "assert":
+            axioms.append(compact)
+        else:
+            # declare-sort / declare-fun / declare-const / define-fun*
+            definitions.append(compact)
+    return {
+        "datatypes": datatypes,
+        "definitions": definitions,
+        "axioms": axioms,
+    }
+
+
+def _theory_background_nonempty(background: Optional[dict]) -> bool:
+    if not isinstance(background, dict):
+        return False
+    return bool(
+        background.get("datatypes")
+        or background.get("definitions")
+        or background.get("axioms")
+    )
+
+
 def build_observation_pack(
     failed_data,
     *,
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
     current_goal: Optional[str] = None,
+    smt_content: Optional[str] = None,
 ):
-    """Pack goal / optional hard axioms / last candidates / library / revive pool.
+    """Pack goal / background / optional hard axioms / last / library / revive.
 
-    Difficulty is optional. None only when there is no goal, no last group,
-    no library delta to show, and no revival pool. Caller should also gate
-    on ``llm_hints_eligible``. Goal comes from the current proof node
-    (``current_goal`` or the obligation-tree root), not from HD.
+    Difficulty is optional (``FEEDBACK_LLM_HINTS_HD``). None only when there is
+    no goal, no background, no last group, no library, and no revival pool.
+    Caller should also gate on ``llm_hints_eligible``. Goal comes from the
+    current proof node (``current_goal`` or the obligation-tree root), not
+    from HD.
     """
-    hd = _latest_hd_hint(failed_data) or {}
+    include_hd = feedback_llm_hints_hd_enabled()
+    hd = (_latest_hd_hint(failed_data) or {}) if include_hd else {}
     base = failed_data.get("baseline_diag") if isinstance(failed_data.get("baseline_diag"), dict) else {}
     goal = _current_node_goal(failed_data, current_goal=current_goal, hd=hd)
     axioms: List[str] = []
-    for raw in (hd.get("hard_axioms") or []):
-        term = str(raw or "")
-        if not term:
-            continue
-        if classify_difficulty_term(term, goal) != "axiom":
-            continue
-        axioms.append(term)
-        if len(axioms) >= MAX_AXIOMS:
-            break
+    if include_hd:
+        for raw in (hd.get("hard_axioms") or []):
+            term = str(raw or "")
+            if not term:
+                continue
+            if classify_difficulty_term(term, goal) != "axiom":
+                continue
+            axioms.append(term)
+            if len(axioms) >= MAX_AXIOMS:
+                break
 
     scores = hd.get("hard_axiom_scores") if isinstance(hd.get("hard_axiom_scores"), dict) else {}
     rarely = {str(a) for a in (hd.get("rarely_instantiated") or []) if a}
@@ -539,7 +654,7 @@ def build_observation_pack(
     group = groups[-1] if groups and isinstance(groups[-1], dict) else None
     dump_complete = bool(group.get("difficulty_dump_complete")) if group else bool(base.get("difficulty"))
     prove_lookup = _prove_status_lookup(failed_data)
-    attributed = _attributed_id_set(group)
+    attributed = _attributed_id_set(group) if include_hd else set()
 
     candidates = []
     if group:
@@ -574,8 +689,10 @@ def build_observation_pack(
 
     lib_items = _library_show_items(library or [], prev_ids=prev_library_ids)
     revive_pool = _revival_candidate_items(failed_data)
+    background = extract_theory_background(smt_content)
     if not (
         goal
+        or _theory_background_nonempty(background)
         or hard_axioms
         or candidates
         or lib_items
@@ -602,6 +719,7 @@ def build_observation_pack(
             "id": "G1",
             "formula": _prompt_formula(goal) if goal else "",
         },
+        "background": background,
         "axioms": [
             {"id": f"A{i}", "formula": ax["formula"]}
             for i, ax in enumerate(hard_axioms, 1)
@@ -624,6 +742,24 @@ def format_observation_prompt_body(pack):
     goal = pack.get("goal") or {}
     lines.append("=== GOAL ===")
     lines.append(f"  {goal.get('formula') or '(unknown)'}")
+
+    background = pack.get("background") or {}
+    if _theory_background_nonempty(background):
+        lines.append("")
+        lines.append(
+            "=== PROBLEM BACKGROUND (theory: datatypes / definitions / axioms; goal omitted) ==="
+        )
+        for label, key in (
+            ("datatypes", "datatypes"),
+            ("definitions", "definitions"),
+            ("axioms", "axioms"),
+        ):
+            items = background.get(key) or []
+            if not items:
+                continue
+            lines.append(f"  {label}:")
+            for item in items:
+                lines.append(f"    - {item}")
 
     hard = pack.get("hard_axioms") or []
     axioms = pack.get("axioms") or []
@@ -1032,15 +1168,16 @@ def maybe_refresh_llm_hints(
     save_failed_lemmas,
     backend: str = "cvc5",
     current_goal: Optional[str] = None,
+    smt_content: Optional[str] = None,
 ) -> Optional[dict]:
     """Run LLM-hints when flag is on and usefulness failed.
 
     Skips Vampire, fewer than ``MIN_USELESS_GROUPS_FOR_HINTS`` groups,
     missing unproved pool or missing library growth vs the last baseline
     (first call: vs empty library),
-    and when stored hints already match the current attempt_id. Difficulty
-    is optional (HD omitted from the pack). ``current_goal`` is the formula
-    of the node being proved.
+    and when stored hints already match the current attempt_id. HD hotspots
+    follow ``FEEDBACK_LLM_HINTS_HD``. ``current_goal`` is the formula of the
+    node being proved; ``smt_content`` supplies the theory background.
     """
     if not feedback_llm_hints_enabled():
         return None
@@ -1064,6 +1201,7 @@ def maybe_refresh_llm_hints(
         library=library,
         prev_library_ids=baseline,
         current_goal=current_goal,
+        smt_content=smt_content,
     )
     if pack is None:
         _persist_library_baseline(

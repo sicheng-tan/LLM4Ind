@@ -72,6 +72,8 @@ def setup_environment():
     feedback_formula_evidence = os.getenv('FEEDBACK_FORMULA_EVIDENCE', 'off')
     # Default off: LLM interprets difficulty observations before lemma generation.
     feedback_llm_hints = os.getenv('FEEDBACK_LLM_HINTS', 'off')
+    # Default off: HD hotspots in the LLM diagnoser pack (+ usefulness dump).
+    feedback_llm_hints_hd = os.getenv('FEEDBACK_LLM_HINTS_HD', 'off')
     # 暂时弃用 (default off): 3s sidecar + progress lemmas; do not enable casually.
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
@@ -142,6 +144,7 @@ def setup_environment():
         'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
         'FEEDBACK_FORMULA_EVIDENCE': feedback_formula_evidence,
         'FEEDBACK_LLM_HINTS': feedback_llm_hints,
+        'FEEDBACK_LLM_HINTS_HD': feedback_llm_hints_hd,
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,

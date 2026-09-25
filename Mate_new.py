@@ -76,6 +76,7 @@ from obligation_tree import (
 )
 from exp_flags import (
     ancestor_prompt_enabled,
+    collect_difficulty_for_feedback,
     normalize_strategy_mode,
     paper_schedule_prompt,
     progress_feedback_enabled,
@@ -1311,7 +1312,7 @@ def verify_combined_lemmas(
         timeout=combined_timeout,
         state=state,
         collect_stats=True,
-        collect_difficulty=True,
+        collect_difficulty=collect_difficulty_for_feedback(),
         **extra,
     )
     record_solver_attempt(
@@ -1798,6 +1799,7 @@ def generate_lemmas_with_llm(
             save_failed_lemmas=save_failed_lemmas,
             backend="cvc5",
             current_goal=formula,
+            smt_content=smt_content,
         )
     messages, feedback = create_prompt(
         smt_content, prompt_strategy, base_path, goal_name, folder_path,

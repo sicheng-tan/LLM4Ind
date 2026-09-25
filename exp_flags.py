@@ -3,7 +3,9 @@
 Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
 ``FEEDBACK_FORMULA_EVIDENCE`` defaults off (no ``-o lemmas`` samples).
 ``FEEDBACK_LLM_HINTS`` defaults off (extra LLM call that proposes hints from
-solver observations before lemma generation; requires difficulty).
+solver observations before lemma generation). ``FEEDBACK_LLM_HINTS_HD``
+defaults off (diagnoser omits HD hotspots; usefulness skips difficulty dump
+unless another consumer needs it).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
@@ -67,11 +69,35 @@ def feedback_llm_hints_enabled() -> bool:
     Default **off**. Requires ≥1 useless group (skips first lemma generation)
     and an opportunity (unproved pool **and** library growth vs the last
     baseline; the first call compares against an empty library). Difficulty is
-    optional. Injects under LAST ATTEMPT only when the diagnoser produced a
-    block (new_direction / revise_candidate). Program HD / repair hints stay
-    out of the generation prompt while this flag is on.
+    optional (see ``FEEDBACK_LLM_HINTS_HD``). Injects under LAST ATTEMPT only
+    when the diagnoser produced a block (new_direction / revise_candidate).
+    Program HD / repair hints stay out of the generation prompt while this
+    flag is on.
     """
     return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
+
+
+def feedback_llm_hints_hd_enabled() -> bool:
+    """Put usefulness HD hotspots into the LLM diagnoser observation pack.
+
+    Default **off**. When off, the diagnoser omits HARD AXIOMS. Use with
+    ``collect_difficulty_for_feedback`` so usefulness skips
+    ``--dump-difficulty`` unless another consumer needs HD.
+    """
+    return _flag_enabled("FEEDBACK_LLM_HINTS_HD", default="off")
+
+
+def collect_difficulty_for_feedback() -> bool:
+    """True when a feedback consumer needs CVC ``--dump-difficulty``.
+
+    Who consumes HD decides collection:
+    - ``FEEDBACK_LLM_HINTS=on``: only if ``FEEDBACK_LLM_HINTS_HD=on``
+      (program HD is not injected while LLM hints are on).
+    - otherwise: ``FEEDBACK_REPAIR_HINTS`` (program LAST ATTEMPT HD path).
+    """
+    if feedback_llm_hints_enabled():
+        return feedback_llm_hints_hd_enabled()
+    return repair_hints_enabled()
 
 
 def progress_feedback_enabled() -> bool:
