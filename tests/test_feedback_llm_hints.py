@@ -18,6 +18,8 @@ os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import feedback_llm_hints_enabled
 from feedback_llm_hints import (
+    HINTS_SYSTEM,
+    HINTS_USER_TEMPLATE,
     build_observation_pack,
     format_llm_hints_for_prompt,
     format_observation_prompt_body,
@@ -380,17 +382,20 @@ def test_parse_plain_and_prompt_block() -> None:
 
 def test_parse_note_and_revive_json() -> None:
     cand = "(forall ((n Nat)) (= (plus n zero) n))"
-    invented = "(forall ((n Nat)) false)"
+    adapted = "(forall ((n Nat)) (= (plus zero n) n))"
+    empty = "   "
     pool = [{"id": "R1", "formula": cand, "status": "timeout"}]
     raw = json.dumps({
         "mode": "REVISE_CANDIDATE",
         "note": (
             "Library now has plus-succ. The zero-case candidate is still unproved; "
-            "decide whether it fits the CURRENT goal. R1"
+            "decide whether it fits the CURRENT goal."
         ),
         "revive": [
             {"formula": cand, "note": "zero case; still unproved after plus-succ landed"},
-            {"formula": invented, "note": "invented"},
+            {"formula": adapted, "note": "left-unit adaptation"},
+            {"formula": empty, "note": "should drop"},
+            {"id": "R1", "note": "id-only without formula should drop"},
         ],
     })
     diag = parse_llm_feedback_hints(raw, revival_candidates=pool)
@@ -398,10 +403,12 @@ def test_parse_note_and_revive_json() -> None:
     assert diag["mode"] == "revise_candidate"
     assert "plus-succ" in diag["text"]
     assert "R1" not in diag["text"]
-    assert len(diag["revive"]) == 1
+    assert len(diag["revive"]) == 2
     assert diag["revive"][0]["formula"] == cand
     assert diag["revive"][0]["note"] == "zero case; still unproved after plus-succ landed"
+    assert diag["revive"][1]["formula"] == adapted
     assert "action" not in diag["revive"][0]
+    assert "id" not in diag["revive"][0]
     txt = format_llm_hints_for_prompt({"hints": diag})
     assert "pending candidates" in txt
     assert "pending (unproved; not assumed true or useful)" in txt
@@ -410,20 +417,35 @@ def test_parse_note_and_revive_json() -> None:
     assert "[weaken]" not in txt
     assert "[retry]" not in txt
     assert cand in txt
+    assert adapted in txt
     assert "R1" not in txt
 
 
-def test_parse_revive_still_accepts_pool_id() -> None:
-    cand = "(forall ((n Nat)) (= (plus n zero) n))"
-    pool = [{"id": "R1", "formula": cand, "status": "timeout"}]
+def test_parse_revive_accepts_adapted_formula() -> None:
+    adapted = "(forall ((n Nat)) (= (plus zero n) n))"
     raw = json.dumps({
         "mode": "REVISE_CANDIDATE",
-        "note": "The plus-zero candidate is still open now that plus-succ is in the library.",
-        "revive": [{"id": "R1", "note": "library may supply the missing succ step"}],
+        "note": "Flip the unit to the left argument to fit the current goal better.",
+        "revive": [{"formula": adapted, "note": "left unit form"}],
     })
-    diag = parse_llm_feedback_hints(raw, revival_candidates=pool)
-    assert diag["revive"][0]["formula"] == cand
-    assert "succ step" in diag["revive"][0]["note"]
+    diag = parse_llm_feedback_hints(raw)
+    assert diag is not None
+    assert diag["mode"] == "revise_candidate"
+    assert len(diag["revive"]) == 1
+    assert diag["revive"][0]["formula"] == adapted
+
+
+def test_parse_revive_drops_empty_formula() -> None:
+    raw = json.dumps({
+        "mode": "REVISE_CANDIDATE",
+        "note": "Only empty revive entries should not count as a revise payload.",
+        "revive": [{"formula": "", "note": "empty"}, {"id": "R1", "note": "no formula"}],
+    })
+    diag = parse_llm_feedback_hints(raw)
+    # Empty revive cannot stay REVISE; long note falls back to NEW_DIRECTION.
+    assert diag is not None
+    assert diag["mode"] == "new_direction"
+    assert diag["revive"] == []
 
 
 def test_no_action_not_injected() -> None:
@@ -441,6 +463,42 @@ def test_no_action_not_injected() -> None:
     txt = format_llm_hints_for_prompt({"hints": diag})
     assert txt == ""
     assert "SOLVER HINTS" not in txt
+
+
+def test_revive_soft_caps() -> None:
+    from feedback_llm_hints import MAX_REVIVE_CANDIDATES, MAX_REVIVE_OUT
+
+    assert MAX_REVIVE_CANDIDATES == 16
+    assert MAX_REVIVE_OUT == 4
+    assert f"put up to {MAX_REVIVE_OUT}" in HINTS_USER_TEMPLATE
+
+
+def test_hints_prompt_has_encoding_shape_menu() -> None:
+    assert "explain a different lemma shape in the note" in HINTS_SYSTEM
+    assert "Tell the generator to try a new lemma shape" in HINTS_USER_TEMPLATE
+    assert "different-but-fitting" in HINTS_USER_TEMPLATE
+    assert "Shape examples" in HINTS_USER_TEMPLATE
+    assert "Prefer one of" not in HINTS_USER_TEMPLATE
+    assert "invent a fitting shape" not in HINTS_USER_TEMPLATE
+    assert "Measure-into-arithmetic" in HINTS_USER_TEMPLATE
+    assert "(>= (m x) 0)" in HINTS_USER_TEMPLATE
+    assert "(= (f x e) x)" in HINTS_USER_TEMPLATE
+    assert "(=> (not (R a b)) (Q b a))" in HINTS_USER_TEMPLATE
+    assert "lightly adapt" in HINTS_USER_TEMPLATE
+    assert "- NO_ACTION:" in HINTS_USER_TEMPLATE
+    assert "- NEW_DIRECTION:" in HINTS_USER_TEMPLATE
+    assert "- REVISE_CANDIDATE:" in HINTS_USER_TEMPLATE
+    assert "optional per-formula note" not in HINTS_USER_TEMPLATE
+    assert "short note explaining how that formula might help" in HINTS_USER_TEMPLATE
+    assert "from:" not in HINTS_USER_TEMPLATE
+    assert "Do not invent pool-external formulas" not in HINTS_USER_TEMPLATE
+    assert "no pool anchor" not in HINTS_USER_TEMPLATE
+    assert "named benchmark" in HINTS_USER_TEMPLATE
+    for banned in (
+        "rotate", "insort", "bubsort", "butlast", "mul3acc", "zip", "len x",
+    ):
+        assert banned not in HINTS_SYSTEM
+        assert banned not in HINTS_USER_TEMPLATE
 
 
 def test_new_direction_text_only() -> None:
@@ -933,7 +991,8 @@ if __name__ == "__main__":
     test_pack_prove_invalid_and_unknown()
     test_parse_plain_and_prompt_block()
     test_parse_note_and_revive_json()
-    test_parse_revive_still_accepts_pool_id()
+    test_parse_revive_accepts_adapted_formula()
+    test_parse_revive_drops_empty_formula()
     test_no_action_not_injected()
     test_new_direction_text_only()
     test_legacy_hold_not_injected()

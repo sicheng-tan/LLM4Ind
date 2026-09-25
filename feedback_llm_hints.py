@@ -40,12 +40,12 @@ MAX_HINT_CHARS = 900
 MIN_HINT_CHARS = 24
 # Block HD-only steering of the first lemma generation.
 MIN_USELESS_GROUPS_FOR_HINTS = 1
-# Soft ceilings above full706 llmhint maxima (library≤18, cum-unique
-# unproved proxy≤15). Pathological blow-ups still truncated; prefer the
-# newest entries, not random sampling.
-MAX_REVIVE_CANDIDATES = 24
+# Soft ceilings for diagnoser context / inject size. Overflow keeps the
+# newest entries (not random sampling). Pool can be larger than OUT so the
+# diagnoser sees history; OUT stays near the generator's 1–3 lemma budget.
+MAX_REVIVE_CANDIDATES = 16
 MAX_LIBRARY_SHOW = 24
-MAX_REVIVE_OUT = 24
+MAX_REVIVE_OUT = 4
 MAX_CANDIDATES = 12
 _HD_USEFULNESS_CONTEXTS = frozenset({"usefulness_check", "usefulness"})
 
@@ -60,15 +60,16 @@ Rules:
 - difficulty ranks runtime hotspots; not proof necessity.
 - search-change stats are weak signals; for reference only.
 - Revival candidates are unproved. They may be true or false, useful or useless;
-  they are not known true and not library axioms. Do not invent formulas.
+  they are not known true and not library axioms.
 - The lemma library has new proved axioms. Re-evaluate the unproved revival candidates
   in that new context.
 - Choose exactly one mode:
   NO_ACTION: generation should proceed as usual; do not steer it.
   NEW_DIRECTION: none of the revival candidates are worth bringing back;
     explain a different lemma shape in the note.
-  REVISE_CANDIDATE: select a few pool formulas as unproved references;
-    the lemma generator decides how to use them.
+  REVISE_CANDIDATE: put a few unproved reference formulas in revive
+    (copy or lightly adapt from the revival pool); the lemma generator
+    decides how to use them.
 - When you mention a formula, quote it in full. Never refer to candidates by id."""
 
 HINTS_USER_TEMPLATE = """From the observations below, choose a mode and write a short note.
@@ -79,11 +80,23 @@ Return ONLY one JSON object:
   "note": "shown to the lemma generator unless mode is NO_ACTION",
   "revive": [{{"formula": "(forall ...)", "note": "how this formula might help"}}]
 }}
-NO_ACTION: leave note/revive empty; the generator is not shown this block.
-NEW_DIRECTION: fill note only (no revive). Tell the generator to try a new shape.
-REVISE_CANDIDATE: copy formulas verbatim from REVIVAL CANDIDATES
-(at most {max_revive}; prefer the most relevant); optional per-formula note.
-Unselected pool formulas are omitted.
+- NO_ACTION: leave note/revive empty; the generator is not shown this block.
+- NEW_DIRECTION: fill note only (no revive). Tell the generator to try a new lemma shape.
+  Shape examples (illustrative; other different-but-fitting shapes are fine):
+  1) Measure-into-arithmetic. Recursive m:T->Int/Real (base ~0, step ~1+m(tail))
+     often needs (forall ((x T)) (>= (m x) 0)). If LAST is already a homomorphism
+     for m and GOAL still uses m in arithmetic, try this domain fact — do not
+     strengthen the same homomorphism.
+  2) Missing unit of a recursive binary op. Axioms often give the
+     constructor-side unit; the other side (forall ((x T)) (= (f x e) x)) is a
+     different shape, not more associativity/commutativity.
+  3) Bridge two order encodings only if BOTH comparison symbols appear:
+     (=> (not (R a b)) (Q b a)). Skip if the file has only one comparison.
+  Quote at most one adapted example formula. Do not suggest algorithm
+  equivalences, language-algebra identities, or named benchmark lemmas.
+- REVISE_CANDIDATE: put up to {max_revive} non-empty formulas in revive (copy or
+  lightly adapt from REVIVAL CANDIDATES when helpful). Each revive entry needs a
+  short note explaining how that formula might help the CURRENT goal.
 LAST CANDIDATE LEMMAS are the previous generation round.
 REVIVAL CANDIDATES are historical unproved lemmas, not only last round.
 
@@ -747,44 +760,21 @@ def _text_from_legacy_json(data: dict) -> str:
     return " ".join(parts).strip()
 
 
-def _filter_revive_list(
-    raw_items: Any,
-    allowed: Sequence[Any],
-) -> List[Dict[str, str]]:
-    """Keep revive formulas that are in the offered pool.
+def _extract_revive_list(raw_items: Any) -> List[Dict[str, str]]:
+    """Extract non-empty revive formulas; no pool-membership filter.
 
-    Legacy ``action: hold`` is dropped (same as unselected). Other action
-    fields are ignored.
+    Legacy ``action: hold`` entries are omitted. Empty formulas are skipped.
+    Dedup by normalized formula text; soft-cap at ``MAX_REVIVE_OUT``.
     """
     if not isinstance(raw_items, list):
         return []
-    by_id: Dict[str, dict] = {}
-    by_norm: Dict[str, dict] = {}
-    for cand in allowed or []:
-        if isinstance(cand, dict):
-            formula = str(cand.get("formula") or "").strip()
-            cid = str(cand.get("id") or "").strip()
-        else:
-            formula = str(cand or "").strip()
-            cid = ""
-        if not formula:
-            continue
-        rec = {
-            "id": cid,
-            "formula": _prompt_formula(formula),
-        }
-        if cid:
-            by_id[cid] = rec
-        by_norm[normalize_lemma_formula(formula)] = rec
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for item in raw_items:
         formula = ""
-        cid = ""
         action = ""
         why = ""
         if isinstance(item, dict):
-            cid = str(item.get("id") or "").strip()
             formula = str(item.get("formula") or "").strip()
             action = str(item.get("action") or "").strip().lower()
             why = str(item.get("note") or item.get("why") or item.get("reason") or "").strip()
@@ -792,21 +782,14 @@ def _filter_revive_list(
             formula = str(item or "").strip()
         if action == "hold":
             continue
-        match = None
-        if cid and cid in by_id:
-            match = by_id[cid]
-        elif formula:
-            match = by_norm.get(normalize_lemma_formula(formula))
-        if not match:
+        out_formula = _prompt_formula(formula)
+        if not out_formula:
             continue
-        key = normalize_lemma_formula(match["formula"])
+        key = normalize_lemma_formula(out_formula)
         if key in seen:
             continue
         seen.add(key)
-        rec = {
-            "id": match.get("id") or cid,
-            "formula": match["formula"],
-        }
+        rec: Dict[str, str] = {"formula": out_formula}
         if why:
             rec["note"] = why[:240]
         out.append(rec)
@@ -895,8 +878,9 @@ def parse_llm_feedback_hints(
         note = text
 
     cleaned = _normalize_hint_text(note)
-    allowed = list(revival_candidates or [])
-    revive = _filter_revive_list(revive_raw, allowed) if allowed else []
+    # revival_candidates kept for call-site compat; revive list is not filtered to it.
+    _ = revival_candidates
+    revive = _extract_revive_list(revive_raw)
     mode = _normalize_hint_mode(
         mode_raw, n_revive=len(revive), has_text=len(cleaned) >= MIN_HINT_CHARS,
     )

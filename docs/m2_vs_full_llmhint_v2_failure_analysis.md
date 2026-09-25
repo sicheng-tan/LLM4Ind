@@ -244,6 +244,62 @@ REVISE 仍禁止用此菜单发明池外公式。NEW_DIRECTION 允许 0–1 条�
 提示词三类负责播种规则不好写的情况：缺侧幺元、双序桥、以及「LAST 已是同态 → 转定义域」的**转向政策**。  
 单独改提示词、不修门控：v2 已证明调用次数为 0，无效。
 
+### 6.5 REVISE_CANDIDATE：接近但不一致时怎么选池
+
+NEW_DIRECTION 管的是「形状整类错了」。日志里另一类失败是：**骨架已经接近目标或接近库里已证事实，只差守卫、变元个数、或把谓词举到 combiner 上**，生成器却去写了一条平行但无用的变体（或把特例写死）。这时应 `REVISE_CANDIDATE`：从复活池**原文挑公式**当未证参考，而不是换形状、也不是编池外引理。
+
+前提：池非空（P0 写入 unproved）。池空时这些场景触发不了，应走 NEW_DIRECTION / fallback，不要假装 REVISE。
+
+**分析层共性（不点名基准引理）：**
+
+| 场景 | 接近但不一致时日志长什么样 | 编码层含义 | 诊断该做什么 |
+|---|---|---|---|
+| **G1 守卫与定义对齐** | 池/LAST 与某条 rewrite 公理同骨架，只差有无 `(=> (guard …) …)`；或 GOAL 在 `Int` 上调了只对 `n≥0` 展开的函数 | 许多递归公理带定义域守卫；少守卫会 invalid，多守卫会证不出 | 复活那条骨架相同的；note 写「守卫与定义该函数的公理一致」，不要新骨架 |
+| **G2 特例 vs 全称** | LAST 已证 `Φ[x,x]` 或 `Φ[x,e]`（单位/对角）；池里有（或失败子目标是）`Φ[x,y]` | 生成器常先写对角/单位实例；父目标是二元全称 | 复活更一般的池公式；不要再生成另一条对角恒等式 |
+| **G3 谓词举到 combiner** | 库里已有原子 `P(x)`（定义域、序、不变量）；失败的是 `P(x)∧P(y)⇒P(combine x y)` 或 `P(g(x))` | 原子事实进不了算术/拼接，需要同一 `P` 在文件已有 combiner 上的闭包 | 复活闭包型池公式；禁止把 `P` 换成另一个测度/不变量 |
+| **G4 同一算子的另一代数律** | 池里是 `f` 的交换（或结合）；GOAL/卡住点需要同一 `f` 的另一律，或 `f` 与文件里另一个同义编码（如 Peano `plus` vs `+`）对齐 | 不是换函数，是同一符号的定律族 | 只复活谈 **同一个** `f` 的池公式 |
+| **G5 构造子一刀 vs 整结构** | LAST 是对 `cons`/`succ` 的一步展开；GOAL 是对 `append`/`plus` 等导出算子的全称（或反过来） | 差在归纳切面，函数族相同 | 复活「同头符号、量化结构更接近 GOAL」的那条；丢掉只对单个构造子、且已证仍无用的 |
+| **G6 近重复 / 退化** | 池公式 α 等价于 GOAL、或恒真（两边相同项）、或只改了绑定变元 | 生成器在绕 same-as-goal / 空强化 | **不要复活**；若池里没有更一般的变体 → NEW_DIRECTION 或 NO_ACTION |
+
+**不要做成 REVISE 菜单的：** 算法互等、语言代数、换一个辅助函数名再写一套交换律——那是新形状或深搜索，属 NEW_DIRECTION / 有用性超时，不是「改一条接近的未证公式」。
+
+**和 NEW_DIRECTION 的分界（写进诊断规则即可）：**
+
+- 池公式与 GOAL/LAST **共享头函数或共享已证谓词 P**，且差异可用上表 G1–G5 之一描述 → REVISE。  
+- 需要的形状在池里不存在（定义域 vs 同态、幺元 vs assoc、序桥 vs 算术）→ NEW_DIRECTION。  
+- LAST 已在正确形状上、池里没有更一般/对齐守卫的公式 → NO_ACTION。
+
+示意块（与 §6.3 并列，可进 system；仍用元变量，不出现基准函数名）：
+
+```text
+REVISE_CANDIDATE: copy pool formulas verbatim (they are unproved).
+Use this only if some pool formula is the SAME SHAPE as the goal or
+LAST, differing by a local mismatch — not a new lemma family.
+
+Prefer a pool formula when it matches one of:
+- Guard alignment: same skeleton as a defining axiom / LAST, but the
+  hypothesis guard disagrees with those axioms (too few or too many).
+- General vs instance: LAST (or a proved library lemma) is Φ[x,x] or
+  Φ[x,unit]; a pool formula is Φ[x,y] and the GOAL quantifies the extra
+  variable.
+- Lift a library predicate: library already has P(x); a pool formula is
+  P on a combiner/constructor that already appears in the file
+  (P(x)∧P(y)⇒P(combine x y) or P(g(x))). Do not switch to a different P.
+- Same operator, other law: pool speaks about f; GOAL needs another
+  equation for the same f (assoc vs comm, or two encodings of f in this
+  file). Do not revive lemmas whose head symbol is a different function.
+- Cut alignment: pool and LAST share the head symbol; one is a
+  constructor-step identity, the other matches the GOAL's derived
+  operator (append/plus/…). Keep the one closer to the GOAL's quantifiers.
+
+Do NOT revive: formulas α-equivalent to the GOAL, tautologies
+(lhs = lhs), or formulas that only rename binders.
+If no pool formula fits the above, use NEW_DIRECTION or NO_ACTION;
+do not invent a formula that is not in the pool.
+```
+
+**实现价值：** 低于 P0（没有池则 G1–G5 全空），但高于「只加 NEW_DIRECTION 散文」。它专门打「生成器和标准证明在同一函数上擦肩而过」——有用性已部分成功、子目标失败留下接近公式的路径。对排序互等 / 正则 / 三元乘法深链仍然帮助有限。
+
 ---
 
 ## 7. 基于当前体系的优化（按优先级）
@@ -262,7 +318,7 @@ REVISE 仍禁止用此菜单发明池外公式。NEW_DIRECTION 允许 0–1 条�
 
 ### P2 — 提示词与生成契约
 
-7. NEW_DIRECTION 只加 §6.3 的三类编码示意（元变量），禁止把案例分析中的名引理写进政策。限制 note 长度。  
+7. NEW_DIRECTION 用 §6.3 三类编码示意；REVISE 用 §6.5 的 G1–G6（接近但不一致时如何从池里挑）。均用元变量，禁止名引理。限制 note 长度。  
 8. LAST ATTEMPT 在无 SOLVER HINTS 时保留「kept 已在库中，请换形状」；换形状的含义指向 §6.2，而不是再 refine 同一公式。
 
 ### P3 — 双边 88 题（hint 不是主攻）
