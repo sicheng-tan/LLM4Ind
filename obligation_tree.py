@@ -87,6 +87,24 @@ def harvest_retry_timeout_s() -> int:
         return 2
 
 
+def root_finish_prove_timeout_s() -> int:
+    """Root-only re-prove after LLM attempts fail.
+
+    Default **120**. Uses ``perform_initial_verification`` (injects the
+    lemma library when that flag is on). The longer budget is the point:
+    no library-growth gate. Set ``ROOT_FINISH_PROVE_TIMEOUT=0`` / ``off``
+    to disable. Call sites also cap by remaining task budget.
+    """
+    raw = os.getenv("ROOT_FINISH_PROVE_TIMEOUT", "120")
+    token = str(raw).strip().lower()
+    if token in _OFF_VALUES or token == "":
+        return 0
+    try:
+        return max(0, int(float(token)))
+    except (TypeError, ValueError):
+        return 120
+
+
 def obligation_tree_enabled() -> bool:
     """Whether the last well-formed obligation tree is recorded and shown in the prompt."""
     return _flag_enabled("OBLIGATION_TREE")

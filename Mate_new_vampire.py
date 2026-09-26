@@ -67,6 +67,7 @@ from obligation_tree import (
     make_goal_tree,
     materialize_smt_with_library,
     obligation_tree_enabled,
+    root_finish_prove_timeout_s,
     solver_smt_content,
     HARVEST_CVC_PROFILES,
     HARVEST_DISPATCH_KEY,
@@ -1286,6 +1287,49 @@ def perform_initial_verification(
             result.status, result.elapsed,
         )
     return False
+
+
+def maybe_root_finish_prove(
+    base_path: str,
+    goal_name: str,
+    *,
+    depth: int,
+) -> bool:
+    """After root LLM attempts fail: one longer re-prove of the current goal."""
+    if int(depth) != 0:
+        return False
+    cap = root_finish_prove_timeout_s()
+    if cap <= 0:
+        log_exp(
+            "root_finish_prove_skip",
+            goal=goal_name,
+            reason="disabled",
+        )
+        return False
+    timeout = int(cap)
+    rem = remaining_task_s()
+    if rem is not None:
+        timeout = min(timeout, max(0, int(rem)))
+    if timeout < 1:
+        log_exp(
+            "root_finish_prove_skip",
+            goal=goal_name,
+            reason="no_time_budget",
+            remaining_s=rem,
+        )
+        return False
+    goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
+    logging.info(
+        "根节点 attempt 用尽，收尾再证 timeout=%ss (cap=%s)",
+        timeout, cap,
+    )
+    return perform_initial_verification(
+        goal_smt_file,
+        base_path=base_path,
+        goal_name=goal_name,
+        log_event="root_finish_prove",
+        timeout=timeout,
+    )
 
 
 def seed_baseline_repair_hints(
@@ -2839,11 +2883,8 @@ def _prove_run_body(
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")
-    # Paper Algorithm 1 returns False here. The original implementation then
-    # retried the same SMT at RETRY_CVC_TIMEOUT (100s). That step is not in
-    # the paper: this node already had a 60s initialCheck on the same file.
-    # Keep the helper below (commented) in case we want to restore it.
-    # return _retry_original_after_llm_exhausted(base_path, base_name)
+    if maybe_root_finish_prove(base_path, base_name, depth=depth):
+        return _done(True, "root_finish_prove")
     if _run_final_goal_diagnosis(
         base_path, base_name, depth, pack, current_prompt,
     ):

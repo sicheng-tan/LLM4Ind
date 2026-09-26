@@ -67,6 +67,8 @@ def setup_environment():
     lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
     usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
     harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
+    # Root finish re-prove after LLM attempts (default 120s); 0/off disables.
+    root_finish_prove_timeout = os.getenv('ROOT_FINISH_PROVE_TIMEOUT', '120')
     feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
     # Default off: -o lemmas samples next to difficulty (opt-in ablation).
     feedback_formula_evidence = os.getenv('FEEDBACK_FORMULA_EVIDENCE', 'off')
@@ -141,6 +143,7 @@ def setup_environment():
         'LEMMA_LIBRARY_LOCAL': lemma_library_local,
         'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
         'HARVEST_RETRY_TIMEOUT': harvest_retry_timeout,
+        'ROOT_FINISH_PROVE_TIMEOUT': root_finish_prove_timeout,
         'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
         'FEEDBACK_FORMULA_EVIDENCE': feedback_formula_evidence,
         'FEEDBACK_LLM_HINTS': feedback_llm_hints,
