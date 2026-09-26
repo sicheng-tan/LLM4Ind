@@ -572,7 +572,7 @@ def drop_equivalent_unproved(
 
 
 def purge_unproved_equivalent(base_path: str, formula: str) -> int:
-    """Drop unproved records equivalent to a proved *formula* in failed_lemmas*.json."""
+    """Drop unproved/revival records equivalent to a proved *formula*."""
     if not str(formula or "").strip():
         return 0
     root = Path(base_path)
@@ -586,17 +586,191 @@ def purge_unproved_equivalent(base_path: str, formula: str) -> int:
             continue
         if not isinstance(data, dict):
             continue
-        records = data.get("unproved_lemmas") or []
-        kept, n_removed = drop_equivalent_unproved(records, formula)
-        if n_removed == 0:
+        changed = False
+        unproved = data.get("unproved_lemmas") or []
+        kept_u, n_u = drop_equivalent_unproved(unproved, formula)
+        if n_u:
+            data["unproved_lemmas"] = kept_u
+            changed = True
+        if "revival_lemmas" in data:
+            kept_r, n_r = drop_equivalent_unproved(
+                data.get("revival_lemmas") or [], formula,
+            )
+            if n_r:
+                data["revival_lemmas"] = kept_r
+                changed = True
+            total += n_r
+        else:
+            n_r = 0
+        total += n_u
+        if not changed:
             continue
-        data["unproved_lemmas"] = kept
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        total += n_removed
     return total
+
+
+REVIVAL_ORIGIN_SITUATION_A = "situation_a"
+REVIVAL_ORIGIN_CHILD_PENDING = "child_pending"
+MAX_REVIVAL_LEMMAS = 24
+
+
+def seed_revival_from_unproved(data: dict) -> None:
+    """If ``revival_lemmas`` is missing, copy this node's unproved as situation_a.
+
+    Does not walk descendants. Mutates *data* in place.
+    """
+    if "revival_lemmas" in data:
+        data.setdefault("revival_lemmas", [])
+        return
+    seeded: List[dict] = []
+    for rec in data.get("unproved_lemmas") or []:
+        if not isinstance(rec, dict):
+            continue
+        lemma = str(rec.get("lemma") or "").strip()
+        if not lemma:
+            continue
+        item = {
+            "lemma": lemma,
+            "status": rec.get("status") or "unproved",
+            "origin": REVIVAL_ORIGIN_SITUATION_A,
+            "source_goal": rec.get("source_goal") or rec.get("blocking_subgoal") or "",
+        }
+        blocking = rec.get("blocking_subgoal")
+        if blocking:
+            item["blocking_subgoal"] = blocking
+        seeded.append(item)
+    data["revival_lemmas"] = seeded[-MAX_REVIVAL_LEMMAS:]
+
+
+def merge_revival_record(records: Sequence[Any], record: dict) -> List[Any]:
+    """Append *record* unless α-equivalent already present; keep newest 24."""
+    lemma = str((record or {}).get("lemma") or "").strip()
+    if not lemma:
+        return list(records or [])
+    if lemma_known_unproved(lemma, records):
+        return list(records or [])
+    out = list(records or []) + [record]
+    if len(out) > MAX_REVIVAL_LEMMAS:
+        out = out[-MAX_REVIVAL_LEMMAS:]
+    return out
+
+
+def should_promote_child_pending(
+    lemma: str,
+    *,
+    current_goal: Optional[str] = None,
+    library: Sequence[Any] = (),
+    blocking_lemma: Optional[str] = None,
+) -> bool:
+    """Child Situation A may enter the parent revival pool.
+
+    No head/locality gate: a lemma that helped a recursive child already sat
+    on a useful split. Skip only empties, the blocking parent lemma (already
+    situation_a), GOAL/library α-equivalents. Missing CURRENT only skips the
+    GOAL check.
+    """
+    text = str(lemma or "").strip()
+    if not text:
+        return False
+    if blocking_lemma and lemmas_equivalent(text, blocking_lemma):
+        return False
+    goal = str(current_goal or "").strip()
+    if goal and lemmas_equivalent(text, goal):
+        return False
+    for item in library or []:
+        stored = item.get("formula") if isinstance(item, dict) else item
+        if lemmas_equivalent(text, str(stored or "")):
+            return False
+    return True
+
+
+def add_revival_lemma(
+    base_path: str,
+    goal_name: str,
+    lemma: str,
+    *,
+    origin: str,
+    source_goal: str = "",
+    status: str = "unproved",
+    blocking_subgoal: Optional[str] = None,
+    load_failed_lemmas,
+    save_failed_lemmas,
+) -> bool:
+    """Append one revival record. Returns True if the pool grew."""
+    text = str(lemma or "").strip()
+    if not text:
+        return False
+    data = load_failed_lemmas(base_path, goal_name)
+    seed_revival_from_unproved(data)
+    record: Dict[str, Any] = {
+        "lemma": text,
+        "status": status or "unproved",
+        "origin": origin or REVIVAL_ORIGIN_SITUATION_A,
+        "source_goal": source_goal or goal_name,
+    }
+    if blocking_subgoal:
+        record["blocking_subgoal"] = blocking_subgoal
+    merged = merge_revival_record(data.get("revival_lemmas") or [], record)
+    if merged == list(data.get("revival_lemmas") or []):
+        return False
+    data["revival_lemmas"] = merged
+    save_failed_lemmas(base_path, goal_name, data)
+    return True
+
+
+def promote_child_pending_lemmas(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    *,
+    blocking_lemma: Optional[str] = None,
+    current_goal: Optional[str] = None,
+    library: Sequence[Any] = (),
+    load_failed_lemmas,
+    save_failed_lemmas,
+) -> int:
+    """Lift the child's ``unproved_lemmas`` into the parent revival pool.
+
+    Does not copy the blocking parent lemma (already situation_a) and does
+    not read the child's useless-timeout groups.
+    """
+    child = load_failed_lemmas(base_path, subgoal)
+    parent = load_failed_lemmas(base_path, parent_goal_name)
+    seed_revival_from_unproved(parent)
+    records = list(parent.get("revival_lemmas") or [])
+    n_add = 0
+    for rec in child.get("unproved_lemmas") or []:
+        if not isinstance(rec, dict):
+            continue
+        lemma = str(rec.get("lemma") or "").strip()
+        if not should_promote_child_pending(
+            lemma,
+            current_goal=current_goal,
+            library=library,
+            blocking_lemma=blocking_lemma,
+        ):
+            continue
+        record = {
+            "lemma": lemma,
+            "status": rec.get("status") or "unproved",
+            "origin": REVIVAL_ORIGIN_CHILD_PENDING,
+            "source_goal": subgoal,
+        }
+        blocking = rec.get("blocking_subgoal")
+        if blocking:
+            record["blocking_subgoal"] = blocking
+        merged = merge_revival_record(records, record)
+        if len(merged) > len(records):
+            n_add += 1
+        records = merged
+    if not n_add:
+        return 0
+    parent["revival_lemmas"] = records
+    save_failed_lemmas(base_path, parent_goal_name, parent)
+    return n_add
 
 
 def lemmas_known_invalid(

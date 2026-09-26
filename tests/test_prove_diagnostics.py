@@ -272,6 +272,8 @@ def test_subgoal_reuses_child_cache() -> None:
         assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
         assert parent["unproved_lemmas"][0]["status"] == "useful_but_unproved"
         assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
+        assert parent["revival_lemmas"][0]["lemma"] == "(assert true)"
+        assert parent["revival_lemmas"][0]["origin"] == "situation_a"
 
 
 def test_subgoal_falls_back_when_cache_missing() -> None:
@@ -323,6 +325,7 @@ def test_vampire_compact_and_subgoal_cache() -> None:
         assert parent["invalid_lemmas"] == []
         assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
         assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
+        assert parent["revival_lemmas"][0]["origin"] == "situation_a"
 
 
 def test_empty_stats_skip_hint_and_utility() -> None:

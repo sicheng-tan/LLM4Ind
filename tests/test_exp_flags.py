@@ -438,6 +438,8 @@ def test_unproved_flag_writes_unproved() -> None:
         assert parent["unproved_lemmas"][0]["lemma"] == "(assert true)"
         assert parent["unproved_lemmas"][0]["status"] == "useful_but_unproved"
         assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
+        assert parent["revival_lemmas"][0]["origin"] == "situation_a"
+        assert parent["revival_lemmas"][0]["lemma"] == "(assert true)"
 
 
 def test_unproved_flag_writes_invalid() -> None:

@@ -110,12 +110,15 @@ def test_pack_without_difficulty_omits_hard_axioms() -> None:
     assert GOAL in pack["goal"]["formula"]
     assert pack["previous_candidates"]
     assert pack["revival_candidates"]
+    assert pack["revival_candidates"][0]["origin"] == "situation_a"
     body = format_observation_prompt_body(pack)
     assert "=== HARD AXIOMS" not in body
     assert "=== LAST CANDIDATE LEMMAS" in body
     assert "previous generation round" in body
     assert "=== REVIVAL CANDIDATES" in body
     assert "historical unproved" in body
+    assert "situation_a" not in body
+    assert "child_pending" not in body
     assert GOAL in body
     assert "(unknown)" not in body
     assert "hotspot" not in body.lower()
@@ -536,7 +539,7 @@ def test_no_action_not_injected() -> None:
 def test_revive_soft_caps() -> None:
     from feedback_llm_hints import MAX_REVIVE_CANDIDATES, MAX_REVIVE_OUT
 
-    assert MAX_REVIVE_CANDIDATES == 16
+    assert MAX_REVIVE_CANDIDATES == 24
     assert MAX_REVIVE_OUT == 4
     assert f"put up to {MAX_REVIVE_OUT}" in HINTS_USER_TEMPLATE
 
@@ -713,24 +716,31 @@ def test_maybe_refresh_runs_without_difficulty(tmp_path: Path) -> None:
     assert rec["hints"]["mode"] == "new_direction"
 
 
-def test_has_hint_opportunity_unproved_and_library_delta() -> None:
+def test_has_hint_opportunity_revival_or_library_new() -> None:
     lemma = "(forall ((n Nat)) (= (plus n zero) n))"
     empty = _hd_data(useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}])
+    empty["revival_lemmas"] = []
+    empty["unproved_lemmas"] = []
     assert has_hint_opportunity(empty) is False
-    with_unproved = _hd_data(unproved_lemmas=[{"lemma": lemma, "status": "timeout"}])
+    with_pool = _hd_data(
+        unproved_lemmas=[{"lemma": lemma, "status": "timeout"}],
+        useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}],
+    )
     lib = [{"id": "lib_1", "formula": AX, "role": "pin"}]
-    assert has_hint_opportunity(with_unproved) is False
-    assert has_hint_opportunity(with_unproved, library=lib) is True
-    assert has_hint_opportunity(with_unproved, library=lib, prev_library_ids=[]) is True
-    assert has_hint_opportunity(with_unproved, library=lib, prev_library_ids=["lib_0"]) is True
-    assert has_hint_opportunity(with_unproved, library=lib, prev_library_ids=["lib_1"]) is False
-    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_0"]) is False
+    assert has_hint_opportunity(with_pool) is True
+    assert has_hint_opportunity(with_pool, library=lib) is True
+    assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=[]) is True
+    assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=["lib_0"]) is True
+    assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=["lib_1"]) is True
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_0"]) is True
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_1"]) is False
 
 
 def test_maybe_refresh_skips_without_opportunity(tmp_path: Path) -> None:
     base = str(tmp_path)
     data = _hd_data_with_useless()
     data["unproved_lemmas"] = []
+    data["revival_lemmas"] = []
     mate.save_failed_lemmas(base, "template", data)
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
         "feedback_llm_hints.invoke_configured_chat",
@@ -747,9 +757,11 @@ def test_maybe_refresh_skips_without_opportunity(tmp_path: Path) -> None:
     assert out is None
 
 
-def test_maybe_refresh_skips_unproved_without_library_delta(tmp_path: Path) -> None:
+def test_maybe_refresh_skips_empty_pool_without_library_delta(tmp_path: Path) -> None:
     base = str(tmp_path)
     data = _hd_data_with_useless()
+    data["unproved_lemmas"] = []
+    data["revival_lemmas"] = []
     data["llm_hints"] = {"library_ids": ["lib_1"]}
     mate.save_failed_lemmas(base, "template", data)
     _write_library(tmp_path)
@@ -770,7 +782,10 @@ def test_maybe_refresh_skips_unproved_without_library_delta(tmp_path: Path) -> N
 
 def test_maybe_refresh_snapshots_then_runs_on_library_growth(tmp_path: Path) -> None:
     base = str(tmp_path)
-    mate.save_failed_lemmas(base, "template", _hd_data_with_useless())
+    data = _hd_data_with_useless()
+    data["unproved_lemmas"] = []
+    data["revival_lemmas"] = []
+    mate.save_failed_lemmas(base, "template", data)
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
         "feedback_llm_hints.invoke_configured_chat",
     ) as inv:
@@ -1084,11 +1099,11 @@ if __name__ == "__main__":
         test_maybe_refresh_skips_without_difficulty(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_useless_group(Path(tmp))
-    test_has_hint_opportunity_unproved_and_library_delta()
+    test_has_hint_opportunity_revival_or_library_new()
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_opportunity(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
-        test_maybe_refresh_skips_unproved_without_library_delta(Path(tmp))
+        test_maybe_refresh_skips_empty_pool_without_library_delta(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_snapshots_then_runs_on_library_growth(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:

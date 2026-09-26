@@ -114,6 +114,10 @@ from lemma_gates import (
     lemma_known_invalid,
     lemma_known_unproved,
     lemma_same_as_goal,
+    add_revival_lemma,
+    promote_child_pending_lemmas,
+    seed_revival_from_unproved,
+    REVIVAL_ORIGIN_SITUATION_A,
     llm_lemma_diagnosis_enabled,
     llm_parse_retries,
     node_attempt_plan,
@@ -174,6 +178,7 @@ def _empty_failed_data() -> dict:
         "progress_routing_signals": [],
         "repair_hints": [],
         "unproved_lemmas": [],
+        "revival_lemmas": [],
         "routing": {},
         "baseline_diag": {},
         "baseline_diag_short": {},
@@ -200,6 +205,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("progress_routing_signals", [])
             data.setdefault("repair_hints", [])
             data.setdefault("unproved_lemmas", [])
+            seed_revival_from_unproved(data)
             data.setdefault("routing", {})
             data.setdefault("baseline_diag", {})
             data.setdefault("baseline_diag_short", {})
@@ -388,12 +394,22 @@ def _record_blocking_lemma(
     """Situation A: useful for the parent, own proof failed.
 
     With ``UNPROVED_NOT_INVALID`` on (default), record in ``unproved_lemmas``
-    so revive / USEFUL BUT UNPROVED can see it; never mark invalid.
+    (USEFUL BUT UNPROVED) and also ``revival_lemmas`` (diagnoser pool,
+    origin=situation_a). Never mark invalid.
     With the flag off, keep the old invalid_lemmas path.
     """
     status = (meta or {}).get("status") or "useful_but_unproved"
     if unproved_not_invalid_enabled():
         add_unproved_lemma(base_path, goal_name, lemma, meta)
+        add_revival_lemma(
+            base_path, goal_name, lemma,
+            origin=REVIVAL_ORIGIN_SITUATION_A,
+            source_goal=goal_name,
+            status=status,
+            blocking_subgoal=(meta or {}).get("blocking_subgoal"),
+            load_failed_lemmas=load_failed_lemmas,
+            save_failed_lemmas=save_failed_lemmas,
+        )
         return
     blocking = (meta or {}).get("blocking_subgoal") or ""
     reason = f"Subgoal proof failed ({blocking or status})"
@@ -424,6 +440,43 @@ def _lemma_for_blocking_subgoal(
     if 1 <= idx <= len(parent_lemmas):
         return parent_lemmas[idx - 1]
     return None
+
+
+def _current_goal_formula(base_path: str, goal_name: str) -> Optional[str]:
+    path = Path(base_path) / f"{goal_name}.smt2"
+    if not path.exists():
+        return None
+    try:
+        _assert, formula = extract_original_goal(
+            solver_smt_content(path.read_text(encoding="utf-8"), base_path)
+        )
+        return formula
+    except Exception:
+        return None
+
+
+def _promote_child_pending(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    *,
+    blocking: Optional[str],
+) -> None:
+    n = promote_child_pending_lemmas(
+        base_path, parent_goal_name, subgoal,
+        blocking_lemma=blocking,
+        current_goal=_current_goal_formula(base_path, parent_goal_name),
+        library=load_lemma_library(base_path) if lemma_library_enabled() else [],
+        load_failed_lemmas=load_failed_lemmas,
+        save_failed_lemmas=save_failed_lemmas,
+    )
+    if n:
+        log_exp(
+            "revival_child_pending",
+            goal=parent_goal_name,
+            source=subgoal,
+            n=n,
+        )
 
 
 def _record_obligation_attempt(
@@ -610,7 +663,10 @@ def _record_subgoal_failure_feedback(
     subgoal: str,
     parent_lemmas: List[str],
 ) -> None:
-    """Invalid child lemmas go on the parent. Situation A goes to unproved_lemmas."""
+    """Invalid child lemmas go on the parent. Situation A goes to unproved_lemmas
+    and the diagnoser revival pool; the child's own unproved lemmas may be
+    promoted as child_pending (not into USEFUL BUT UNPROVED).
+    """
     child_profile = load_routing_state(base_path, subgoal).active_profile
     blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
     child_data = load_failed_lemmas(base_path, subgoal)
@@ -630,6 +686,7 @@ def _record_subgoal_failure_feedback(
                     "profile": child_profile,
                 },
             )
+    _promote_child_pending(base_path, parent_goal_name, subgoal, blocking=blocking)
     parent_state = load_routing_state(base_path, parent_goal_name)
     child_state = load_routing_state(base_path, subgoal)
     if child_state.active_profile:
@@ -2502,6 +2559,9 @@ def prove_subgoals_parallel(
                                 base_path, parent_goal_name, blocking,
                                 {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
                             )
+                        _promote_child_pending(
+                            base_path, parent_goal_name, subgoal, blocking=blocking,
+                        )
                     snapshots[subgoal] = _snap(subgoal, "failed")
                     _collect_remaining(record_failures=True)
                     return False, _ordered()

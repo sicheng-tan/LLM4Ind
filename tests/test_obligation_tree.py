@@ -93,6 +93,10 @@ def test_add_proved_lemma_drops_equivalent_unproved(tmp_path: Path) -> None:
                 {"lemma": proved, "status": "timeout"},
                 {"lemma": other, "status": "timeout"},
             ],
+            "revival_lemmas": [
+                {"lemma": proved, "origin": "situation_a", "status": "timeout"},
+                {"lemma": other, "origin": "child_pending", "status": "timeout"},
+            ],
         }),
         encoding="utf-8",
     )
@@ -102,6 +106,10 @@ def test_add_proved_lemma_drops_equivalent_unproved(tmp_path: Path) -> None:
                 {"lemma": alpha, "status": "unknown"},
                 {"lemma": other, "status": "timeout"},
             ],
+            "revival_lemmas": [
+                {"lemma": alpha, "origin": "situation_a", "status": "unknown"},
+                {"lemma": other, "origin": "child_pending", "status": "timeout"},
+            ],
         }),
         encoding="utf-8",
     )
@@ -110,8 +118,10 @@ def test_add_proved_lemma_drops_equivalent_unproved(tmp_path: Path) -> None:
     root = json.loads((tmp_path / "failed_lemmas.json").read_text(encoding="utf-8"))
     child = json.loads((tmp_path / "failed_lemmas_1.json").read_text(encoding="utf-8"))
     assert [item["lemma"] for item in root["unproved_lemmas"]] == [other]
+    assert [item["lemma"] for item in root["revival_lemmas"]] == [other]
     assert root["invalid_lemmas"] == [{"lemma": invalid_keep, "reason": "unsat"}]
     assert [item["lemma"] for item in child["unproved_lemmas"]] == [other]
+    assert [item["lemma"] for item in child["revival_lemmas"]] == [other]
 
 
 def test_add_proved_lemma_drops_unproved_when_library_off(tmp_path: Path) -> None:

@@ -214,7 +214,8 @@ def add_proved_lemma(
     Returns its library id, or None if empty / local harvest is off. Duplicate
     formulas (whitespace or α-equivalent) keep the existing id; a later pin
     promotes local in place. There is no size cap: pins and locals both append.
-    Equivalent formulas are also dropped from ``unproved_lemmas`` in this folder.
+    Equivalent formulas are also dropped from ``unproved_lemmas`` and
+    ``revival_lemmas`` in this folder.
     """
     want = "local" if str(role or "pin").strip().lower() == "local" else "pin"
     if want == "local" and not local_lemma_harvest_enabled():

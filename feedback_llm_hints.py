@@ -2,15 +2,16 @@
 
 Default **off**. Requires at least one failed usefulness group (so the first
 lemma-generation call is never steered by HD-only hints). After a useless
-group, the diagnoser runs only if there is an unproved revival pool **and**
-the lemma library has new ids vs the last baseline (first call compares
-against an empty library, so any proved lemma counts as a change). The pack
-includes a preprocessed theory background (datatypes / definitions /
-background asserts; goal omitted). HD hotspots are optional via
+group, the diagnoser runs if the independent ``revival_lemmas`` pool is
+nonempty **or** the lemma library has ``[NEW]`` ids vs the last baseline
+(first call compares against an empty library). The pack includes a
+preprocessed theory background (datatypes / definitions / background
+asserts; goal omitted). HD hotspots are optional via
 ``FEEDBACK_LLM_HINTS_HD`` (default off); usefulness skips ``--dump-difficulty``
 unless a feedback consumer needs it. GOAL is the current proof-node formula.
 The diagnoser chooses no_action (leave generation alone), new_direction
-(text only), or revise_candidate (pending formulas plus notes).
+(text only), or revise_candidate (pending formulas plus notes). Revival
+candidates are not copied into the generator's USEFUL BUT UNPROVED block.
 """
 
 from __future__ import annotations
@@ -29,6 +30,12 @@ from exp_flags import (
 )
 from exp_stats import add_llm_time, log_exp, record_llm_generation
 from llm_time_budget import invoke_configured_chat
+from lemma_gates import (
+    MAX_REVIVAL_LEMMAS,
+    REVIVAL_ORIGIN_CHILD_PENDING,
+    REVIVAL_ORIGIN_SITUATION_A,
+    seed_revival_from_unproved,
+)
 from obligation_tree import (
     last_normal_tree,
     load_lemma_library,
@@ -48,9 +55,9 @@ MIN_HINT_CHARS = 24
 # Block HD-only steering of the first lemma generation.
 MIN_USELESS_GROUPS_FOR_HINTS = 1
 # Soft ceilings for diagnoser context / inject size. Overflow keeps the
-# newest entries (not random sampling). Pool can be larger than OUT so the
-# diagnoser sees history; OUT stays near the generator's 1–3 lemma budget.
-MAX_REVIVE_CANDIDATES = 16
+# newest entries (not random sampling). Pool matches lemma-library show
+# window (24); OUT stays near the generator's 1–3 lemma budget.
+MAX_REVIVE_CANDIDATES = MAX_REVIVAL_LEMMAS
 MAX_LIBRARY_SHOW = 24
 MAX_REVIVE_OUT = 4
 MAX_CANDIDATES = 12
@@ -200,15 +207,14 @@ def has_hint_opportunity(
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
 ) -> bool:
-    """True when unproved revival candidates exist *and* the library grew.
+    """True when the revival pool is nonempty *or* the library grew.
 
     Missing ``prev_library_ids`` is an empty-library baseline: any current
     library id counts as a change (the first diagnoser call).
     """
-    if not _revival_candidate_items(failed_data or {}):
-        return False
     prev = [] if prev_library_ids is None else list(prev_library_ids)
-    return _library_has_new_ids(library or [], prev_ids=prev)
+    lib_new = _library_has_new_ids(library or [], prev_ids=prev)
+    return bool(_revival_candidate_items(failed_data or {})) or lib_new
 
 
 def _library_has_new_ids(
@@ -306,13 +312,16 @@ def _library_show_items(
 
 
 def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
-    """Soft-failed lemmas only (unproved/timeout); never invalid.
+    """Soft-failed lemmas from the independent revival pool; never invalid.
 
-    If the pool exceeds ``MAX_REVIVE_CANDIDATES``, keep the newest entries
-    (list tail), not a random sample.
+    Missing ``revival_lemmas`` seeds from this node's ``unproved_lemmas`` as
+    situation_a (no descendant walk). Overflow keeps the newest
+    ``MAX_REVIVE_CANDIDATES`` entries.
     """
+    data = dict(failed_data or {})
+    seed_revival_from_unproved(data)
     invalid_keys: Set[str] = set()
-    for rec in failed_data.get("invalid_lemmas") or []:
+    for rec in data.get("invalid_lemmas") or []:
         if isinstance(rec, dict):
             raw = str(rec.get("lemma") or "")
         else:
@@ -322,7 +331,7 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
             invalid_keys.add(key)
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
-    for rec in failed_data.get("unproved_lemmas") or []:
+    for rec in data.get("revival_lemmas") or []:
         if not isinstance(rec, dict):
             continue
         formula = str(rec.get("lemma") or "").strip()
@@ -334,10 +343,18 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
         status = _normalize_prove_status(rec.get("status") or "unproved")
         if status == "invalid":
             continue
+        origin = str(rec.get("origin") or REVIVAL_ORIGIN_SITUATION_A)
+        if origin not in (
+            REVIVAL_ORIGIN_SITUATION_A,
+            REVIVAL_ORIGIN_CHILD_PENDING,
+        ):
+            origin = REVIVAL_ORIGIN_SITUATION_A
         seen.add(key)
         out.append({
             "formula": _prompt_formula(formula),
             "status": status or "unproved",
+            "origin": origin,
+            "source_goal": str(rec.get("source_goal") or ""),
         })
     if len(out) > MAX_REVIVE_CANDIDATES:
         out = out[-MAX_REVIVE_CANDIDATES:]
@@ -364,8 +381,8 @@ def _source_attempt_id(
             )
         else:
             base = "baseline"
-    n_unproved = len(failed_data.get("unproved_lemmas") or [])
-    return f"{base}|{_library_fingerprint(library or [])}|u{n_unproved}"
+    n_revival = len(_revival_candidate_items(failed_data))
+    return f"{base}|{_library_fingerprint(library or [])}|r{n_revival}"
 
 
 def _formula_evidence_hint(failed_data: dict) -> Optional[dict]:
@@ -1173,7 +1190,7 @@ def maybe_refresh_llm_hints(
     """Run LLM-hints when flag is on and usefulness failed.
 
     Skips Vampire, fewer than ``MIN_USELESS_GROUPS_FOR_HINTS`` groups,
-    missing unproved pool or missing library growth vs the last baseline
+    empty revival pool with no library growth vs the last baseline
     (first call: vs empty library),
     and when stored hints already match the current attempt_id. HD hotspots
     follow ``FEEDBACK_LLM_HINTS_HD``. ``current_goal`` is the formula of the
@@ -1235,7 +1252,7 @@ def maybe_refresh_llm_hints(
             "llm_feedback_hints_skip",
             goal=goal_name,
             reason="no_opportunity",
-            n_unproved=len(failed_data.get("unproved_lemmas") or []),
+            n_revival=len(pack.get("revival_candidates") or []),
             library_new=bool(pack.get("library_new")),
             n_prev_library=len(baseline),
         )

@@ -128,9 +128,9 @@ def prompt_advice_enabled() -> bool:
 def unproved_not_invalid_enabled() -> bool:
     """Situation A: useful-but-unproved stays off invalid_lemmas (default on).
 
-    When on, blocking subgoals are recorded in ``unproved_lemmas`` (and may
-    appear under USEFUL BUT UNPROVED / LLM-hint revival). When off, they are
-    written to ``invalid_lemmas`` instead.
+    When on, blocking subgoals are recorded in ``unproved_lemmas``
+    (USEFUL BUT UNPROVED) and copied to ``revival_lemmas`` for the diagnoser.
+    When off, they are written to ``invalid_lemmas`` instead.
     """
     return _flag_enabled("UNPROVED_NOT_INVALID")
 
