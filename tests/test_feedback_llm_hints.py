@@ -118,6 +118,7 @@ def test_pack_without_difficulty_omits_hard_axioms() -> None:
     assert "previous generation round" in body
     assert "=== REVIVAL CANDIDATES" in body
     assert "historical unproved" in body
+    assert "need not help CURRENT" in body
     assert "situation_a" not in body
     assert "child_pending" not in body
     assert GOAL in body
@@ -624,11 +625,12 @@ def test_hints_prompt_has_encoding_shape_menu() -> None:
     assert "no pool anchor" not in HINTS_USER_TEMPLATE
     assert "simpler than GOAL" in HINTS_USER_TEMPLATE
     assert "PROBLEM BACKGROUND" in HINTS_USER_TEMPLATE
-    assert "do not name algorithms or benchmark lemmas" in HINTS_USER_TEMPLATE
     assert "named benchmark" not in HINTS_USER_TEMPLATE
     assert "language-algebra" not in HINTS_USER_TEMPLATE
     assert "DO NOT REPEAT" in HINTS_USER_TEMPLATE
     assert "LEMMA LIBRARY formulas (already proved)" in HINTS_USER_TEMPLATE
+    assert "need not help CURRENT" in HINTS_USER_TEMPLATE
+    assert "descendant subgoal" in HINTS_SYSTEM
     assert "already proved axioms" in HINTS_SYSTEM
     assert "difficulty ranks" not in HINTS_SYSTEM
     assert "search-change stats" not in HINTS_SYSTEM
@@ -822,6 +824,62 @@ def test_has_hint_opportunity_revival_or_library_new() -> None:
     assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_1"]) is False
 
 
+def test_revival_pack_drops_library_alpha_equivalents() -> None:
+    """Diagnoser revival omits formulas already in the lemma library (α)."""
+    lemma = GOAL
+    alpha = "(forall ((x Nat)) (= (plus x zero) x))"
+    other = AX
+    data = _hd_data(
+        unproved_lemmas=[
+            {"lemma": lemma, "status": "timeout"},
+            {"lemma": other, "status": "timeout"},
+        ],
+        revival_lemmas=[
+            {
+                "lemma": lemma,
+                "status": "timeout",
+                "origin": "situation_a",
+            },
+            {
+                "lemma": other,
+                "status": "timeout",
+                "origin": "child_pending",
+            },
+        ],
+        useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}],
+    )
+    lib = [{"id": "lib_1", "formula": alpha, "role": "pin"}]
+    pack = build_observation_pack(data, library=lib, prev_library_ids=["lib_1"])
+    assert pack is not None
+    revive = [item["formula"] for item in pack["revival_candidates"]]
+    assert other in revive
+    assert lemma not in revive
+    assert alpha not in revive
+    body = format_observation_prompt_body(pack)
+    assert other in body
+    assert "child_pending" not in body
+    assert has_hint_opportunity(data, library=lib, prev_library_ids=["lib_1"]) is True
+
+    only_lib = _hd_data(
+        unproved_lemmas=[{"lemma": lemma, "status": "timeout"}],
+        revival_lemmas=[{
+            "lemma": lemma, "status": "timeout", "origin": "situation_a",
+        }],
+        useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}],
+    )
+    assert has_hint_opportunity(
+        only_lib, library=lib, prev_library_ids=["lib_1"],
+    ) is False
+    assert has_hint_opportunity(
+        only_lib, library=lib, prev_library_ids=[],
+    ) is True
+    packed = build_observation_pack(
+        only_lib, library=lib, prev_library_ids=["lib_1"],
+    )
+    assert packed is not None
+    assert packed["revival_candidates"] == []
+
+
 def test_maybe_refresh_skips_without_opportunity(tmp_path: Path) -> None:
     base = str(tmp_path)
     data = _hd_data_with_useless()
@@ -941,7 +999,7 @@ def test_maybe_refresh_first_call_nonempty_library_vs_empty(tmp_path: Path) -> N
     assert "added since the last diagnoser baseline" in user
     assert AX in user or "plus" in user
     assert "lib_1" not in user
-    assert "Re-evaluate the unproved revival candidates" in inv.call_args.args[1][0]["content"]
+    assert "re-evaluate the unproved revival candidates" in inv.call_args.args[1][0]["content"]
     assert rec is not None
 
 
@@ -1189,6 +1247,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_useless_group(Path(tmp))
     test_has_hint_opportunity_revival_or_library_new()
+    test_revival_pack_drops_library_alpha_equivalents()
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_opportunity(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:

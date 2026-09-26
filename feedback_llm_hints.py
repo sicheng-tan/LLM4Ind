@@ -37,6 +37,7 @@ from lemma_gates import (
     REVIVAL_ORIGIN_CHILD_PENDING,
     REVIVAL_ORIGIN_SITUATION_A,
     seed_revival_from_unproved,
+    should_promote_child_pending,
 )
 from obligation_tree import (
     last_normal_tree,
@@ -93,7 +94,8 @@ HINTS_SYSTEM = """You help repair a failed SMT inductive attempt.
 You receive blocked solver observations for your reading only.
 Rules:
 - Revival candidates are unproved. They may be true or false, useful or useless;
-  they are not known true and not library axioms.
+  they are not known true and not library axioms. Some helped a
+  descendant subgoal and need not help CURRENT; skip those with NEW_DIRECTION.
 - LEMMA LIBRARY formulas are already proved axioms. Do not put them in revive
   and do not ask the generator to regenerate α-equivalent copies.
 - DO NOT REPEAT ancestor goals on the current proof path and
@@ -173,6 +175,7 @@ Return ONLY one JSON object:
   Each revive entry needs a short note explaining how that formula might help the CURRENT goal.
 LAST CANDIDATE LEMMAS are the previous generation round.
 REVIVAL CANDIDATES are historical unproved lemmas, not only last round.
+Some helped a descendant subgoal; they need not help CURRENT.
 
 {body}
 """.replace("{max_revive}", str(MAX_REVIVE_OUT))
@@ -246,7 +249,9 @@ def has_hint_opportunity(
     """
     prev = [] if prev_library_ids is None else list(prev_library_ids)
     lib_new = _library_has_new_ids(library or [], prev_ids=prev)
-    return bool(_revival_candidate_items(failed_data or {})) or lib_new
+    return bool(
+        _revival_candidate_items(failed_data or {}, library=library)
+    ) or lib_new
 
 
 def _library_has_new_ids(
@@ -343,12 +348,17 @@ def _library_show_items(
     return items
 
 
-def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
+def _revival_candidate_items(
+    failed_data: dict,
+    *,
+    library: Optional[Sequence[Any]] = None,
+) -> List[Dict[str, str]]:
     """Soft-failed lemmas from the independent revival pool; never invalid.
 
     Missing ``revival_lemmas`` seeds from this node's ``unproved_lemmas`` as
-    situation_a (no descendant walk). Overflow keeps the newest
-    ``MAX_REVIVE_CANDIDATES`` entries.
+    situation_a (no descendant walk). α-equivalent library formulas are
+    dropped with the same check as ``should_promote_child_pending``.
+    Overflow keeps the newest ``MAX_REVIVE_CANDIDATES`` entries.
     """
     data = dict(failed_data or {})
     seed_revival_from_unproved(data)
@@ -371,6 +381,8 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
             continue
         key = normalize_lemma_formula(formula)
         if not key or key in seen or key in invalid_keys:
+            continue
+        if not should_promote_child_pending(formula, library=library or []):
             continue
         status = _normalize_prove_status(rec.get("status") or "unproved")
         if status == "invalid":
@@ -464,7 +476,7 @@ def _source_attempt_id(
             )
         else:
             base = "baseline"
-    n_revival = len(_revival_candidate_items(failed_data))
+    n_revival = len(_revival_candidate_items(failed_data, library=library))
     return f"{base}|{_library_fingerprint(library or [])}|r{n_revival}"
 
 
@@ -791,7 +803,7 @@ def build_observation_pack(
         }
 
     lib_items = _library_show_items(library or [], prev_ids=prev_library_ids)
-    revive_pool = _revival_candidate_items(failed_data)
+    revive_pool = _revival_candidate_items(failed_data, library=library)
     do_not_repeat = _do_not_repeat_items(failed_data, ancestor_stack)
     background = extract_theory_background(smt_content)
     if not (
@@ -964,6 +976,9 @@ def format_observation_prompt_body(pack):
     lines.append("")
     lines.append(
         "=== REVIVAL CANDIDATES (historical unproved lemmas, not only last round) ==="
+    )
+    lines.append(
+        "  Some helped a descendant subgoal; they need not help CURRENT."
     )
     if revive_pool:
         for item in revive_pool:

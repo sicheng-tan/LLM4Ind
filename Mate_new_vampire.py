@@ -664,8 +664,8 @@ def _record_subgoal_failure_feedback(
     parent_lemmas: List[str],
 ) -> None:
     """Invalid child lemmas go on the parent. Situation A goes to unproved_lemmas
-    and the diagnoser revival pool; the child's own unproved lemmas may be
-    promoted as child_pending (not into USEFUL BUT UNPROVED).
+    and the diagnoser revival pool; the child's revival pool may be promoted
+    as child_pending (not into USEFUL BUT UNPROVED).
     """
     child_profile = load_routing_state(base_path, subgoal).active_profile
     blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)

@@ -665,12 +665,11 @@ def should_promote_child_pending(
     library: Sequence[Any] = (),
     blocking_lemma: Optional[str] = None,
 ) -> bool:
-    """Child Situation A may enter the parent revival pool.
+    """A child revival formula may enter the parent revival pool.
 
-    No head/locality gate: a lemma that helped a recursive child already sat
-    on a useful split. Skip only empties, the blocking parent lemma (already
-    situation_a), GOAL/library α-equivalents. Missing CURRENT only skips the
-    GOAL check.
+    No head/locality gate: the child already kept it as diagnoser material.
+    Skip only empties, the blocking parent lemma (already situation_a),
+    GOAL/library α-equivalents. Missing CURRENT only skips the GOAL check.
     """
     text = str(lemma or "").strip()
     if not text:
@@ -732,17 +731,21 @@ def promote_child_pending_lemmas(
     load_failed_lemmas,
     save_failed_lemmas,
 ) -> int:
-    """Lift the child's ``unproved_lemmas`` into the parent revival pool.
+    """Lift the child's diagnoser ``revival_lemmas`` into the parent pool.
 
-    Does not copy the blocking parent lemma (already situation_a) and does
-    not read the child's useless-timeout groups.
+    One hop of the child's already-aggregated pool (situation_a plus
+    whatever that child inherited). Does not walk descendant files, so a
+    deeper tree reuses the same inherit. Does not write parent
+    ``unproved_lemmas`` / USEFUL BUT UNPROVED. Skips the blocking parent
+    lemma, GOAL, library α-equivalents, and useless-timeout groups.
     """
     child = load_failed_lemmas(base_path, subgoal)
     parent = load_failed_lemmas(base_path, parent_goal_name)
+    seed_revival_from_unproved(child)
     seed_revival_from_unproved(parent)
     records = list(parent.get("revival_lemmas") or [])
     n_add = 0
-    for rec in child.get("unproved_lemmas") or []:
+    for rec in child.get("revival_lemmas") or []:
         if not isinstance(rec, dict):
             continue
         lemma = str(rec.get("lemma") or "").strip()
@@ -757,7 +760,7 @@ def promote_child_pending_lemmas(
             "lemma": lemma,
             "status": rec.get("status") or "unproved",
             "origin": REVIVAL_ORIGIN_CHILD_PENDING,
-            "source_goal": subgoal,
+            "source_goal": str(rec.get("source_goal") or "").strip() or subgoal,
         }
         blocking = rec.get("blocking_subgoal")
         if blocking:

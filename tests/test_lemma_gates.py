@@ -238,8 +238,9 @@ def test_promote_child_pending_skips_library_blocking_timeout() -> None:
     )
 
     with tempfile.TemporaryDirectory() as tmp:
-        mate.add_unproved_lemma(
-            tmp, "template_1", plus_zero, {"status": "useful_but_unproved"},
+        mate._record_blocking_lemma(
+            tmp, "template_1", plus_zero,
+            {"status": "useful_but_unproved"},
         )
         mate.save_failed_lemmas(tmp, "template", {
             **mate._empty_failed_data(),
@@ -276,6 +277,71 @@ def test_promote_child_pending_skips_library_blocking_timeout() -> None:
             save_failed_lemmas=mate.save_failed_lemmas,
         )
         assert n_dup == 0
+
+
+def test_promote_inherits_child_revival_not_deeper_files() -> None:
+    """Parent copies the child's revival pool; deeper files stay put until promoted."""
+    import Mate_new as mate
+
+    goal_len = "(forall ((x Lst)) (= (len (rev x)) (len x)))"
+    homo = (
+        "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
+    )
+    plus_zero = "(forall ((n Nat)) (= (plus n zero) n))"
+    len_ge = "(forall ((x Lst)) (>= (len x) 0))"
+    great = "(forall ((x Lst)) (= (rev (rev (rev x))) (rev x)))"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mate._record_blocking_lemma(
+            tmp, "template_1_1", len_ge,
+            {"status": "useful_but_unproved", "blocking_subgoal": "template_1_1_1"},
+        )
+        n_mid = promote_child_pending_lemmas(
+            tmp, "template_1", "template_1_1",
+            blocking_lemma=plus_zero,
+            current_goal=homo,
+            library=[],
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        assert n_mid == 1
+        mate._record_blocking_lemma(
+            tmp, "template_1", plus_zero,
+            {"status": "useful_but_unproved", "blocking_subgoal": "template_1_1"},
+        )
+        great_data = mate._empty_failed_data()
+        great_data["unproved_lemmas"] = [
+            {"lemma": great, "status": "useful_but_unproved"},
+        ]
+        great_data["revival_lemmas"] = [{
+            "lemma": great,
+            "status": "unproved",
+            "origin": REVIVAL_ORIGIN_SITUATION_A,
+            "source_goal": "template_1_1_1",
+        }]
+        mate.save_failed_lemmas(tmp, "template_1_1_1", great_data)
+
+        n = promote_child_pending_lemmas(
+            tmp, "template", "template_1",
+            blocking_lemma=homo,
+            current_goal=goal_len,
+            library=[],
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        assert n == 2
+        parent = mate.load_failed_lemmas(tmp, "template")
+        assert parent["unproved_lemmas"] == []
+        by_lemma = {item["lemma"]: item for item in parent["revival_lemmas"]}
+        assert set(by_lemma) == {plus_zero, len_ge}
+        assert by_lemma[plus_zero]["origin"] == REVIVAL_ORIGIN_CHILD_PENDING
+        assert by_lemma[plus_zero]["source_goal"] == "template_1"
+        assert by_lemma[len_ge]["origin"] == REVIVAL_ORIGIN_CHILD_PENDING
+        assert by_lemma[len_ge]["source_goal"] == "template_1_1"
+        prompt = mate.format_solver_feedback_for_prompt(parent, tmp)
+        assert "USEFUL BUT UNPROVED" not in prompt
+        assert plus_zero not in prompt
+        assert len_ge not in prompt
 
 
 def test_parse_llm_reason() -> None:
@@ -1811,6 +1877,7 @@ def main() -> int:
     test_add_unproved_lemma_dedups_equivalent()
     test_situation_a_dual_writes_revival_not_into_child_pending()
     test_promote_child_pending_skips_library_blocking_timeout()
+    test_promote_inherits_child_revival_not_deeper_files()
     test_parse_llm_reason()
     test_parse_llm_lemmas_xml_and_legacy()
     test_parse_llm_lemmas_salvage_and_paren_repair()
