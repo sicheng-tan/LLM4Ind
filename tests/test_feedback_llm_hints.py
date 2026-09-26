@@ -21,6 +21,7 @@ from feedback_llm_hints import (
     HINTS_SYSTEM,
     HINTS_USER_TEMPLATE,
     build_observation_pack,
+    format_hints_system,
     format_llm_hints_for_prompt,
     format_observation_prompt_body,
     has_difficulty_observations,
@@ -123,6 +124,47 @@ def test_pack_without_difficulty_omits_hard_axioms() -> None:
     assert "(unknown)" not in body
     assert "hotspot" not in body.lower()
     assert "attributed" not in body
+    assert "=== DO NOT REPEAT" not in body
+
+
+def test_pack_do_not_repeat_ancestors_and_invalid_omits_timeout() -> None:
+    timeout = "(forall ((n Nat)) (= (plus n zero) n))"
+    invalid = "(forall ((x Lst)) (= (rev (rev x)) x))"
+    ancestor = "(forall ((x Lst)) (= (len (rev x)) (len x)))"
+    data = {
+        "repair_hints": [],
+        "baseline_diag": {},
+        "useless_lemma_groups": [{"lemmas": [timeout], "status": "timeout"}],
+        "unproved_lemmas": [{"lemma": timeout, "status": "timeout"}],
+        "invalid_lemmas": [{"lemma": invalid, "reason": "solver:sat"}],
+        "obligation": {
+            "last_normal_tree_id": 1,
+            "attempts": [{
+                "id": 1,
+                "kind": "obligation_tree",
+                "tree": {"role": "goal", "formula": GOAL, "status": "open", "children": []},
+            }],
+        },
+    }
+    pack = build_observation_pack(
+        data,
+        current_goal=GOAL,
+        ancestor_stack=[{"goal_id": "template", "depth": 0, "formula": ancestor}],
+    )
+    assert pack is not None
+    kinds = [item["kind"] for item in pack["do_not_repeat"]]
+    formulas = [item["formula"] for item in pack["do_not_repeat"]]
+    assert kinds == ["ancestor", "invalid"]
+    assert ancestor in formulas
+    assert invalid in formulas
+    assert timeout not in formulas
+    body = format_observation_prompt_body(pack)
+    assert "=== DO NOT REPEAT (proof-path ancestors; invalid lemmas) ===" in body
+    assert "[ancestor, depth=0]" in body
+    assert "[invalid; solver:sat]" in body
+    assert ancestor in body
+    assert invalid in body
+    assert "Usefulness timeout is not listed" in body
 
 
 def test_pack_goal_prefers_current_node_over_hd_fragments() -> None:
@@ -213,8 +255,14 @@ def test_pack_omits_hard_axioms_when_hd_flag_off() -> None:
         pack = build_observation_pack(_hd_data_with_useless())
     assert pack is not None
     assert pack["hard_axioms"] == []
+    assert pack.get("stats_delta")
     body = format_observation_prompt_body(pack)
     assert "=== HARD AXIOMS" not in body
+    assert "=== SEARCH CHANGE VS BASELINE (for reference) ===" in body
+    assert "attributed=" not in body
+    system = format_hints_system(pack)
+    assert "HARD AXIOMS rank runtime hotspots" not in system
+    assert "SEARCH CHANGE VS BASELINE stats are weak signals" in system
     assert "=== GOAL ===" in body
 
 
@@ -561,8 +609,6 @@ def test_hints_prompt_has_encoding_shape_menu() -> None:
     assert "(= (f x e) x)" not in HINTS_USER_TEMPLATE
     assert "lightly adapt" in HINTS_USER_TEMPLATE
     assert "Drop tautologies" in HINTS_USER_TEMPLATE
-    assert "use NEW_DIRECTION" in HINTS_USER_TEMPLATE
-    assert "or NO_ACTION instead" in HINTS_USER_TEMPLATE
     assert "verbatim copies" not in HINTS_USER_TEMPLATE
     assert "shared function/predicate symbols" not in HINTS_USER_TEMPLATE
     assert "unrelated identities" not in HINTS_USER_TEMPLATE
@@ -576,12 +622,47 @@ def test_hints_prompt_has_encoding_shape_menu() -> None:
     assert "from:" not in HINTS_USER_TEMPLATE
     assert "Do not invent pool-external formulas" not in HINTS_USER_TEMPLATE
     assert "no pool anchor" not in HINTS_USER_TEMPLATE
-    assert "named benchmark" in HINTS_USER_TEMPLATE
+    assert "simpler than GOAL" in HINTS_USER_TEMPLATE
+    assert "PROBLEM BACKGROUND" in HINTS_USER_TEMPLATE
+    assert "do not name algorithms or benchmark lemmas" in HINTS_USER_TEMPLATE
+    assert "named benchmark" not in HINTS_USER_TEMPLATE
+    assert "language-algebra" not in HINTS_USER_TEMPLATE
+    assert "DO NOT REPEAT" in HINTS_USER_TEMPLATE
+    assert "LEMMA LIBRARY formulas (already proved)" in HINTS_USER_TEMPLATE
+    assert "already proved axioms" in HINTS_SYSTEM
+    assert "difficulty ranks" not in HINTS_SYSTEM
+    assert "search-change stats" not in HINTS_SYSTEM
+    assert "Never refer to candidates by id" not in HINTS_SYSTEM
+    assert "quote it in full" not in HINTS_SYSTEM
     for banned in (
         "rotate", "insort", "bubsort", "butlast", "mul3acc", "zip",
     ):
         assert banned not in HINTS_SYSTEM
         assert banned not in HINTS_USER_TEMPLATE
+
+
+def test_format_hints_system_binds_hard_axioms_and_stats() -> None:
+    assert format_hints_system() == HINTS_SYSTEM
+    assert format_hints_system({}) == HINTS_SYSTEM
+    assert "HARD AXIOMS" not in format_hints_system({"hard_axioms": []})
+    hd = format_hints_system({
+        "hard_axioms": [{"formula": AX, "rank": 1}],
+    })
+    assert HINTS_SYSTEM in hd or "HARD AXIOMS rank runtime hotspots" in hd
+    assert "HARD AXIOMS rank runtime hotspots" in hd
+    assert "not proof necessity" in hd
+    assert "SEARCH CHANGE VS BASELINE" not in hd
+    stats = format_hints_system({
+        "stats_delta": {"CONJ_TOTAL": "up"},
+    })
+    assert "SEARCH CHANGE VS BASELINE stats are weak signals" in stats
+    assert "HARD AXIOMS" not in stats
+    both = format_hints_system({
+        "axioms": [{"id": "A1", "formula": AX}],
+        "stats_delta": {"INST_TOTAL": "down"},
+    })
+    assert "HARD AXIOMS rank runtime hotspots" in both
+    assert "SEARCH CHANGE VS BASELINE" in both
 
 
 def test_new_direction_text_only() -> None:
@@ -707,8 +788,13 @@ def test_maybe_refresh_runs_without_difficulty(tmp_path: Path) -> None:
             current_goal=GOAL,
         )
         inv.assert_called_once()
-    user = inv.call_args.args[1][1]["content"]
+    messages = inv.call_args.args[1]
+    system = messages[0]["content"]
+    user = messages[1]["content"]
     assert "=== HARD AXIOMS" not in user
+    assert "HARD AXIOMS rank runtime hotspots" not in system
+    assert "SEARCH CHANGE VS BASELINE stats" not in system
+    assert "Never refer to candidates by id" not in system
     assert "=== LAST CANDIDATE LEMMAS" in user
     assert f"=== GOAL ===\n  {GOAL}" in user
     assert "(unknown)" not in user
@@ -1082,6 +1168,7 @@ if __name__ == "__main__":
     test_pack_skips_initial_and_baseline_hd()
     test_pack_filters_goal_terms_from_usefulness_hd()
     test_pack_without_difficulty_omits_hard_axioms()
+    test_pack_do_not_repeat_ancestors_and_invalid_omits_timeout()
     test_pack_goal_prefers_current_node_over_hd_fragments()
     test_pack_keeps_long_formulas()
     test_pack_candidates_attributed_stats_and_prove()
@@ -1091,6 +1178,8 @@ if __name__ == "__main__":
     test_parse_revive_accepts_adapted_formula()
     test_parse_revive_drops_empty_formula()
     test_no_action_not_injected()
+    test_hints_prompt_has_encoding_shape_menu()
+    test_format_hints_system_binds_hard_axioms_and_stats()
     test_new_direction_text_only()
     test_legacy_hold_not_injected()
     test_parse_legacy_json_collapsed()

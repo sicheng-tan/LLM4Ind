@@ -1916,6 +1916,7 @@ def generate_lemmas_with_llm(
             backend="cvc5",
             current_goal=formula,
             smt_content=smt_content,
+            ancestor_stack=ancestor_stack,
         )
     messages, feedback = create_prompt(
         smt_content, prompt_strategy, base_path, goal_name, folder_path,

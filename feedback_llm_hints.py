@@ -12,6 +12,8 @@ unless a feedback consumer needs it. GOAL is the current proof-node formula.
 The diagnoser chooses no_action (leave generation alone), new_direction
 (text only), or revise_candidate (pending formulas plus notes). Revival
 candidates are not copied into the generator's USEFUL BUT UNPROVED block.
+DO NOT REPEAT lists strict ancestor goals on the current proof path and
+invalid lemmas; usefulness timeout is not a ban.
 """
 
 from __future__ import annotations
@@ -90,14 +92,15 @@ _ID_TOKEN = re.compile(r"\b([EAGCR]\d+)\b")
 HINTS_SYSTEM = """You help repair a failed SMT inductive attempt.
 You receive blocked solver observations for your reading only.
 Rules:
-- difficulty ranks runtime hotspots; not proof necessity.
-- search-change stats are weak signals; for reference only.
 - Revival candidates are unproved. They may be true or false, useful or useless;
   they are not known true and not library axioms.
+- LEMMA LIBRARY formulas are already proved axioms. Do not put them in revive
+  and do not ask the generator to regenerate α-equivalent copies.
+- DO NOT REPEAT ancestor goals on the current proof path and
+  invalid lemmas. Do not revive or restate them.
 - PROBLEM BACKGROUND is the theory encoding extracted from the SMT file
-  (datatypes, definitions, background asserts). The goal itself is omitted;
-  see GOAL. This is not a difficulty dump and not proof necessity.
-- The lemma library has new proved axioms. Re-evaluate the unproved revival candidates
+  (datatypes, definitions, background asserts).
+- If lemma library has new proved axioms, re-evaluate the unproved revival candidates
   in that new context.
 - Choose exactly one mode:
   NO_ACTION: generation should proceed as usual; do not steer it.
@@ -105,8 +108,37 @@ Rules:
     explain a different lemma shape in the note.
   REVISE_CANDIDATE: put a few unproved reference formulas in revive
     (copy or lightly adapt from the revival pool); the lemma generator
-    decides how to use them.
-- When you mention a formula, quote it in full. Never refer to candidates by id."""
+    decides how to use them."""
+
+HINTS_SYSTEM_HARD_AXIOMS = (
+    "- HARD AXIOMS rank runtime hotspots from the last usefulness dump; "
+    "not proof necessity."
+)
+HINTS_SYSTEM_SEARCH_CHANGE = (
+    "- SEARCH CHANGE VS BASELINE stats are weak signals; for reference only."
+)
+
+
+def format_hints_system(pack: Optional[dict] = None) -> str:
+    """Base system prompt, plus bullets only for sections actually in *pack*.
+
+    HARD AXIOMS follow ``FEEDBACK_LLM_HINTS_HD`` (dump-difficulty). SEARCH
+    CHANGE is CVC ``--stats`` (CONJ/INST/SKOL) and does not require HD.
+    """
+    extra: List[str] = []
+    data = pack if isinstance(pack, dict) else {}
+    if data.get("hard_axioms") or data.get("axioms"):
+        extra.append(HINTS_SYSTEM_HARD_AXIOMS)
+    delta = data.get("stats_delta")
+    if isinstance(delta, dict) and delta:
+        extra.append(HINTS_SYSTEM_SEARCH_CHANGE)
+    if not extra:
+        return HINTS_SYSTEM
+    head, sep, tail = HINTS_SYSTEM.partition("Rules:\n")
+    if not sep:
+        return HINTS_SYSTEM + "\n" + "\n".join(extra)
+    return head + sep + "\n".join(extra) + "\n" + tail
+
 
 HINTS_USER_TEMPLATE = """From the observations below, choose a mode and write a short note.
 
@@ -131,14 +163,14 @@ Return ONLY one JSON object:
   3) Bridge two order encodings only if BOTH comparison symbols appear,
      e.g. (=> (not (< a b)) (>= a b)) or (=> (not (lt a b)) (leq b a)).
      Skip if the file has only one comparison.
-  Quote at most one adapted example formula. Do not suggest algorithm
-  equivalences, language-algebra identities, or named benchmark lemmas.
+  Quote at most one adapted example. Suggest a lemma simpler than GOAL
+  using PROBLEM BACKGROUND.
 - REVISE_CANDIDATE: put up to {max_revive} non-empty formulas in revive (copy or
   lightly adapt from REVIVAL CANDIDATES when helpful). Drop tautologies,
-  formulas that repeat the GOAL up to renaming, and lemmas whose symbols are
-  unrelated to the goal. If nothing in the pool is relevant, use NEW_DIRECTION
-  or NO_ACTION instead. Each revive entry needs a short note explaining how
-  that formula might help the CURRENT goal.
+  formulas that repeat the GOAL up to renaming, lemmas whose symbols are
+  unrelated to the goal, LEMMA LIBRARY formulas (already proved), and
+  DO NOT REPEAT proof-path ancestors, invalid lemmas.
+  Each revive entry needs a short note explaining how that formula might help the CURRENT goal.
 LAST CANDIDATE LEMMAS are the previous generation round.
 REVIVAL CANDIDATES are historical unproved lemmas, not only last round.
 
@@ -361,6 +393,57 @@ def _revival_candidate_items(failed_data: dict) -> List[Dict[str, str]]:
     for i, item in enumerate(out, 1):
         item["id"] = f"R{i}"
     return out
+
+
+def _do_not_repeat_items(
+    failed_data: Optional[dict],
+    ancestor_stack: Optional[Sequence[Any]] = None,
+) -> List[Dict[str, str]]:
+    """Strict proof-path ancestors plus invalid lemmas. Not timeout/sat groups."""
+    seen: Set[str] = set()
+
+    def _item(formula: Any, kind: str, **extra: str) -> Optional[Dict[str, str]]:
+        key = normalize_lemma_formula(str(formula or ""))
+        if not key or key in seen:
+            return None
+        seen.add(key)
+        rec: Dict[str, str] = {
+            "formula": _prompt_formula(str(formula or "")),
+            "kind": kind,
+        }
+        for name, value in extra.items():
+            if value:
+                rec[name] = value
+        return rec
+
+    ancestors: List[Dict[str, str]] = []
+    for entry in ancestor_stack or ():
+        if not isinstance(entry, dict):
+            continue
+        depth = entry.get("depth")
+        rec = _item(
+            entry.get("formula"),
+            "ancestor",
+            depth="" if depth is None else str(depth),
+            goal_id=str(entry.get("goal_id") or ""),
+        )
+        if rec:
+            ancestors.append(rec)
+
+    invalids: List[Dict[str, str]] = []
+    for rec in (failed_data or {}).get("invalid_lemmas") or []:
+        if isinstance(rec, dict):
+            lemma = rec.get("lemma") or rec.get("formula")
+            reason = str(rec.get("reason") or "").strip()
+        else:
+            lemma = rec
+            reason = ""
+        item = _item(lemma, "invalid", reason=reason)
+        if item:
+            invalids.append(item)
+    if len(invalids) > MAX_LIBRARY_SHOW:
+        invalids = invalids[-MAX_LIBRARY_SHOW:]
+    return ancestors + invalids
 
 
 def _source_attempt_id(
@@ -625,14 +708,17 @@ def build_observation_pack(
     prev_library_ids: Optional[Sequence[str]] = None,
     current_goal: Optional[str] = None,
     smt_content: Optional[str] = None,
+    ancestor_stack: Optional[Sequence[Any]] = None,
 ):
     """Pack goal / background / optional hard axioms / last / library / revive.
 
-    Difficulty is optional (``FEEDBACK_LLM_HINTS_HD``). None only when there is
-    no goal, no background, no last group, no library, and no revival pool.
+    Difficulty (HARD AXIOMS) is optional (``FEEDBACK_LLM_HINTS_HD``). SEARCH
+    CHANGE uses mix/baseline ``--stats`` and is independent of HD. Returns
+    None only when there is no goal, no background, no last group, no
+    library, and no revival pool.
     Caller should also gate on ``llm_hints_eligible``. Goal comes from the
     current proof node (``current_goal`` or the obligation-tree root), not
-    from HD.
+    from HD. ``ancestor_stack`` is the current proof path (strict ancestors).
     """
     include_hd = feedback_llm_hints_hd_enabled()
     hd = (_latest_hd_hint(failed_data) or {}) if include_hd else {}
@@ -706,6 +792,7 @@ def build_observation_pack(
 
     lib_items = _library_show_items(library or [], prev_ids=prev_library_ids)
     revive_pool = _revival_candidate_items(failed_data)
+    do_not_repeat = _do_not_repeat_items(failed_data, ancestor_stack)
     background = extract_theory_background(smt_content)
     if not (
         goal
@@ -746,6 +833,7 @@ def build_observation_pack(
         "previous_candidates": candidates,
         "library": lib_items,
         "library_new": any(bool(item.get("new")) for item in lib_items),
+        "do_not_repeat": do_not_repeat,
         "revival_candidates": revive_pool,
         "group_status": str((group or {}).get("status") or base.get("status") or ""),
         "status": str((group or {}).get("status") or base.get("status") or ""),
@@ -848,6 +936,29 @@ def format_observation_prompt_body(pack):
             lines.append(f"  - {item.get('formula')}{role_bit}{new_bit}")
     else:
         lines.append("  (empty)")
+
+    banned = pack.get("do_not_repeat") or []
+    if banned:
+        lines.append("")
+        lines.append(
+            "=== DO NOT REPEAT (proof-path ancestors; invalid lemmas) ==="
+        )
+        lines.append(
+            "  Do not revive or restate these. Usefulness timeout is not listed."
+        )
+        for item in banned:
+            kind = str(item.get("kind") or "")
+            formula = item.get("formula")
+            if kind == "ancestor":
+                depth = item.get("depth")
+                depth_bit = f", depth={depth}" if depth not in (None, "") else ""
+                lines.append(f"  - {formula}  [ancestor{depth_bit}]")
+            elif kind == "invalid":
+                reason = str(item.get("reason") or "").strip()
+                reason_bit = f"; {reason}" if reason else ""
+                lines.append(f"  - {formula}  [invalid{reason_bit}]")
+            else:
+                lines.append(f"  - {formula}")
 
     revive_pool = pack.get("revival_candidates") or []
     lines.append("")
@@ -1186,6 +1297,7 @@ def maybe_refresh_llm_hints(
     backend: str = "cvc5",
     current_goal: Optional[str] = None,
     smt_content: Optional[str] = None,
+    ancestor_stack: Optional[Sequence[Any]] = None,
 ) -> Optional[dict]:
     """Run LLM-hints when flag is on and usefulness failed.
 
@@ -1195,6 +1307,7 @@ def maybe_refresh_llm_hints(
     and when stored hints already match the current attempt_id. HD hotspots
     follow ``FEEDBACK_LLM_HINTS_HD``. ``current_goal`` is the formula of the
     node being proved; ``smt_content`` supplies the theory background.
+    ``ancestor_stack`` is the current proof path (strict ancestors).
     """
     if not feedback_llm_hints_enabled():
         return None
@@ -1219,6 +1332,7 @@ def maybe_refresh_llm_hints(
         prev_library_ids=baseline,
         current_goal=current_goal,
         smt_content=smt_content,
+        ancestor_stack=ancestor_stack,
     )
     if pack is None:
         _persist_library_baseline(
@@ -1259,8 +1373,9 @@ def maybe_refresh_llm_hints(
         return None
 
     user_body = format_observation_prompt_body(pack)
+    system_text = format_hints_system(pack)
     messages = [
-        {"role": "system", "content": HINTS_SYSTEM},
+        {"role": "system", "content": system_text},
         {"role": "user", "content": HINTS_USER_TEMPLATE.format(body=user_body)},
     ]
     started = time.time()
@@ -1297,7 +1412,7 @@ def maybe_refresh_llm_hints(
         strategy="feedback_llm_hints",
         prompt_folder="",
         smt_file="",
-        system_text=HINTS_SYSTEM,
+        system_text=system_text,
         user_text=messages[1]["content"],
         feedback="",
         lemmas=hint_revive_list(hints or {}),
