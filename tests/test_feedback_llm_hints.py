@@ -804,7 +804,7 @@ def test_maybe_refresh_runs_without_difficulty(tmp_path: Path) -> None:
     assert rec["hints"]["mode"] == "new_direction"
 
 
-def test_has_hint_opportunity_revival_or_library_new() -> None:
+def test_has_hint_opportunity_revival_and_library_new() -> None:
     lemma = "(forall ((n Nat)) (= (plus n zero) n))"
     empty = _hd_data(useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}])
     empty["revival_lemmas"] = []
@@ -815,13 +815,16 @@ def test_has_hint_opportunity_revival_or_library_new() -> None:
         useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}],
     )
     lib = [{"id": "lib_1", "formula": AX, "role": "pin"}]
-    assert has_hint_opportunity(with_pool) is True
+    # Pool alone (no library growth) is not enough.
+    assert has_hint_opportunity(with_pool) is False
+    assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=["lib_1"]) is False
+    # Lib-only (empty pool) is not enough.
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_0"]) is False
+    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_1"]) is False
+    # Both sides: pool nonempty and library [NEW] vs baseline.
     assert has_hint_opportunity(with_pool, library=lib) is True
     assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=[]) is True
     assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=["lib_0"]) is True
-    assert has_hint_opportunity(with_pool, library=lib, prev_library_ids=["lib_1"]) is True
-    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_0"]) is True
-    assert has_hint_opportunity(empty, library=lib, prev_library_ids=["lib_1"]) is False
 
 
 def test_revival_pack_drops_library_alpha_equivalents() -> None:
@@ -858,7 +861,9 @@ def test_revival_pack_drops_library_alpha_equivalents() -> None:
     body = format_observation_prompt_body(pack)
     assert other in body
     assert "child_pending" not in body
-    assert has_hint_opportunity(data, library=lib, prev_library_ids=["lib_1"]) is True
+    # Pool still has *other*; library not NEW vs baseline → no opportunity.
+    assert has_hint_opportunity(data, library=lib, prev_library_ids=["lib_1"]) is False
+    assert has_hint_opportunity(data, library=lib, prev_library_ids=[]) is True
 
     only_lib = _hd_data(
         unproved_lemmas=[{"lemma": lemma, "status": "timeout"}],
@@ -867,12 +872,13 @@ def test_revival_pack_drops_library_alpha_equivalents() -> None:
         }],
         useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}],
     )
+    # After α-drop the pool is empty → AND fails even when library is NEW.
     assert has_hint_opportunity(
         only_lib, library=lib, prev_library_ids=["lib_1"],
     ) is False
     assert has_hint_opportunity(
         only_lib, library=lib, prev_library_ids=[],
-    ) is True
+    ) is False
     packed = build_observation_pack(
         only_lib, library=lib, prev_library_ids=["lib_1"],
     )
@@ -925,10 +931,9 @@ def test_maybe_refresh_skips_empty_pool_without_library_delta(tmp_path: Path) ->
 
 
 def test_maybe_refresh_snapshots_then_runs_on_library_growth(tmp_path: Path) -> None:
+    """Pool alone skips; after baseline snap, library growth + pool runs."""
     base = str(tmp_path)
     data = _hd_data_with_useless()
-    data["unproved_lemmas"] = []
-    data["revival_lemmas"] = []
     mate.save_failed_lemmas(base, "template", data)
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
         "feedback_llm_hints.invoke_configured_chat",
@@ -967,6 +972,30 @@ def test_maybe_refresh_snapshots_then_runs_on_library_growth(tmp_path: Path) -> 
         inv.assert_called_once()
     assert rec is not None
     assert rec["hints"]["mode"] == "new_direction"
+
+
+def test_maybe_refresh_skips_lib_only_without_pool(tmp_path: Path) -> None:
+    """Library [NEW] alone must not start the diagnoser."""
+    base = str(tmp_path)
+    data = _hd_data_with_useless()
+    data["unproved_lemmas"] = []
+    data["revival_lemmas"] = []
+    data["llm_hints"] = {"library_ids": []}
+    mate.save_failed_lemmas(base, "template", data)
+    _write_library(tmp_path)
+    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}), patch(
+        "feedback_llm_hints.invoke_configured_chat",
+    ) as inv:
+        out = maybe_refresh_llm_hints(
+            base,
+            "template",
+            llm=MagicMock(),
+            config=mate.config,
+            load_failed_lemmas=mate.load_failed_lemmas,
+            save_failed_lemmas=mate.save_failed_lemmas,
+        )
+        inv.assert_not_called()
+    assert out is None
 
 
 def test_maybe_refresh_first_call_nonempty_library_vs_empty(tmp_path: Path) -> None:
@@ -1246,7 +1275,7 @@ if __name__ == "__main__":
         test_maybe_refresh_skips_without_difficulty(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_useless_group(Path(tmp))
-    test_has_hint_opportunity_revival_or_library_new()
+    test_has_hint_opportunity_revival_and_library_new()
     test_revival_pack_drops_library_alpha_equivalents()
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_skips_without_opportunity(Path(tmp))
@@ -1254,6 +1283,8 @@ if __name__ == "__main__":
         test_maybe_refresh_skips_empty_pool_without_library_delta(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_snapshots_then_runs_on_library_growth(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        test_maybe_refresh_skips_lib_only_without_pool(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         test_maybe_refresh_first_call_nonempty_library_vs_empty(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:

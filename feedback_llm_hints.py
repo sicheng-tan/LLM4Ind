@@ -2,8 +2,8 @@
 
 Default **off**. Requires at least one failed usefulness group (so the first
 lemma-generation call is never steered by HD-only hints). After a useless
-group, the diagnoser runs if the independent ``revival_lemmas`` pool is
-nonempty **or** the lemma library has ``[NEW]`` ids vs the last baseline
+group, the diagnoser runs only if the independent ``revival_lemmas`` pool is
+nonempty **and** the lemma library has ``[NEW]`` ids vs the last baseline
 (first call compares against an empty library). The pack includes a
 preprocessed theory background (datatypes / definitions / background
 asserts; goal omitted). HD hotspots are optional via
@@ -242,16 +242,18 @@ def has_hint_opportunity(
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
 ) -> bool:
-    """True when the revival pool is nonempty *or* the library grew.
+    """True when the revival pool is nonempty *and* the library grew.
 
-    Missing ``prev_library_ids`` is an empty-library baseline: any current
-    library id counts as a change (the first diagnoser call).
+    Both sides are required so lib-only calls (empty pool → only
+    NEW_DIRECTION / NO_ACTION) do not steer generation. Missing
+    ``prev_library_ids`` is an empty-library baseline: any current library
+    id counts as a change (the first diagnoser call).
     """
     prev = [] if prev_library_ids is None else list(prev_library_ids)
     lib_new = _library_has_new_ids(library or [], prev_ids=prev)
     return bool(
         _revival_candidate_items(failed_data or {}, library=library)
-    ) or lib_new
+    ) and lib_new
 
 
 def _library_has_new_ids(
@@ -1317,8 +1319,8 @@ def maybe_refresh_llm_hints(
     """Run LLM-hints when flag is on and usefulness failed.
 
     Skips Vampire, fewer than ``MIN_USELESS_GROUPS_FOR_HINTS`` groups,
-    empty revival pool with no library growth vs the last baseline
-    (first call: vs empty library),
+    empty revival pool, no library growth vs the last baseline
+    (first call: vs empty library; both pool and ``[NEW]`` required),
     and when stored hints already match the current attempt_id. HD hotspots
     follow ``FEEDBACK_LLM_HINTS_HD``. ``current_goal`` is the formula of the
     node being proved; ``smt_content`` supplies the theory background.
