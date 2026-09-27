@@ -19,6 +19,9 @@ invalid write-back. Soft ``soft_rejected_lemmas`` hold node-local suppressions
 (same_as_goal, solver errors, undefined_symbol, …) that are not necessarily
 false; they feed screening and a separate prompt block, never INVALID.
 ``FEEDBACK_PROGRESS`` remains default off.
+``PROOF_SHAPE_HINT`` (default off) appends a short observer/recursion hint after
+LAST ATTEMPT usefulness-fail kept and/or USEFUL BUT UNPROVED (sublemma proof
+fail); not the diagnoser.
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 LLM_SCREEN_RETRIES extra generation after static screen kept=0 (default 1);
@@ -36,7 +39,12 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from exp_flags import _flag_enabled, feedback_llm_hints_enabled, prompt_advice_enabled
+from exp_flags import (
+    _flag_enabled,
+    feedback_llm_hints_enabled,
+    prompt_advice_enabled,
+    proof_shape_hint_enabled,
+)
 from obligation_tree import (
     compact_formula,
     lemmas_equivalent,
@@ -170,6 +178,21 @@ SCREEN_RETRY_USER = (
     "or library axioms up to renaming. "
     "For parse_error/type_error, fix syntax or sorts "
     "(e.g. no undeclared plus; rename binder as→xs)."
+)
+PROOF_SHAPE_HINT_BLOCK = (
+    "\nPROOF-SHAPE HINT:\n"
+    "\n"
+    "- Preserve the observer in the goal. Equal observed results do not imply that\n"
+    "  the underlying structures are equal. For example,\n"
+    "  length(reverse(xs)) = length(xs) does not justify reverse(xs) = xs.\n"
+    "\n"
+    "- If the relevant function is recursive, inspect its supplied definition and\n"
+    "  propose at most one helper matching a constructor case. Generalize any\n"
+    "  parameters needed by the recursive call.\n"
+    "\n"
+    "- Use induction only when the definition gives a smaller recursive argument.\n"
+    "  Do not output an induction hypothesis as an unconditional lemma. Skip this\n"
+    "  hint if the supplied theory does not support the reasoning."
 )
 
 
@@ -1340,6 +1363,34 @@ def compact_repair_snapshot(hints: Sequence[dict]) -> List[dict]:
 def last_useless_group(failed_data: Optional[dict]) -> Any:
     groups = (failed_data or {}).get("useless_lemma_groups") or []
     return groups[-1] if groups else None
+
+
+def _unproved_lemma_formulas(failed_data: Optional[dict]) -> List[str]:
+    """Lemmas recorded as useful-but-unproved (sublemma prove failure)."""
+    out: List[str] = []
+    for item in (failed_data or {}).get("unproved_lemmas") or []:
+        if isinstance(item, dict):
+            lemma = str(item.get("lemma") or "").strip()
+        else:
+            lemma = str(item or "").strip()
+        if lemma:
+            out.append(lemma)
+    return out
+
+
+def should_append_proof_shape_hint(failed_data: Optional[dict]) -> bool:
+    """True when flag on and either usefulness-fail kept or sublemma unproved.
+
+    - Usefulness fail: same ``last_useless_group`` as LAST ATTEMPT kept.
+    - Sublemma prove fail: non-empty ``unproved_lemmas`` (USEFUL BUT UNPROVED).
+    Lifetime follows those records (not a one-shot after a single attempt).
+    Screen-only / illformed drops alone do not trigger.
+    """
+    if not proof_shape_hint_enabled():
+        return False
+    if _group_lemmas(last_useless_group(failed_data)):
+        return True
+    return bool(_unproved_lemma_formulas(failed_data))
 
 
 def _group_lemmas(group: Any) -> List[str]:

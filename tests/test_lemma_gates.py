@@ -30,6 +30,8 @@ from lemma_gates import (
     format_attempt_feedback_for_prompt,
     format_diagnosis_invalid_prompt,
     format_repair_header,
+    PROOF_SHAPE_HINT_BLOCK,
+    should_append_proof_shape_hint,
     drop_equivalent_unproved,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
@@ -853,6 +855,71 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     assert "LAST ATTEMPT" in hidden
     assert "matching_weak" not in hidden
     assert "hidden" not in hidden
+
+
+def test_proof_shape_hint_after_usefulness_fail_only() -> None:
+    import Mate_new as mate_cvc
+
+    payload = {
+        "useless_lemma_groups": [{"lemmas": ["(L1)"], "status": "timeout"}],
+        "last_screen": [],
+        "unproved_lemmas": [],
+    }
+    with patch.dict(os.environ, {"PROOF_SHAPE_HINT": "off"}):
+        assert should_append_proof_shape_hint(payload) is False
+        off = mate_cvc.format_solver_feedback_for_prompt(payload)
+        assert "PROOF-SHAPE HINT" not in off
+    with patch.dict(os.environ, {"PROOF_SHAPE_HINT": "on", "UNPROVED_NOT_INVALID": "on"}):
+        assert should_append_proof_shape_hint(payload) is True
+        on = mate_cvc.format_solver_feedback_for_prompt(payload)
+        assert "LAST ATTEMPT" in on
+        assert "PROOF-SHAPE HINT" in on
+        assert "length(reverse(xs))" in on
+        assert PROOF_SHAPE_HINT_BLOCK.strip() in on
+        screen_only = {
+            "useless_lemma_groups": [],
+            "last_screen": [{
+                "lemma": "(forall ((x Nat)) true)",
+                "reason": "Same as original goal",
+                "gate": "same_as_goal",
+            }],
+            "unproved_lemmas": [],
+        }
+        assert should_append_proof_shape_hint(screen_only) is False
+        no_ug = mate_cvc.format_solver_feedback_for_prompt(screen_only)
+        assert "LAST ATTEMPT" in no_ug
+        assert "PROOF-SHAPE HINT" not in no_ug
+        # Stale usefulness kept still in LAST ATTEMPT → hint stays in sync with kept.
+        stale = {
+            "useless_lemma_groups": [{"lemmas": ["(L_old)"], "status": "timeout"}],
+            "last_screen": [{
+                "lemma": "(forall ((x Nat)) true)",
+                "reason": "Same as original goal",
+                "gate": "same_as_goal",
+            }],
+            "unproved_lemmas": [],
+        }
+        with_stale = mate_cvc.format_solver_feedback_for_prompt(stale)
+        assert "(L_old)" in with_stale
+        assert "PROOF-SHAPE HINT" in with_stale
+        # Sublemma prove failure alone (no useless group) also triggers.
+        unproved_only = {
+            "useless_lemma_groups": [],
+            "last_screen": [],
+            "unproved_lemmas": [{
+                "lemma": "(forall ((xs Lst)) (= (len (append xs nil)) (len xs)))",
+                "status": "timeout",
+            }],
+        }
+        assert should_append_proof_shape_hint(unproved_only) is True
+        with_unproved = mate_cvc.format_solver_feedback_for_prompt(unproved_only)
+        assert "USEFUL BUT UNPROVED" in with_unproved
+        assert "PROOF-SHAPE HINT" in with_unproved
+        assert with_unproved.count("PROOF-SHAPE HINT") == 1
+        empty = mate_cvc.format_solver_feedback_for_prompt(
+            {"useless_lemma_groups": [], "last_screen": [], "unproved_lemmas": []},
+        )
+        assert "PROOF-SHAPE HINT" not in empty
 
 
 def test_node_attempt_plan_child_cap() -> None:
@@ -2370,6 +2437,7 @@ def main() -> int:
     test_last_attempt_omits_lemma_difficulty_tags()
     test_stale_lemma_usage_json_is_not_prompted()
     test_last_attempt_prompt_keeps_latest_group_and_drops()
+    test_proof_shape_hint_after_usefulness_fail_only()
     test_node_attempt_plan_child_cap()
     test_llm_parse_retries_env()
     test_llm_screen_retries_env()

@@ -136,8 +136,10 @@ from lemma_gates import (
     llm_invalid_ce_verify_enabled,
     llm_invalid_ce_retries,
     format_ce_retry_user,
+    PROOF_SHAPE_HINT_BLOCK,
     should_append_diagnosis_suffix,
     should_accept_in_loop_invalid_goal,
+    should_append_proof_shape_hint,
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
@@ -1006,6 +1008,9 @@ def format_solver_feedback_for_prompt(
             parts.append(
                 f"  Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
             )
+
+    if should_append_proof_shape_hint(failed_data):
+        parts.append(PROOF_SHAPE_HINT_BLOCK)
 
     if routing_enabled():
         routing_txt = format_routing_for_prompt(

@@ -111,6 +111,15 @@ def progress_feedback_enabled() -> bool:
     return _flag_enabled("FEEDBACK_PROGRESS", default="off")
 
 
+def proof_shape_hint_enabled() -> bool:
+    """Append PROOF-SHAPE HINT after usefulness fail or unproved sublemma (default off).
+
+    Runtime lemma-generation feedback only; not produced by the LLM diagnoser
+    and not part of static prompt templates. Enable with ``PROOF_SHAPE_HINT=on``.
+    """
+    return _flag_enabled("PROOF_SHAPE_HINT", default="off")
+
+
 def prompt_retarget_enabled() -> bool:
     """Pick / switch generation templates from hint families and consecutive no-help."""
     return _flag_enabled("PROMPT_RETARGET")

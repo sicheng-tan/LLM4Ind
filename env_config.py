@@ -78,6 +78,7 @@ def setup_environment():
     feedback_llm_hints_hd = os.getenv('FEEDBACK_LLM_HINTS_HD', 'off')
     # 暂时弃用 (default off): 3s sidecar + progress lemmas; do not enable casually.
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
+    proof_shape_hint = os.getenv('PROOF_SHAPE_HINT', 'off')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
@@ -153,6 +154,7 @@ def setup_environment():
         'FEEDBACK_LLM_HINTS': feedback_llm_hints,
         'FEEDBACK_LLM_HINTS_HD': feedback_llm_hints_hd,
         'FEEDBACK_PROGRESS': feedback_progress,
+        'PROOF_SHAPE_HINT': proof_shape_hint,
         'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,

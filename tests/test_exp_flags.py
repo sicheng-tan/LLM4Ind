@@ -26,6 +26,7 @@ from exp_flags import (
     prompt_advice_enabled,
     prompt_retarget_active,
     prompt_retarget_enabled,
+    proof_shape_hint_enabled,
     repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
@@ -45,6 +46,7 @@ _FLAG_NAMES = (
     "FEEDBACK_LLM_HINTS",
     "FEEDBACK_LLM_HINTS_HD",
     "FEEDBACK_PROGRESS",
+    "PROOF_SHAPE_HINT",
     "PROMPT_RETARGET",
     "PROMPT_ADVICE",
     "UNPROVED_NOT_INVALID",
@@ -101,6 +103,7 @@ def test_flags_default_on() -> None:
         assert feedback_llm_hints_enabled() is False
         assert feedback_llm_hints_hd_enabled() is False
         assert progress_feedback_enabled() is False
+        assert proof_shape_hint_enabled() is False
         assert prompt_retarget_enabled() is True
         assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
@@ -123,6 +126,8 @@ def test_flags_default_on() -> None:
             assert feedback_llm_hints_hd_enabled() is False
         with patch.dict(os.environ, {"FEEDBACK_PROGRESS": val}):
             assert progress_feedback_enabled() is False
+        with patch.dict(os.environ, {"PROOF_SHAPE_HINT": val}):
+            assert proof_shape_hint_enabled() is False
         with patch.dict(os.environ, {"PROMPT_RETARGET": val}):
             assert prompt_retarget_enabled() is False
         with patch.dict(os.environ, {"PROMPT_ADVICE": val}):
@@ -145,6 +150,8 @@ def test_flags_default_on() -> None:
         assert llm_lemma_diagnosis_final_only() is True
     with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
         assert progress_feedback_enabled() is True
+    with patch.dict(os.environ, {"PROOF_SHAPE_HINT": "on"}):
+        assert proof_shape_hint_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": "on"}):
         assert formula_evidence_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}):
