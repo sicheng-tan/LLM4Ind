@@ -120,7 +120,6 @@ from lemma_gates import (
     promote_child_pending_lemmas,
     seed_revival_from_unproved,
     REVIVAL_ORIGIN_SITUATION_A,
-    llm_lemma_diagnosis_enabled,
     llm_parse_retries,
     llm_screen_retries,
     format_screen_retry_user,
@@ -129,6 +128,7 @@ from lemma_gates import (
     parse_llm_lemmas,
     parse_llm_reason,
     should_append_diagnosis_suffix,
+    should_accept_in_loop_invalid_goal,
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
@@ -1820,7 +1820,7 @@ def generate_lemmas_with_llm(
             )
         elif extracted_asserts:
             _store_last_llm_reason(base_path, goal_name, None)
-        elif llm_lemma_diagnosis_enabled():
+        elif should_accept_in_loop_invalid_goal(depth):
             _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
         return extracted_asserts
 
@@ -2925,7 +2925,7 @@ def _prove_run_body(
                 not ret
                 and not extracted_asserts
                 and depth >= 1
-                and llm_lemma_diagnosis_enabled()
+                and should_accept_in_loop_invalid_goal(depth)
             ):
                 reason = load_failed_lemmas(base_path, base_name).get("last_llm_reason")
                 if reason:

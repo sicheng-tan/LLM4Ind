@@ -34,6 +34,7 @@ from lemma_gates import (
     defined_symbols_enabled,
     lemma_filter_drop_enabled,
     llm_lemma_diagnosis_enabled,
+    llm_lemma_diagnosis_final_only,
     subgoal_sat_abort_enabled,
 )
 
@@ -50,6 +51,7 @@ _FLAG_NAMES = (
     "LEMMA_DEFINED_SYMBOLS",
     "LEMMA_FILTER_DROP",
     "LLM_LEMMA_DIAGNOSIS",
+    "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY",
 )
 
 _FEEDBACK_PAYLOAD = {
@@ -103,6 +105,7 @@ def test_flags_default_on() -> None:
         assert defined_symbols_enabled() is True
         assert lemma_filter_drop_enabled() is True
         assert llm_lemma_diagnosis_enabled() is True
+        assert llm_lemma_diagnosis_final_only() is True
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
@@ -130,6 +133,8 @@ def test_flags_default_on() -> None:
             assert lemma_filter_drop_enabled() is False
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": val}):
             assert llm_lemma_diagnosis_enabled() is False
+        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": val}):
+            assert llm_lemma_diagnosis_final_only() is False
     with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
         assert progress_feedback_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": "on"}):

@@ -160,6 +160,7 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "MAX_TOKENS=" in compact
     assert "LLM_PARSE_RETRIES=" in compact
     assert "LLM_SCREEN_RETRIES=" in compact
+    assert "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=" in compact
     assert "CHILD_LLM_ATTEMPTS=" in compact
 
 

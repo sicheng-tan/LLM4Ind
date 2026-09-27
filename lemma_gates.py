@@ -5,6 +5,10 @@ the original loop. CHILD_LLM_ATTEMPTS=0 keeps the root 2N budget at every depth.
 LEMMA_FILTER_DROP keeps remaining members after screening and continues
 usefulness; paper.env sets it off so any failing member aborts the group.
 The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
+``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY`` (default on) skips the in-loop INVALID_GOAL
+suffix and early ``llm_invalid`` stop; diagnosis runs only after child attempts
+are exhausted (``should_run_final_diagnosis``). Set it off to restore per-attempt
+empty+INVALID_GOAL abort.
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
 judges whether the CURRENT goal is invalid from the parent's accumulated
 ``invalid_lemmas`` (child write-back), same signal as in-loop diagnosis —
@@ -169,11 +173,30 @@ def llm_lemma_diagnosis_enabled() -> bool:
     return _flag_enabled("LLM_LEMMA_DIAGNOSIS")
 
 
+def llm_lemma_diagnosis_final_only() -> bool:
+    """When on (default), child diagnosis runs only after attempts are exhausted.
+
+    In-loop ``DIAGNOSIS_PROMPT_SUFFIX`` and early ``llm_invalid`` from empty
+    ``INVALID_GOAL`` are skipped. Final diagnosis-only call is unchanged.
+    Set ``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=off`` to restore per-attempt abort.
+    """
+    return _flag_enabled("LLM_LEMMA_DIAGNOSIS_FINAL_ONLY")
+
+
 def should_append_diagnosis_suffix(depth: int = 0) -> bool:
-    """Root (depth 0) never gets the diagnosis lines; children follow the flag."""
+    """Root never; children only when diagnosis is on and not final-only."""
     if int(depth or 0) <= 0:
         return False
-    return llm_lemma_diagnosis_enabled()
+    if not llm_lemma_diagnosis_enabled():
+        return False
+    if llm_lemma_diagnosis_final_only():
+        return False
+    return True
+
+
+def should_accept_in_loop_invalid_goal(depth: int = 0) -> bool:
+    """Empty ``INVALID_GOAL`` may end a child attempt (not final-only mode)."""
+    return should_append_diagnosis_suffix(depth)
 
 
 def llm_parse_retries() -> int:
@@ -349,7 +372,7 @@ def allow_unmarked_lemma_output(
         return True
     if int(depth or 0) <= 0:
         return False
-    if not llm_lemma_diagnosis_enabled():
+    if not should_accept_in_loop_invalid_goal(depth):
         return False
     return bool(parse_llm_reason(raw))
 
@@ -519,7 +542,7 @@ def parse_llm_lemmas(
         raise ValueError(PARSE_ERR_UNMATCHED)
     if not has_wrapper:
         raise ValueError(PARSE_ERR_MISSING_TAGS)
-    if int(depth or 0) >= 1 and parse_llm_reason(text):
+    if should_accept_in_loop_invalid_goal(depth) and parse_llm_reason(text):
         return []
     raise ValueError(PARSE_ERR_EMPTY)
 

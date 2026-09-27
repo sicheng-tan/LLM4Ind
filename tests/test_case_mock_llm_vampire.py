@@ -201,6 +201,7 @@ def test_mock_llm_case_experiments(result_parent: Path | None = None) -> Path:
         "SUBGOAL_SAT_ABORT": "on",
         "LEMMA_DEFINED_SYMBOLS": "on",
         "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "CHILD_LLM_ATTEMPTS": "2",
     }
     results: list[tuple] = []

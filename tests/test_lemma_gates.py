@@ -49,7 +49,9 @@ from lemma_gates import (
     parse_llm_reason,
     repair_hint_for_prompt,
     should_append_diagnosis_suffix,
+    should_accept_in_loop_invalid_goal,
     should_run_final_diagnosis,
+    llm_lemma_diagnosis_final_only,
     undefined_symbols_in_lemma,
     tree_status_from_child_data,
     with_parse_retry_hint,
@@ -365,7 +367,10 @@ def test_parse_llm_reason() -> None:
     )
     assert parse_final_diagnosis("; reason: plus has no axioms") == ("failed", None)
     assert parse_final_diagnosis("") == ("failed", None)
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+    }):
         assert allow_unmarked_lemma_output(
             "thinking\n; INVALID_GOAL: plus has no axioms\n",
             diagnosis_only=False,
@@ -389,6 +394,13 @@ def test_parse_llm_reason() -> None:
         )
         assert allow_unmarked_lemma_output(
             "thinking with no diagnosis line", diagnosis_only=True,
+        )
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
+    }):
+        assert not allow_unmarked_lemma_output(
+            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=1,
         )
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert not allow_unmarked_lemma_output(
@@ -441,10 +453,28 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
         empty_raised = True
         assert str(exc) == PARSE_ERR_EMPTY
     assert empty_raised
-    assert parse_llm_lemmas(
-        "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
-        depth=1,
-    ) == []
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+    }):
+        assert parse_llm_lemmas(
+            "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
+            depth=1,
+        ) == []
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
+    }):
+        final_only_raised = False
+        try:
+            parse_llm_lemmas(
+                "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
+                depth=1,
+            )
+        except ValueError as exc:
+            final_only_raised = True
+            assert str(exc) == PARSE_ERR_EMPTY
+        assert final_only_raised
     root_invalid_raised = False
     try:
         parse_llm_lemmas(
@@ -1027,6 +1057,8 @@ def test_quick_run_does_not_skip_unrelated_lemma() -> None:
         with patch.dict(os.environ, {
             "SOLVER_ROUTING": "off",
             "LEMMA_DEFINED_SYMBOLS": "off",
+            "LEMMA_WELLFORMED_CHECK": "off",
+            "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", return_value=[overlapping]
         ), patch("Mate_new_vampire.run_vampire", return_value=timeout) as vampire:
@@ -1075,7 +1107,10 @@ def test_diagnosis_suffix_flag() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+        }):
             root, _ = mate.create_prompt(
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
                 "./prompts_ours", depth=0,
@@ -1102,6 +1137,16 @@ def test_diagnosis_suffix_flag() -> None:
         assert "obligation tree" not in final[1]["content"]
         assert "still_open" not in final[1]["content"]
         assert "prior attempts" not in final[1]["content"]
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
+        }):
+            child_final_only, _ = mate.create_prompt(
+                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
+                "./prompts_ours", depth=1,
+            )
+        assert DIAGNOSIS_PROMPT_SUFFIX.strip() not in child_final_only[1]["content"]
+        assert "INVALID_GOAL: <short explanation>" not in child_final_only[1]["content"]
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
             child_off, _ = mate.create_prompt(
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
@@ -1111,9 +1156,21 @@ def test_diagnosis_suffix_flag() -> None:
 
 
 def test_should_append_diagnosis_by_depth() -> None:
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+    }):
         assert should_append_diagnosis_suffix(0) is False
         assert should_append_diagnosis_suffix(1) is True
+        assert should_accept_in_loop_invalid_goal(1) is True
+    with patch.dict(os.environ, {
+        "LLM_LEMMA_DIAGNOSIS": "on",
+        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
+    }):
+        assert should_append_diagnosis_suffix(1) is False
+        assert should_accept_in_loop_invalid_goal(1) is False
+        assert llm_lemma_diagnosis_final_only() is True
+        assert should_run_final_diagnosis(1) is True
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
         assert should_append_diagnosis_suffix(1) is False
 
@@ -1131,6 +1188,7 @@ def test_child_empty_reason_stops_attempts() -> None:
         timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
         with patch.dict(os.environ, {
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
@@ -1144,6 +1202,37 @@ def test_child_empty_reason_stops_attempts() -> None:
         outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
         assert outcome.get("kind") == "invalid"
         assert "plus" in outcome.get("reason", "")
+
+
+def test_final_only_skips_in_loop_invalid_continues_attempts() -> None:
+    import Mate_new as mate
+    from cvc5_runner import CvcResult
+
+    def fake_llm(_smt, _strat, _path, base_path, goal_name, _folder, depth=0, **_kwargs):
+        mate._store_last_llm_reason(base_path, goal_name, "plus has no axioms")
+        return []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
+            "SUBGOAL_SAT_ABORT": "off",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY": "off",
+            "CHILD_LLM_ATTEMPTS": "2",
+        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+            "Mate_new.generate_lemmas_with_llm", side_effect=fake_llm
+        ) as gen, patch(
+            "Mate_new._run_final_goal_diagnosis", return_value=False,
+        ) as final:
+            ok = mate.prove_run(tmp, "template", depth=1)
+        assert ok is False
+        assert gen.call_count == 2
+        final.assert_called_once()
+        outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
+        assert outcome.get("kind") != "invalid" or outcome.get("source") != "llm"
 
 
 class _InvalidGoalOnlyReply:
@@ -1174,6 +1263,7 @@ def _run_generate_lemmas(
         smt.write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_PARSE_RETRIES": retries,
         }), patch(
             f"{mod_name}.create_prompt",
@@ -1203,7 +1293,11 @@ def test_generate_reason_without_markers_stores_reason() -> None:
         fake_llm.invoke.return_value = _InvalidGoalOnlyReply()
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-            with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
+            with patch.dict(os.environ, {
+                "LLM_LEMMA_DIAGNOSIS": "on",
+                "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+                "LLM_PARSE_RETRIES": "0",
+            }), patch(
                 f"{mod_name}.create_prompt",
                 return_value=(
                     [
@@ -1422,6 +1516,7 @@ def test_parse_retry_does_not_consume_extra_attempt() -> None:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_PARSE_RETRIES": "1",
             "CHILD_LLM_ATTEMPTS": "2",
             "SUBGOAL_SAT_ABORT": "off",
@@ -1560,6 +1655,7 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
             "OBLIGATION_TREE": "on",
             "LEMMA_LIBRARY": "off",
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "FEEDBACK_REPAIR_HINTS": "off",
         }):
             root, root_extra = mate.create_prompt(
@@ -1597,6 +1693,7 @@ def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
             "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
@@ -1977,6 +2074,7 @@ def main() -> int:
     test_diagnosis_suffix_flag()
     test_should_append_diagnosis_by_depth()
     test_child_empty_reason_stops_attempts()
+    test_final_only_skips_in_loop_invalid_continues_attempts()
     test_generate_reason_without_markers_stores_reason()
     test_generate_unmarked_without_reason_still_raises()
     test_parse_retry_recovers_on_second_call()
