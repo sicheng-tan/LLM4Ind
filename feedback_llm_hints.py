@@ -379,6 +379,14 @@ def _revival_candidate_items(
         key = normalize_lemma_formula(raw)
         if key:
             invalid_keys.add(key)
+    for rec in data.get("soft_rejected_lemmas") or []:
+        if isinstance(rec, dict):
+            raw = str(rec.get("lemma") or "")
+        else:
+            raw = str(rec or "")
+        key = normalize_lemma_formula(raw)
+        if key:
+            invalid_keys.add(key)
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
     for rec in data.get("revival_lemmas") or []:
@@ -421,7 +429,11 @@ def _do_not_repeat_items(
     failed_data: Optional[dict],
     ancestor_stack: Optional[Sequence[Any]] = None,
 ) -> List[Dict[str, str]]:
-    """Strict proof-path ancestors plus invalid lemmas. Not timeout/sat groups."""
+    """Strict proof-path ancestors plus hard/soft rejected lemmas.
+
+    Not timeout/sat groups. Soft suppressions use kind ``do_not_repeat``,
+    not ``invalid``.
+    """
     seen: Set[str] = set()
 
     def _item(formula: Any, kind: str, **extra: str) -> Optional[Dict[str, str]]:
@@ -465,7 +477,21 @@ def _do_not_repeat_items(
             invalids.append(item)
     if len(invalids) > MAX_LIBRARY_SHOW:
         invalids = invalids[-MAX_LIBRARY_SHOW:]
-    return ancestors + invalids
+
+    banned_soft: List[Dict[str, str]] = []
+    for rec in (failed_data or {}).get("soft_rejected_lemmas") or []:
+        if isinstance(rec, dict):
+            lemma = rec.get("lemma") or rec.get("formula")
+            reason = str(rec.get("reason") or "").strip()
+        else:
+            lemma = rec
+            reason = ""
+        item = _item(lemma, "do_not_repeat", reason=reason)
+        if item:
+            banned_soft.append(item)
+    if len(banned_soft) > MAX_LIBRARY_SHOW:
+        banned_soft = banned_soft[-MAX_LIBRARY_SHOW:]
+    return ancestors + invalids + banned_soft
 
 
 def _source_attempt_id(
@@ -970,7 +996,7 @@ def format_observation_prompt_body(pack):
     if banned:
         lines.append("")
         lines.append(
-            "=== DO NOT REPEAT (proof-path ancestors; invalid lemmas) ==="
+            "=== DO NOT REPEAT (proof-path ancestors; invalid / do not repeat) ==="
         )
         lines.append(
             "  Do not revive or restate these. Usefulness timeout is not listed."
@@ -986,6 +1012,10 @@ def format_observation_prompt_body(pack):
                 reason = str(item.get("reason") or "").strip()
                 reason_bit = f"; {reason}" if reason else ""
                 lines.append(f"  - {formula}  [invalid{reason_bit}]")
+            elif kind in ("do_not_repeat", "suppressed"):
+                reason = str(item.get("reason") or "").strip()
+                reason_bit = f"; {reason}" if reason else ""
+                lines.append(f"  - {formula}  [do not repeat{reason_bit}]")
             else:
                 lines.append(f"  - {formula}")
 

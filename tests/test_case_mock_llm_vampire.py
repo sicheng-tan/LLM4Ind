@@ -202,6 +202,7 @@ def test_mock_llm_case_experiments(result_parent: Path | None = None) -> Path:
         "LEMMA_DEFINED_SYMBOLS": "on",
         "LLM_LEMMA_DIAGNOSIS": "on",
         "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+        "LLM_INVALID_CE_VERIFY": "off",
         "CHILD_LLM_ATTEMPTS": "2",
     }
     results: list[tuple] = []

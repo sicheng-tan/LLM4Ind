@@ -21,6 +21,7 @@ from vampire_runner import (
     vampire_diagnostic_profile,
     VampireResult,
 )
+from cvc5_runner import verify_llm_goal_counterexample
 from solver_routing import (
     GoalSearchState,
     build_search_state,
@@ -106,14 +107,18 @@ from lemma_gates import (
     attach_source_lemmas,
     BENIGN_SCREEN_GATES,
     ILLFORMED_SCREEN_GATES,
+    SOFT_SCREEN_GATES,
     compact_repair_snapshot,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
     format_diagnosis_invalid_prompt,
+    format_soft_rejected_prompt,
+    infer_soft_reject_gate,
     last_screen_records,
     is_invalid_diagnosis_reason,
     lemma_filter_drop_enabled,
     lemma_known_invalid,
+    lemma_known_soft_rejected,
     lemma_known_unproved,
     lemma_same_as_goal,
     add_revival_lemma,
@@ -127,6 +132,10 @@ from lemma_gates import (
     parse_final_diagnosis,
     parse_llm_lemmas,
     parse_llm_reason,
+    parse_llm_counterexample_smt,
+    llm_invalid_ce_verify_enabled,
+    llm_invalid_ce_retries,
+    format_ce_retry_user,
     should_append_diagnosis_suffix,
     should_accept_in_loop_invalid_goal,
     should_run_final_diagnosis,
@@ -177,6 +186,7 @@ def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
 def _empty_failed_data() -> dict:
     return {
         "invalid_lemmas": [],
+        "soft_rejected_lemmas": [],
         "illformed_lemmas": [],
         "useless_lemma_groups": [],
         "progress_lemmas": [],
@@ -192,6 +202,7 @@ def _empty_failed_data() -> dict:
         "exp_attempts": [],
         "node_outcome": {},
         "last_llm_reason": "",
+        "last_llm_ce_smt": "",
         "last_screen": [],
         "llm_hints": {},
     }
@@ -205,6 +216,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
                 data = json.load(f)
             # Backward compatible defaults
             data.setdefault("invalid_lemmas", [])
+            data.setdefault("soft_rejected_lemmas", [])
             data.setdefault("illformed_lemmas", [])
             data.setdefault("useless_lemma_groups", [])
             data.setdefault("progress_lemmas", [])
@@ -220,6 +232,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("exp_attempts", [])
             data.setdefault("node_outcome", {})
             data.setdefault("last_llm_reason", "")
+            data.setdefault("last_llm_ce_smt", "")
             data.setdefault("last_screen", [])
             data.setdefault("llm_hints", {})
             return data
@@ -255,7 +268,10 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
                 pass
 
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
-    """添加无效引理记录。公式已在列表中则保留原 reason，不追加。"""
+    """Hard invalid: solver-refuted or LLM/solver child write-back.
+
+    Formula already present keeps the original reason (no append).
+    """
     failed_data = load_failed_lemmas(base_path, goal_name)
     if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
         return
@@ -264,6 +280,32 @@ def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     save_failed_lemmas(base_path, goal_name, failed_data)
     logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
     log_exp("invalid_lemma", goal=goal_name, reason=reason)
+
+
+def add_soft_rejected_lemma(
+    base_path: str,
+    goal_name: str,
+    lemma: str,
+    reason: str,
+    *,
+    gate: str = "",
+) -> None:
+    """Node-local suppression: not necessarily false; never hard INVALID."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    soft = failed_data.setdefault("soft_rejected_lemmas", [])
+    if lemma_known_soft_rejected(lemma, soft):
+        return
+    if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
+        return
+    soft_gate = infer_soft_reject_gate(reason, gate=gate)
+    soft.append({"lemma": lemma, "reason": reason, "gate": soft_gate})
+    failed_data["soft_rejected_lemmas"] = soft[-40:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(
+        "记录节点抑制引理到%s: %s - %s...",
+        goal_name, soft_gate, (lemma or "")[:50],
+    )
+    log_exp("soft_rejected_lemma", goal=goal_name, gate=soft_gate, reason=reason)
 
 
 def add_illformed_lemma(
@@ -417,6 +459,83 @@ def _store_last_llm_reason(base_path: str, goal_name: str, reason: Optional[str]
     failed_data = load_failed_lemmas(base_path, goal_name)
     failed_data["last_llm_reason"] = reason or ""
     save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _store_last_llm_ce_smt(base_path: str, goal_name: str, ce_smt: Optional[str]) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_llm_ce_smt"] = (ce_smt or "").strip()
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _accept_llm_invalid_diagnosis(
+    base_path: str,
+    goal_name: str,
+    reason: str,
+    *,
+    source: str,
+) -> Tuple[bool, str]:
+    """Write ``node_outcome.invalid`` for LLM diagnosis; optionally require CE verify.
+
+    Returns ``(accepted, reject_detail)``. ``reject_detail`` is non-empty when CE
+    verify rejected the claim (for optional same-slot CE retry).
+    """
+    text = (reason or "").strip()
+    if not text or not is_invalid_diagnosis_reason(text):
+        return False, ""
+    if not llm_invalid_ce_verify_enabled():
+        _set_node_outcome(
+            base_path, goal_name, kind="invalid", reason=text, source=source,
+        )
+        return True, ""
+    ce = str(load_failed_lemmas(base_path, goal_name).get("last_llm_ce_smt") or "").strip()
+    if not ce:
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason="missing_ce_smt",
+        )
+        logging.info("子目标 %s LLM invalid 缺 CE_SMT，不写入硬 invalid", goal_name)
+        return False, "missing_ce_smt"
+    smt_path = Path(base_path) / f"{goal_name}.smt2"
+    if not smt_path.exists():
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason="missing_smt",
+        )
+        return False, "missing_smt"
+    ok, cex_reason = verify_llm_goal_counterexample(smt_path, ce)
+    if not ok:
+        detail = cex_reason or "ce_unverified"
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason=detail,
+        )
+        logging.info(
+            "子目标 %s LLM CE 未通过求解器校验 (%s)，不写入硬 invalid",
+            goal_name,
+            detail,
+        )
+        return False, detail
+    combined = text
+    if cex_reason and cex_reason not in text:
+        combined = f"{text} | {cex_reason}"
+    if len(combined) > 600:
+        combined = combined[:597] + "..."
+    _set_node_outcome(
+        base_path, goal_name, kind="invalid", reason=combined, source=source,
+    )
+    log_exp(
+        "llm_invalid_ce_ok",
+        goal=goal_name,
+        source=source,
+        reason=combined[:160],
+    )
+    return True, ""
 
 
 def _record_blocking_lemma(
@@ -842,6 +961,10 @@ def format_solver_feedback_for_prompt(
         )
         for i, record in enumerate(failed_data["invalid_lemmas"], 1):
             parts.append(f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}")
+
+    soft_txt = format_soft_rejected_prompt(failed_data)
+    if soft_txt:
+        parts.append(soft_txt)
 
     useless_members = _lemmas_in_useless_groups(failed_data)
 
@@ -1818,10 +1941,18 @@ def generate_lemmas_with_llm(
                 base_path, goal_name,
                 (reason or "invalid") if verdict == "invalid" else "failed",
             )
+            _store_last_llm_ce_smt(
+                base_path, goal_name,
+                parse_llm_counterexample_smt(raw) if verdict == "invalid" else None,
+            )
         elif extracted_asserts:
             _store_last_llm_reason(base_path, goal_name, None)
+            _store_last_llm_ce_smt(base_path, goal_name, None)
         elif should_accept_in_loop_invalid_goal(depth):
             _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
+            _store_last_llm_ce_smt(
+                base_path, goal_name, parse_llm_counterexample_smt(raw),
+            )
         return extracted_asserts
 
     return extracted_asserts
@@ -2008,7 +2139,10 @@ def validate_lemmas_against_original(extracted_asserts: List[str], original_fora
     )
     for assert_stmt, _reason in dropped:
         logging.error("引理与原目标相同，已排除: %s", assert_stmt[:80])
-        add_invalid_lemma(base_path, goal_name, assert_stmt, "Same as original goal")
+        add_soft_rejected_lemma(
+            base_path, goal_name, assert_stmt, "Same as original goal",
+            gate="same_as_goal",
+        )
     if dropped and kept:
         log_exp(
             "lemma_filter_drop",
@@ -2084,9 +2218,10 @@ def validate_lemmas_parallel(
                     logging.error(f"引理检查出错: {valid_path.name}: {result.error}")
                     bad.add(valid_path)
                     if lemma_content:
-                        add_invalid_lemma(
+                        add_soft_rejected_lemma(
                             base_path, goal_name, lemma_content,
                             f"vampire error: {result.error}",
+                            gate="solver_error",
                         )
                 else:
                     logging.info(
@@ -2098,7 +2233,10 @@ def validate_lemmas_parallel(
                 bad.add(path)
                 lemma_content = lemma_by_path.get(path) or extract_lemma_from_file(path)
                 if lemma_content:
-                    add_invalid_lemma(base_path, goal_name, lemma_content, f"验证异常: {e}")
+                    add_soft_rejected_lemma(
+                        base_path, goal_name, lemma_content, f"验证异常: {e}",
+                        gate="verify_exception",
+                    )
     
     if bad and not lemma_filter_drop_enabled():
         logging.error("存在不合法引理，需要重新生成")
@@ -2280,6 +2418,7 @@ def quick_run(
     decision_source: Optional[str] = None,
     depth: int = 0,
     ancestor_stack: AncestorStack = (),
+    seed_extra_user: Optional[str] = None,
 ) -> Tuple[bool, List[str], List[str]]:
     """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
     smt_file_path = Path(base_path)
@@ -2326,8 +2465,8 @@ def quick_run(
     
     # 步骤3: 使用LLM生成引理；静态筛 kept=0 时同 attempt 最多再生成 LLM_SCREEN_RETRIES 次
     library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
-    extra_user: Optional[str] = None
-    skip_hint_refresh = False
+    extra_user: Optional[str] = seed_extra_user
+    skip_hint_refresh = bool(seed_extra_user)
     generated_asserts: List[str] = []
     dropped: List[Tuple[str, str, str]] = []
     extracted_asserts: List[str] = []
@@ -2355,6 +2494,7 @@ def quick_run(
             original_forall=original_forall,
             smt=solver_content,
             invalid_records=failed_data.get("invalid_lemmas") or [],
+            soft_rejected_records=failed_data.get("soft_rejected_lemmas") or [],
             same_as_goal=are_formulas_equivalent,
             library_items=library_items,
             ancestor_stack=ancestor_stack,
@@ -2374,6 +2514,11 @@ def quick_run(
             if gate in ILLFORMED_SCREEN_GATES:
                 add_illformed_lemma(
                     base_path, goal_smt_name, lemma, reason, kind=gate,
+                )
+                continue
+            if gate in SOFT_SCREEN_GATES:
+                add_soft_rejected_lemma(
+                    base_path, goal_smt_name, lemma, reason, gate=gate,
                 )
                 continue
             add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
@@ -2714,9 +2859,12 @@ def _run_final_goal_diagnosis(
     if not is_invalid_diagnosis_reason(reason):
         logging.info("最终鉴定为 failed: %s", reason or "empty")
         return False
-    _set_node_outcome(
-        base_path, base_name, kind="invalid", reason=reason, source="llm_final",
+    ok, _reject = _accept_llm_invalid_diagnosis(
+        base_path, base_name, str(reason or ""), source="llm_final",
     )
+    if not ok:
+        logging.info("子目标 %s 最终鉴定未通过 CE 校验，保持 open", base_name)
+        return False
     logging.info("子目标 %s 最终鉴定不可证: %s", base_name, reason)
     return True
 
@@ -2910,31 +3058,76 @@ def _prove_run_body(
             source=decision_source,
         )
         try:
-            ret, new_subgoals, extracted_asserts = quick_run(
-                base_path,
-                base_name,
-                prompt_strategy,
-                pack["folder_path"],
-                baseline_only=False,
-                solver_profile=solver_profile,
-                decision_source=decision_source,
-                depth=depth,
-                ancestor_stack=ancestor_stack,
+            seed_extra: Optional[str] = None
+            ce_rounds = 0
+            ce_budget = (
+                llm_invalid_ce_retries()
+                if (
+                    llm_invalid_ce_verify_enabled()
+                    and depth >= 1
+                    and should_accept_in_loop_invalid_goal(depth)
+                )
+                else 0
             )
-            if (
-                not ret
-                and not extracted_asserts
-                and depth >= 1
-                and should_accept_in_loop_invalid_goal(depth)
-            ):
-                reason = load_failed_lemmas(base_path, base_name).get("last_llm_reason")
-                if reason:
-                    _set_node_outcome(
-                        base_path, base_name,
-                        kind="invalid", reason=reason, source="llm",
+            while True:
+                ret, new_subgoals, extracted_asserts = quick_run(
+                    base_path,
+                    base_name,
+                    prompt_strategy,
+                    pack["folder_path"],
+                    baseline_only=False,
+                    solver_profile=solver_profile,
+                    decision_source=decision_source,
+                    depth=depth,
+                    ancestor_stack=ancestor_stack,
+                    seed_extra_user=seed_extra,
+                )
+                if ret or extracted_asserts:
+                    break
+                if not (
+                    depth >= 1 and should_accept_in_loop_invalid_goal(depth)
+                ):
+                    break
+                reason = load_failed_lemmas(base_path, base_name).get(
+                    "last_llm_reason"
+                )
+                if not reason:
+                    break
+                ok, reject = _accept_llm_invalid_diagnosis(
+                    base_path, base_name, str(reason), source="llm",
+                )
+                if ok:
+                    logging.info(
+                        "子目标 %s LLM 判定不可证: %s", base_name, reason,
                     )
-                    logging.info("子目标 %s LLM 判定不可证: %s", base_name, reason)
                     return _done(False, "llm_invalid")
+                if not reject or ce_rounds >= ce_budget:
+                    logging.info(
+                        "子目标 %s LLM INVALID_GOAL 未通过 CE 校验，继续 attempt",
+                        base_name,
+                    )
+                    break
+                ce_rounds += 1
+                failed_now = load_failed_lemmas(base_path, base_name)
+                seed_extra = format_ce_retry_user(
+                    reject,
+                    ce_smt=str(failed_now.get("last_llm_ce_smt") or ""),
+                )
+                log_exp(
+                    "llm_invalid_ce_retry",
+                    goal=base_name,
+                    source="llm",
+                    retry=ce_rounds,
+                    max_retries=ce_budget,
+                    reason=reject[:160],
+                )
+                logging.info(
+                    "子目标 %s CE 校验失败 (%s)，同 attempt 再生成引理 (%d/%d)",
+                    base_name,
+                    reject,
+                    ce_rounds,
+                    ce_budget,
+                )
             # ret为True代表发现了可能会有用的子目标 不代表证明成功
             # lemma 被quick filtering了
             # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次

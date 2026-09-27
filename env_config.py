@@ -85,7 +85,9 @@ def setup_environment():
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
     lemma_filter_drop = os.getenv('LEMMA_FILTER_DROP', 'on')
     llm_lemma_diagnosis = os.getenv('LLM_LEMMA_DIAGNOSIS', 'on')
-    llm_lemma_diagnosis_final_only = os.getenv('LLM_LEMMA_DIAGNOSIS_FINAL_ONLY', 'on')
+    llm_lemma_diagnosis_final_only = os.getenv('LLM_LEMMA_DIAGNOSIS_FINAL_ONLY', 'off')
+    llm_invalid_ce_verify = os.getenv('LLM_INVALID_CE_VERIFY', 'on')
+    llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '1')
     child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '2')
     llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')
     llm_screen_retries = os.getenv('LLM_SCREEN_RETRIES', '1')
@@ -159,6 +161,8 @@ def setup_environment():
         'LEMMA_FILTER_DROP': lemma_filter_drop,
         'LLM_LEMMA_DIAGNOSIS': llm_lemma_diagnosis,
         'LLM_LEMMA_DIAGNOSIS_FINAL_ONLY': llm_lemma_diagnosis_final_only,
+        'LLM_INVALID_CE_VERIFY': llm_invalid_ce_verify,
+        'LLM_INVALID_CE_RETRIES': llm_invalid_ce_retries,
         'CHILD_LLM_ATTEMPTS': child_llm_attempts,
         'LLM_PARSE_RETRIES': llm_parse_retries,
         'LLM_SCREEN_RETRIES': llm_screen_retries,

@@ -5,14 +5,19 @@ the original loop. CHILD_LLM_ATTEMPTS=0 keeps the root 2N budget at every depth.
 LEMMA_FILTER_DROP keeps remaining members after screening and continues
 usefulness; paper.env sets it off so any failing member aborts the group.
 The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
-``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY`` (default on) skips the in-loop INVALID_GOAL
-suffix and early ``llm_invalid`` stop; diagnosis runs only after child attempts
-are exhausted (``should_run_final_diagnosis``). Set it off to restore per-attempt
-empty+INVALID_GOAL abort.
+``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY`` (default off) when on skips the in-loop
+INVALID_GOAL suffix and early ``llm_invalid`` stop; diagnosis runs only after
+child attempts are exhausted (``should_run_final_diagnosis``). Default off keeps
+per-attempt empty+INVALID_GOAL abort (with optional CE verify/retry).
 After a child node's attempts are exhausted, one extra diagnosis-only LLM call
 judges whether the CURRENT goal is invalid from the parent's accumulated
-``invalid_lemmas`` (child write-back), same signal as in-loop diagnosis —
-not the obligation tree. Skip when that INVALID list is empty.
+``invalid_lemmas`` (hard / mathematically refuted child write-back), same
+signal as in-loop diagnosis — not the obligation tree. Skip when that
+INVALID list is empty.
+Hard ``invalid_lemmas`` hold solver-refuted formulas and LLM/solver child
+invalid write-back. Soft ``soft_rejected_lemmas`` hold node-local suppressions
+(same_as_goal, solver errors, undefined_symbol, …) that are not necessarily
+false; they feed screening and a separate prompt block, never INVALID.
 ``FEEDBACK_PROGRESS`` remains default off.
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
@@ -60,6 +65,12 @@ _INVALID_GOAL_LINE = re.compile(
     rf"^[;\s]*{INVALID_GOAL_TAG}\s*:\s*(.+)$",
     flags=re.IGNORECASE,
 )
+CE_SMT_TAG = "CE_SMT"
+_CE_SMT_LINE = re.compile(
+    rf"^[;\s]*{CE_SMT_TAG}\s*:\s*(.*)$",
+    flags=re.IGNORECASE,
+)
+_CE_SECTION_HEADER = re.compile(r"^[;\s]*[A-Za-z_][A-Za-z0-9_]*\s*:", re.IGNORECASE)
 
 _RESERVED = frozenset({
     "forall", "exists", "assert", "and", "or", "not", "xor", "ite", "let", "as",
@@ -72,9 +83,14 @@ DIAGNOSIS_PROMPT_SUFFIX = (
     "\nIf the CURRENT goal is invalid (not a theorem of the given axioms, "
     "for example it is missing hypotheses, it contradicts existing axioms or lemmas, "
     "or a used function is only declared with no defining assert), "
-    "emit <output></output> and write one line:\n"
+    "emit <output></output> and write:\n"
     "; INVALID_GOAL: <short explanation>\n"
+    "; CE_SMT:\n"
+    "(define-fun <var> () <Sort> <value>)\n"
+    "... one define-fun per free constant in a concrete counterexample ...\n"
     "INVALID_GOAL means the CURRENT goal is not a theorem, not that no helper lemma is needed.\n"
+    "CE_SMT must be a ground model (nullary define-fun bindings) that makes "
+    "(assert (not CURRENT)) satisfiable under the axioms; the solver will check it.\n"
     "If a previously proposed child lemma is marked invalid, use that invalid mark "
     "and its reason to decide whether the CURRENT goal is also invalid "
     "(e.g. it depends on the same missing definition or contradiction).\n"
@@ -88,8 +104,11 @@ FINAL_DIAGNOSIS_PROMPT_SUFFIX = (
     "If a previously proposed child lemma is marked invalid, use that mark "
     "and its reason to decide whether the CURRENT goal is also invalid "
     "(e.g. it depends on the same missing definition or contradiction).\n"
-    "If it is INVALID (not a theorem), output invalid and write one line:\n"
+    "If it is INVALID (not a theorem), output invalid and write:\n"
     "; INVALID_GOAL: <short explanation>\n"
+    "; CE_SMT:\n"
+    "(define-fun <var> () <Sort> <value>)\n"
+    "CE_SMT must be a ground model the solver can check against axioms ∧ ¬CURRENT.\n"
     "If it MAY still be a theorem, output failed.\n"
 )
 
@@ -131,7 +150,13 @@ PARSE_RETRY_USER = (
     "</output>\n"
     "Child only, if the CURRENT goal is not a theorem:\n"
     "<output></output>\n"
-    "; INVALID_GOAL: <short explanation>"
+    "; INVALID_GOAL: <short explanation>\n"
+    "; CE_SMT:\n"
+    "(define-fun <var> () <Sort> <value>)"
+)
+CE_RETRY_USER = (
+    "COUNTEREXAMPLE CHECK FAILED: your INVALID_GOAL was not accepted because "
+    "CE_SMT was missing or did not make axioms ∧ ¬CURRENT satisfiable."
 )
 PARSE_ERR_EMPTY = "空引理输出"
 PARSE_ERR_UNMATCHED = "引理括号不配平"
@@ -174,13 +199,52 @@ def llm_lemma_diagnosis_enabled() -> bool:
 
 
 def llm_lemma_diagnosis_final_only() -> bool:
-    """When on (default), child diagnosis runs only after attempts are exhausted.
+    """When on, child diagnosis runs only after attempts are exhausted.
 
-    In-loop ``DIAGNOSIS_PROMPT_SUFFIX`` and early ``llm_invalid`` from empty
-    ``INVALID_GOAL`` are skipped. Final diagnosis-only call is unchanged.
-    Set ``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=off`` to restore per-attempt abort.
+    Default **off** (in-loop ``DIAGNOSIS_PROMPT_SUFFIX`` + early ``llm_invalid``).
+    Set ``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=on`` to skip in-loop diagnosis and rely
+    on the final diagnosis-only call after attempts are exhausted.
     """
-    return _flag_enabled("LLM_LEMMA_DIAGNOSIS_FINAL_ONLY")
+    return _flag_enabled("LLM_LEMMA_DIAGNOSIS_FINAL_ONLY", default="off")
+
+
+def llm_invalid_ce_verify_enabled() -> bool:
+    """When on (default), LLM INVALID_GOAL needs a solver-checked CE_SMT model.
+
+    Missing or unsat counterexamples do not write hard ``node_outcome.invalid``.
+    Set ``LLM_INVALID_CE_VERIFY=off`` to accept prose INVALID_GOAL alone.
+    """
+    return _flag_enabled("LLM_INVALID_CE_VERIFY")
+
+
+def llm_invalid_ce_retries() -> int:
+    """Extra lemma-generation rounds after CE_SMT fails solver check.
+
+    Default 1 (same prove-run attempt: re-run ``quick_run`` with a CE-fail hint,
+    not a diagnosis-only CE rewrite). 0 disables. Only when verify is on.
+    """
+    raw = os.getenv("LLM_INVALID_CE_RETRIES")
+    if raw is None or str(raw).strip() == "":
+        return 1
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def format_ce_retry_user(
+    reject_reason: str = "",
+    ce_smt: str = "",
+) -> str:
+    """Short CE-fail notice plus the rejected model; LLM re-judges freely."""
+    del reject_reason  # kept for call-site compatibility
+    parts = [CE_RETRY_USER]
+    ce = str(ce_smt or "").strip()
+    if ce:
+        parts.append(f"Rejected CE_SMT:\n{ce}")
+    else:
+        parts.append("Rejected CE_SMT: (missing)")
+    return "\n".join(parts)
 
 
 def should_append_diagnosis_suffix(depth: int = 0) -> bool:
@@ -326,8 +390,9 @@ def should_run_final_diagnosis(depth: int = 0, *, has_invalid: bool = True) -> b
 def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
     """INVALID-only block for the extra invalid-check LLM call.
 
-    Same records as the in-loop INVALID section (child write-back / static
-    gates). Omits unproved, repair, progress, routing, and the obligation tree.
+    Hard ``invalid_lemmas`` only (child write-back / solver refutation). Soft
+    suppressions are omitted — they are not mathematical INVALID evidence.
+    Omits unproved, repair, progress, routing, and the obligation tree.
     """
     data = failed_data if isinstance(failed_data, dict) else {}
     records = [
@@ -347,6 +412,26 @@ def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
     return "\n".join(parts)
 
 
+def format_soft_rejected_prompt(failed_data: Optional[dict]) -> str:
+    """Node-local suppressions: do not regenerate; not mathematical INVALID."""
+    data = failed_data if isinstance(failed_data, dict) else {}
+    records = [
+        item for item in (data.get("soft_rejected_lemmas") or [])
+        if isinstance(item, dict) and str(item.get("lemma") or "").strip()
+    ]
+    if not records:
+        return ""
+    parts = [
+        "\n\nNODE-LOCAL SUPPRESSIONS: The following were rejected at THIS node "
+        "and should not be regenerated here. They are NOT necessarily "
+        "mathematically false (unlike INVALID):"
+    ]
+    for i, record in enumerate(records, 1):
+        reason = str(record.get("reason") or "").strip() or "suppressed"
+        parts.append(f"  Suppressed lemma {i} ({reason}): {record.get('lemma')}")
+    return "\n".join(parts)
+
+
 def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
     """Extract the ``; INVALID_GOAL:`` diagnosis line. Plain ``reason:`` is ignored."""
     if not raw:
@@ -358,6 +443,47 @@ def parse_llm_reason(raw: Optional[str]) -> Optional[str]:
             if reason:
                 return reason[:MAX_REASON_CHARS]
     return None
+
+
+def parse_llm_counterexample_smt(raw: Optional[str]) -> Optional[str]:
+    """Extract the ``; CE_SMT:`` block (nullary define-fun model bindings).
+
+    Accepts a same-line body after ``CE_SMT:`` and/or following non-header lines
+    until the next ``; TAG:`` section (including another INVALID_GOAL).
+    """
+    if not raw:
+        return None
+    chunks: List[str] = []
+    collecting = False
+    for line in str(raw).splitlines():
+        stripped = line.strip()
+        start = _CE_SMT_LINE.match(stripped)
+        if start:
+            collecting = True
+            rest = (start.group(1) or "").strip()
+            if rest:
+                chunks.append(rest)
+            continue
+        if not collecting:
+            continue
+        if not stripped:
+            if chunks:
+                break
+            continue
+        if _INVALID_GOAL_LINE.match(stripped):
+            break
+        if stripped.startswith(";") and _CE_SECTION_HEADER.match(stripped.lstrip(";").strip()):
+            # Another ; TAG: section ends the CE block.
+            if not _CE_SMT_LINE.match(stripped):
+                break
+        # Drop leading comment markers on continuation lines.
+        if stripped.startswith(";"):
+            stripped = stripped.lstrip(";").strip()
+            if not stripped:
+                continue
+        chunks.append(stripped)
+    text = "\n".join(chunks).strip()
+    return text or None
 
 
 def allow_unmarked_lemma_output(
@@ -707,6 +833,40 @@ def lemma_known_invalid(lemma: str, invalid_lemmas: Sequence[Any]) -> bool:
     return any(_stored_invalid_formula(record) == key for record in invalid_lemmas or [])
 
 
+def _stored_soft_formula(record: Any) -> str:
+    stored = record.get("lemma") if isinstance(record, dict) else record
+    return str(stored or "")
+
+
+def lemma_known_soft_rejected(lemma: str, soft_rejected: Sequence[Any]) -> bool:
+    """True iff *lemma* is whitespace- or α-equivalent to a soft-rejected formula."""
+    if not str(lemma or "").strip():
+        return False
+    return any(
+        lemmas_equivalent(lemma, _stored_soft_formula(record))
+        for record in soft_rejected or []
+    )
+
+
+def infer_soft_reject_gate(reason: str, *, gate: str = "") -> str:
+    """Normalize a soft-reject gate from an explicit gate or reason string."""
+    explicit = str(gate or "").strip()
+    if explicit:
+        return explicit
+    text = str(reason or "").strip().lower()
+    if "same as original goal" in text or text == "same_as_goal":
+        return "same_as_goal"
+    if text.startswith("undefined_symbol"):
+        return "undefined_symbol"
+    if "cvc error" in text or "vampire error" in text:
+        return "solver_error"
+    if "验证异常" in str(reason or "") or (
+        "verify" in text and "exception" in text
+    ):
+        return "verify_exception"
+    return "soft_rejected"
+
+
 def _stored_unproved_formula(record: Any) -> str:
     stored = record.get("lemma") if isinstance(record, dict) else record
     return str(stored or "")
@@ -949,8 +1109,18 @@ def lemmas_known_invalid(
 
 BENIGN_SCREEN_GATES = frozenset({
     "known_invalid",
+    "known_soft_rejected",
     "same_as_library",
     "same_as_ancestor",
+})
+
+# Soft (node-local) screen hits: write soft_rejected_lemmas, not hard invalid.
+SOFT_SCREEN_GATES = frozenset({
+    "same_as_goal",
+    "undefined_symbol",
+    "known_soft_rejected",
+    "solver_error",
+    "verify_exception",
 })
 
 # Format / sort failures: retry with feedback; never write mathematical invalid.
@@ -996,17 +1166,19 @@ def apply_static_lemma_screen(
     same_as_goal: Callable[[str, str], bool],
     library_items: Sequence[Any] = (),
     ancestor_stack: Sequence[Any] = (),
+    soft_rejected_records: Sequence[Any] = (),
 ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
-    """Drop known-invalid / same-as-goal / ancestor-cycle / library / undefined members.
+    """Drop known-invalid / soft-rejected / same-as-goal / ancestor / library / undef.
 
     Returns ``(kept, dropped)`` where each dropped item is
-    ``(lemma, reason, gate)``.     ``gate`` is ``known_invalid``, ``same_as_goal``,
-    ``same_as_ancestor``, ``same_as_library``, ``undefined_symbol``,
-    ``parse_error``, or ``type_error``.
-    Known-invalid, library duplicates, and ancestor cycles are not recorded as
-    invalid by the caller (ancestor hits are path cycles, often still theorems).
-    Parse/type failures are recorded as ``illformed_lemmas``, not mathematical
-    invalid. Library matches always drop only that member.
+    ``(lemma, reason, gate)``.     ``gate`` is ``known_invalid``,
+    ``known_soft_rejected``, ``same_as_goal``, ``same_as_ancestor``,
+    ``same_as_library``, ``undefined_symbol``, ``parse_error``, or ``type_error``.
+    Known-invalid, known soft-rejected, library duplicates, and ancestor cycles
+    are not re-recorded by the caller (ancestor hits are path cycles, often
+    still theorems). Soft hits (same_as_goal / undefined_symbol) go to
+    ``soft_rejected_lemmas``. Parse/type failures are ``illformed_lemmas``, not
+    mathematical invalid. Library matches always drop only that member.
     """
     from ancestor_stack import lemma_matches_ancestor
     from exp_flags import ancestor_cycle_filter_enabled
@@ -1025,6 +1197,15 @@ def apply_static_lemma_screen(
     if not _stage(
         "known_invalid",
         lambda lemma: "known_invalid" if lemma_known_invalid(lemma, invalid_records) else None,
+    ):
+        return [], dropped
+    if not _stage(
+        "known_soft_rejected",
+        lambda lemma: (
+            "known_soft_rejected"
+            if lemma_known_soft_rejected(lemma, soft_rejected_records)
+            else None
+        ),
     ):
         return [], dropped
     if not _stage(
@@ -1103,6 +1284,7 @@ _SCREEN_GATE_LABEL = {
     "same_as_library": "already in lemma library",
     "same_as_ancestor": "same as a STRICT ANCESTOR on the proof path",
     "same_as_goal": "same as the CURRENT goal",
+    "known_soft_rejected": "already suppressed at this node",
     "parse_error": "parse_error (fix syntax / names / reserved binders)",
     "type_error": "type_error (argument or return sort mismatch)",
 }
@@ -1189,9 +1371,9 @@ def _exclude_source_lemmas(
 
 
 def format_dropped_line(item: dict) -> Optional[str]:
-    """One dropped-lemma line; skip known-invalid (already in the INVALID block)."""
+    """One dropped-lemma line; skip hard/soft lists already shown above."""
     gate = str((item or {}).get("gate") or "")
-    if gate == "known_invalid":
+    if gate in ("known_invalid", "known_soft_rejected"):
         return None
     lemma = compact_formula((item or {}).get("lemma") or "")
     if not lemma:

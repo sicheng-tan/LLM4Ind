@@ -161,7 +161,7 @@ def test_pack_do_not_repeat_ancestors_and_invalid_omits_timeout() -> None:
     assert invalid in formulas
     assert timeout not in formulas
     body = format_observation_prompt_body(pack)
-    assert "=== DO NOT REPEAT (proof-path ancestors; invalid lemmas) ===" in body
+    assert "=== DO NOT REPEAT (proof-path ancestors; invalid / do not repeat) ===" in body
     assert "[ancestor, depth=0]" in body
     assert "[invalid; solver:sat]" in body
     assert ancestor in body

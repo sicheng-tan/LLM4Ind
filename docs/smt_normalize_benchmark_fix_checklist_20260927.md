@@ -11,7 +11,7 @@
 |---|---:|---|
 | `check-sat` 落在证明目标之前（预处理模板） | 8 | **定点**把唯一 `(check-sat)` 挪到 `; proof goal end` 之后（与 `preprocessed.py` 写出策略一致） |
 | Tip 风格 `declare-datatypes` 无法被 cvc5 解析（源文件） | 4 | **定点**改正 `benchmarks/smtlib2/...`，并同步同名预处理副本 / 模板中的对应声明 |
-| LLM 候选引理中的未声明符号 / 类型错 / 保留字 | 7（审计下界） | **不是 benchmark 错误**；需运行时 parse/type 门控（未在本次改代码路径中落地） |
+| LLM 候选引理中的未声明符号 / 类型错 / 保留字 | 7（审计下界） | **不改正文 SMT**；运行时 `LEMMA_WELLFORMED_CHECK`（见第 3 节） |
 
 ---
 
@@ -165,7 +165,23 @@ cvc5 报错形如：`Expected LPAREN_TOK or RPAREN_TOK, got \`T\``。
 
 | 角色 | 路径 |
 |---|---|
+| 本清单 | `docs/smt_normalize_benchmark_fix_checklist_20260927.md` |
 | 预处理实现 | `preprocessed.py` |
 | 原始 AutoProof | `benchmarks/smtlib2/autoproof/standard/*.smt2` |
 | 运行用模板 | `benchmarks/preprocessed/autoproof/standard/*/template.smt2` |
 | 审计报告 | `docs/v5_nohd_noadv_failure_audit_20260927.md` |
+| Wellformed 门控 | `cvc5_runner.check_lemma_wellformed`、`lemma_gates.screen_lemmas_wellformed`、`Mate_new` / `Mate_new_vampire` |
+| 测试 | `tests/test_lemma_wellformed.py` |
+
+### 正文 SMT 变动覆盖范围（便于核对）
+
+**已写入本清单、且磁盘上已改的 SMT 文件：**
+
+- 8 个 `benchmarks/preprocessed/autoproof/standard/<name>/template.smt2`（仅 `check-sat` 位置）
+- 4 个 `benchmarks/smtlib2/autoproof/standard/<name>.smt2`（Tip datatype）
+- 对应 4 题的 `benchmarks/preprocessed/.../<name>/<name>.smt2` 副本（同上 datatype）
+
+**未改 SMT 正文、只改 pipeline 代码（本清单第 1/3 节有说明，无逐文件 diff）：**  
+`preprocessed.py`、`cvc5_runner.py`、`lemma_gates.py`、`Mate_new.py`、`Mate_new_vampire.py`。
+
+本清单**不含**完整 before/after 贴出；具体字节级差异以仓库中上述路径为准。

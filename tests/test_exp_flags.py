@@ -35,6 +35,7 @@ from lemma_gates import (
     lemma_filter_drop_enabled,
     llm_lemma_diagnosis_enabled,
     llm_lemma_diagnosis_final_only,
+    llm_invalid_ce_verify_enabled,
     subgoal_sat_abort_enabled,
 )
 
@@ -52,6 +53,8 @@ _FLAG_NAMES = (
     "LEMMA_FILTER_DROP",
     "LLM_LEMMA_DIAGNOSIS",
     "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY",
+    "LLM_INVALID_CE_VERIFY",
+    "LLM_INVALID_CE_RETRIES",
 )
 
 _FEEDBACK_PAYLOAD = {
@@ -105,7 +108,8 @@ def test_flags_default_on() -> None:
         assert defined_symbols_enabled() is True
         assert lemma_filter_drop_enabled() is True
         assert llm_lemma_diagnosis_enabled() is True
-        assert llm_lemma_diagnosis_final_only() is True
+        assert llm_lemma_diagnosis_final_only() is False
+        assert llm_invalid_ce_verify_enabled() is True
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
@@ -135,6 +139,10 @@ def test_flags_default_on() -> None:
             assert llm_lemma_diagnosis_enabled() is False
         with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": val}):
             assert llm_lemma_diagnosis_final_only() is False
+        with patch.dict(os.environ, {"LLM_INVALID_CE_VERIFY": val}):
+            assert llm_invalid_ce_verify_enabled() is False
+    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on"}):
+        assert llm_lemma_diagnosis_final_only() is True
     with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
         assert progress_feedback_enabled() is True
     with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": "on"}):
@@ -356,7 +364,12 @@ def test_paper_schedule_prompt() -> None:
 def test_prompt_hides_disabled_feedback_sections() -> None:
     import Mate_new as mate
 
-    with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
+    with patch.dict(os.environ, {
+        "FEEDBACK_PROGRESS": "on",
+        "SOLVER_ROUTING": "on",
+        "FEEDBACK_REPAIR_HINTS": "on",
+        "UNPROVED_NOT_INVALID": "on",
+    }):
         on_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
     assert "SOLVER PROGRESS SIGNALS" in on_txt
     assert "USEFUL BUT UNPROVED" in on_txt

@@ -1977,6 +1977,206 @@ def counterexample_reason_for_smt(
     return fallback
 
 
+def _iter_top_sexprs(text: str) -> List[str]:
+    out: List[str] = []
+    i = 0
+    while True:
+        expr, nxt = _read_sexpr(text, i)
+        if expr is None:
+            break
+        out.append(expr)
+        i = nxt if nxt > i else i + 1
+    return out
+
+
+def parse_nullary_define_fun_bindings(ce_smt: str) -> Tuple[Dict[str, str], List[str]]:
+    """Parse nullary ``(define-fun x () Sort body)`` → ``{x: body}`` plus leftovers."""
+    bindings: Dict[str, str] = {}
+    leftovers: List[str] = []
+    for expr in _iter_top_sexprs(ce_smt or ""):
+        kids = _sexpr_children(expr)
+        if not kids or kids[0] != "define-fun" or len(kids) < 5:
+            leftovers.append(expr)
+            continue
+        name, args, _sort, body = kids[1], kids[2], kids[3], kids[4]
+        arg_kids = _sexpr_children(args) if str(args).strip().startswith("(") else []
+        if str(args).strip() in ("()", "") or arg_kids == []:
+            if name and body:
+                bindings[str(name)] = str(body)
+            else:
+                leftovers.append(expr)
+        else:
+            leftovers.append(expr)
+    return bindings, leftovers
+
+
+def _subst_free_symbols(expr: str, env: Dict[str, str]) -> str:
+    """Replace free atoms in *expr* using *env* (does not enter shadowed binders)."""
+    if not env:
+        return expr
+    text = (expr or "").strip()
+    if not text.startswith("("):
+        return env.get(text, text)
+    kids = _sexpr_children(text)
+    if not kids:
+        return "()"
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        shadowed = {name for name, _sort in binders}
+        inner = {k: v for k, v in env.items() if k not in shadowed}
+        bind_parts = []
+        for name, sort in binders:
+            bind_parts.append(
+                f"({name} {_subst_free_symbols(sort, env)})"
+            )
+        body = _subst_free_symbols(kids[2], inner)
+        extra = " ".join(_subst_free_symbols(k, inner) for k in kids[3:])
+        core = f"({head} ({' '.join(bind_parts)}) {body}"
+        return core + (f" {extra})" if extra else ")")
+    return "(" + " ".join(_subst_free_symbols(k, env) for k in kids) + ")"
+
+
+def instantiate_goal_with_bindings(
+    phi: str, bindings: Dict[str, str]
+) -> Tuple[str, Dict[str, str]]:
+    """Instantiate leading ``forall`` binders present in *bindings*.
+
+    Returns ``(formula, unused_bindings)``.
+    """
+    kids = _sexpr_children(phi or "")
+    if kids and kids[0] == "forall" and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        body = kids[2]
+        used: Dict[str, str] = {}
+        remaining: List[Tuple[str, str]] = []
+        for name, sort in binders:
+            if name in bindings:
+                used[name] = bindings[name]
+            else:
+                remaining.append((name, sort))
+        subst_body = _subst_free_symbols(body, used)
+        unused = {k: v for k, v in bindings.items() if k not in used}
+        if remaining:
+            bind_s = " ".join(f"({n} {s})" for n, s in remaining)
+            return f"(forall ({bind_s}) {subst_body})", unused
+        return subst_body, unused
+    if bindings:
+        return _subst_free_symbols(phi, bindings), {}
+    return phi, {}
+
+
+def inject_counterexample_into_smt(smt: str, ce_smt: str) -> str:
+    """Apply LLM CE bindings to the proof goal, then check axioms ∧ ¬φ[ce].
+
+    Prefer instantiating ``forall`` binders named in nullary ``define-fun``
+    bindings (typical LLM CE). Remaining free-constant bindings become
+    ``(assert (= x v))`` before the goal. Non-nullary leftovers are injected
+    as raw sexprs.
+    """
+    bindings, leftovers = parse_nullary_define_fun_bindings(ce_smt)
+    text = smt or ""
+    goal_term = extract_proof_goal_term(text)
+    new_goal_assert = None
+    unused = dict(bindings)
+    if goal_term and bindings:
+        phi = goal_term
+        kids = _sexpr_children(phi)
+        if kids and kids[0] == "not" and len(kids) >= 2:
+            # Child files store (assert (not φ)); instantiate φ then re-negate.
+            inst, unused = instantiate_goal_with_bindings(kids[1], bindings)
+            new_goal_assert = f"(assert (not {inst}))"
+        else:
+            # Positive assert φ (rare here): instantiate and keep positive.
+            inst, unused = instantiate_goal_with_bindings(phi, bindings)
+            new_goal_assert = f"(assert {inst})"
+
+    free_asserts = [f"(assert (= {name} {val}))" for name, val in unused.items()]
+    block_lines = leftovers + free_asserts
+    block = ""
+    if block_lines:
+        block = (
+            "; LLM counterexample bindings (verified)\n"
+            + "\n".join(block_lines)
+            + "\n"
+        )
+
+    if new_goal_assert and _PROOF_GOAL_BLOCK.search(text):
+        def _repl(_match: re.Match) -> str:
+            return (
+                f"; proof goal\n{new_goal_assert}\n; proof goal end"
+            )
+
+        text = _PROOF_GOAL_BLOCK.sub(_repl, text, count=1)
+        marker = re.search(r";\s*proof goal\b", text, flags=re.IGNORECASE)
+        if block and marker:
+            text = text[: marker.start()] + block + text[marker.start() :]
+        elif block:
+            text = text.rstrip() + "\n" + block
+        return text
+
+    # Fallback: pin bindings only (no forall rewrite).
+    if not block:
+        return text
+    marker = re.search(r";\s*proof goal\b", text, flags=re.IGNORECASE)
+    if marker:
+        return text[: marker.start()] + block + text[marker.start() :]
+    check = re.search(r"(?m)^[ \t]*\(check-sat\)", text)
+    if check:
+        return text[: check.start()] + block + text[check.start() :]
+    return text.rstrip() + "\n" + block
+
+
+def verify_llm_goal_counterexample(
+    smt2_path,
+    ce_smt: str,
+    *,
+    timeout: int = _CEX_TIMEOUT_S,
+) -> Tuple[bool, str]:
+    """Check LLM CE bindings against child SMT (axioms ∧ ¬φ[ce]).
+
+    Returns ``(verified, reason)``. On success reason is ``Counterexample: …``.
+    Fail-closed on missing CE, inject issues, or non-sat.
+    """
+    import tempfile
+
+    ce = (ce_smt or "").strip()
+    if not ce:
+        return False, "missing_ce_smt"
+    src = Path(smt2_path)
+    try:
+        content = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"ce_verify_io:{exc}"
+    try:
+        content = inject_counterexample_into_smt(content, ce)
+        content = prepare_smt_for_get_model(content)
+    except Exception as exc:
+        return False, f"ce_inject_error:{exc}"
+
+    specs = cvc_profile_specs()
+    cfg = specs.get("cvc5_simple") or next(
+        (v for v in specs.values() if v.get("type") == "CVC5"), None
+    )
+    if not cfg:
+        return False, "ce_verify_no_cvc5"
+    with tempfile.TemporaryDirectory(prefix="llm_ce_") as tmp:
+        path = Path(tmp) / "ce_check.smt2"
+        path.write_text(content, encoding="utf-8")
+        cmd = [cfg["binary"]] + list(cfg["options"]) + [str(path)]
+        result = _execute_single(cmd, max(1, int(timeout)), strategy="cvc5_simple")
+        result.model_text = parse_cvc_model(result.stdout + "\n" + result.stderr)
+        if result.model_text and result.status in ("unknown", "timeout", ""):
+            result.status = "sat"
+        if result.status == "sat" or result.model_text:
+            compact = re.sub(r"\s+", " ", ce).strip()
+            model = (result.model_text or "").strip()
+            if model and model not in ("()", "( )"):
+                return True, format_counterexample_reason(model)
+            return True, format_counterexample_reason(compact)
+        return False, f"ce_unverified:{result.status or 'unknown'}"
+
+
 def named_attr_id(term: str) -> Optional[str]:
     """``C1`` from ``(! φ :named C1)``, else None."""
     kids = _sexpr_children(term)
