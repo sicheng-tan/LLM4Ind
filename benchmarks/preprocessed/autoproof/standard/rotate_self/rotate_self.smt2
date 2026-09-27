@@ -1,6 +1,6 @@
 (set-logic UFDT)
 (declare-sort sk_a 0)
-(declare-datatypes ((Nat 0)) ((Nat (S (p Nat)) (Z))))
+(declare-datatypes ((Nat 0)) (((S (p Nat)) (Z))))
 (declare-datatypes ((List2 0))
   (((Cons (Cons_0 sk_a) (Cons_1 List2)) (Nil))))
 (declare-fun append (List2 List2) List2)

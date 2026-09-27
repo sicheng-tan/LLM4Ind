@@ -1,5 +1,7 @@
 (set-logic UFDTLIA)
+
 (declare-sort fun1 0)
+
 ; datatypes
 (declare-datatypes ((list2 0))
   (((nil2) (cons2 (head2 Int) (tail2 list2)))))
@@ -72,10 +74,10 @@
     (= (isort x)
       (ite (is-cons2 x) (insert2 (head2 x) (isort (tail2 x))) nil2))))
 (assert (forall ((y Int)) (= (apply1 lam y) (cons2 y nil2))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((x list2)) (= (msortbu x) (isort x)))))
 ; proof goal end
 
+(check-sat)

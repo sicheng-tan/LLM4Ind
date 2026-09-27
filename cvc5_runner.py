@@ -2522,3 +2522,137 @@ def _cleanup_processes(processes, exclude=None):
                             pass
                 except Exception:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Lemma well-formedness (parse / type) before portfolio prove
+# ---------------------------------------------------------------------------
+
+_TYPE_ERROR_MARKERS = (
+    "expecting an arithmetic",
+    "has incorrect type",
+    "typing error",
+    "type mismatch",
+    "is not of sort",
+    "expected sort",
+    "invalid type",
+    "term of sort",
+)
+
+
+@dataclass
+class WellformedResult:
+    """Result of a cheap cvc5 ``--parse-only`` check on one candidate lemma."""
+
+    ok: bool
+    kind: Optional[str] = None  # parse_error | type_error
+    message: str = ""
+
+
+def classify_cvc_wellformed_message(text: str) -> Tuple[str, str]:
+    """Map cvc5 stderr/stdout to ``(parse_error|type_error, short_message)``."""
+    raw = (text or "").strip()
+    line = next(
+        (
+            ln.strip()
+            for ln in raw.splitlines()
+            if "error" in ln.lower() or "expecting" in ln.lower()
+        ),
+        raw.splitlines()[-1] if raw else "wellformedness check failed",
+    )
+    # Drop absolute temp paths for stable feedback / logs.
+    line = re.sub(r"Parse Error:\s*\S+:\d+\.\d+:\s*", "Parse Error: ", line)
+    line = re.sub(r'\(error\s+"|"\)$', "", line).strip()
+    low = raw.lower()
+    for marker in _TYPE_ERROR_MARKERS:
+        if marker in low:
+            return "type_error", line[:400]
+    return "parse_error", line[:400]
+
+
+def build_lemma_assert_smt(smt_content: str, lemma: str) -> str:
+    """Theory + ``(assert lemma)`` as the proof goal, single trailing check-sat."""
+    body = (lemma or "").strip()
+    if not body:
+        body = "true"
+    text = smt_content or ""
+    if re.search(r"; proof goal\s*\(assert.*?\)\s*; proof goal end", text, flags=re.DOTALL):
+        text = re.sub(
+            r"; proof goal\s*\(assert.*?\)\s*; proof goal end",
+            f"; proof goal\n(assert {body})\n; proof goal end",
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+    else:
+        text = text.rstrip() + f"\n; proof goal\n(assert {body})\n; proof goal end\n"
+    text = re.sub(r"(?m)^[ \t]*\(check-sat\)[ \t]*\r?\n?", "", text)
+    text = re.sub(r"(?m)^[ \t]*\(exit\)[ \t]*\r?\n?", "", text)
+    return text.rstrip() + "\n(check-sat)\n"
+
+
+def check_lemma_wellformed(
+    lemma: str,
+    smt_content: str,
+    *,
+    binary: Optional[str] = None,
+) -> WellformedResult:
+    """Run cvc5 ``--parse-only`` on theory + asserted lemma (no prove profiles)."""
+    formula = (lemma or "").strip()
+    if not formula:
+        return WellformedResult(ok=False, kind="parse_error", message="empty lemma")
+    content = build_lemma_assert_smt(smt_content, formula)
+    cvc5 = binary or _cvc5_binary()
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".smt2",
+            prefix="lemma_wf_",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+        proc = subprocess.run(
+            [cvc5, "--lang=smt2", "--parse-only", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode == 0 and "error" not in text.lower():
+            return WellformedResult(ok=True)
+        kind, message = classify_cvc_wellformed_message(text)
+        return WellformedResult(ok=False, kind=kind, message=message)
+    except FileNotFoundError:
+        return WellformedResult(
+            ok=False,
+            kind="parse_error",
+            message=f"cvc5 binary not found: {cvc5}",
+        )
+    except subprocess.TimeoutExpired:
+        return WellformedResult(
+            ok=False,
+            kind="parse_error",
+            message="cvc5 --parse-only timed out",
+        )
+    except Exception as exc:
+        return WellformedResult(ok=False, kind="parse_error", message=str(exc))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def cvc_output_wellformed_failure(stdout: str, stderr: str) -> Optional[WellformedResult]:
+    """If solver output is a parse/type failure, return a WellformedResult; else None."""
+    text = (stdout or "") + "\n" + (stderr or "")
+    low = text.lower()
+    if "parse error" not in low and "expecting an arithmetic" not in low:
+        if "typing error" not in low and "incorrect type" not in low:
+            return None
+    kind, message = classify_cvc_wellformed_message(text)
+    return WellformedResult(ok=False, kind=kind, message=message)

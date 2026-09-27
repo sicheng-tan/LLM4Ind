@@ -28,6 +28,7 @@ from cvc5_runner import (
     attributed_ids_from_portfolio,
     expand_named_difficulty,
     pick_advice_witness,
+    cvc_output_wellformed_failure,
     CvcResult,
 )
 from solver_routing import (
@@ -66,6 +67,7 @@ from obligation_tree import (
     make_child_node,
     make_goal_tree,
     materialize_smt_with_library,
+    normalize_lemma_formula,
     obligation_tree_enabled,
     root_finish_prove_timeout_s,
     solver_smt_content,
@@ -122,6 +124,7 @@ from lemma_gates import (
     apply_static_lemma_screen,
     attach_source_lemmas,
     BENIGN_SCREEN_GATES,
+    ILLFORMED_SCREEN_GATES,
     compact_repair_snapshot,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
@@ -138,6 +141,8 @@ from lemma_gates import (
     REVIVAL_ORIGIN_SITUATION_A,
     llm_lemma_diagnosis_enabled,
     llm_parse_retries,
+    llm_screen_retries,
+    format_screen_retry_user,
     node_attempt_plan,
     parse_final_diagnosis,
     parse_llm_lemmas,
@@ -190,6 +195,7 @@ def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
 def _empty_failed_data() -> dict:
     return {
         "invalid_lemmas": [],
+        "illformed_lemmas": [],
         "useless_lemma_groups": [],
         "progress_lemmas": [],
         "progress_routing_signals": [],
@@ -216,6 +222,7 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             with open(failed_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data.setdefault("invalid_lemmas", [])
+            data.setdefault("illformed_lemmas", [])
             data.setdefault("useless_lemma_groups", [])
             data.setdefault("progress_lemmas", [])
             data.setdefault("progress_routing_signals", [])
@@ -273,6 +280,32 @@ def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     save_failed_lemmas(base_path, goal_name, failed_data)
     logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
     log_exp("invalid_lemma", goal=goal_name, reason=reason)
+
+
+def add_illformed_lemma(
+    base_path: str,
+    goal_name: str,
+    lemma: str,
+    reason: str,
+    *,
+    kind: str = "parse_error",
+) -> None:
+    """Record a syntax/type failure; never write mathematical ``invalid_lemmas``."""
+    gate = kind if kind in ILLFORMED_SCREEN_GATES else "parse_error"
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    records = failed_data.setdefault("illformed_lemmas", [])
+    key = normalize_lemma_formula(lemma) if lemma else ""
+    for item in records:
+        stored = item.get("lemma") if isinstance(item, dict) else item
+        if key and normalize_lemma_formula(str(stored or "")) == key:
+            return
+    records.append({"lemma": lemma, "reason": reason, "kind": gate})
+    # Cap growth within one node.
+    failed_data["illformed_lemmas"] = records[-40:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info("记录格式/类型错误引理到%s: %s - %s...", goal_name, gate, (lemma or "")[:50])
+    log_exp("illformed_lemma", goal=goal_name, kind=gate, reason=reason)
+
 
 def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
                             meta: Optional[dict] = None):
@@ -882,7 +915,13 @@ def record_solver_attempt(
             prompt=prompt_strategy,
         )
 
-def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, depth: int = 0) -> str:
+def format_solver_feedback_for_prompt(
+    failed_data: dict,
+    base_path: str = None,
+    depth: int = 0,
+    *,
+    current_formula: Optional[str] = None,
+) -> str:
     """把 cvc5 失败/进展/难度信号格式化进下一轮 LLM prompt。"""
     parts: List[str] = []
 
@@ -900,6 +939,7 @@ def format_solver_feedback_for_prompt(failed_data: dict, base_path: str = None, 
         failed_data,
         backend="cvc5",
         include_stuck=repair_hints_enabled(),
+        current_goal=current_formula,
     )
     if attempt_txt:
         parts.append(attempt_txt)
@@ -993,6 +1033,7 @@ def create_prompt(
         else:
             failed_info += format_solver_feedback_for_prompt(
                 failed_data, base_path=base_path, depth=depth,
+                current_formula=current_formula,
             )
         log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
     
@@ -1888,10 +1929,13 @@ def generate_lemmas_with_llm(
     *,
     ancestor_stack: AncestorStack = (),
     current_formula: Optional[str] = None,
+    extra_user: Optional[str] = None,
+    skip_hint_refresh: bool = False,
 ) -> List[str]:
     """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。
 
     格式解析失败时在同一次 attempt 内按 LLM_PARSE_RETRIES 再请求，不立刻消耗下一轮 attempt。
+    extra_user 追加一轮用户说明（静态筛 kept=0 重生）；skip_hint_refresh 跳过诊断器。
     """
     logging.info(
         "即将使用LLM%s, 目标文件: %s, 提示策略: %s",
@@ -1905,7 +1949,7 @@ def generate_lemmas_with_llm(
             _assert, formula = extract_original_goal(smt_content)
         except Exception:
             formula = None
-    if not diagnosis_only:
+    if not diagnosis_only and not skip_hint_refresh:
         maybe_refresh_llm_hints(
             base_path,
             goal_name,
@@ -1924,6 +1968,8 @@ def generate_lemmas_with_llm(
         ancestor_stack=ancestor_stack,
         current_formula=formula,
     )
+    if extra_user:
+        messages = list(messages) + [{"role": "user", "content": extra_user}]
     system_text = (messages[0].get("content") if messages else "") or ""
     extra_retries = 0 if diagnosis_only else llm_parse_retries()
     call_messages = list(messages)
@@ -2285,7 +2331,7 @@ def validate_lemmas_parallel(
     base_path: str,
     goal_name: str,
 ) -> List[str]:
-    """1s 有效性：与公理矛盾 / error 的成员记 invalid 并丢掉。
+    """1s 有效性：与公理矛盾记 invalid；parse/type 记 illformed；其余进入有用性。
 
     ``LEMMA_FILTER_DROP`` 开启时返回其余成员；关闭时任一失败则返回空列表。
     """
@@ -2303,7 +2349,21 @@ def validate_lemmas_parallel(
             try:
                 valid_path, result = future.result()
                 lemma_content = lemma_by_path.get(valid_path) or extract_lemma_from_file(valid_path)
-                if result.proved:
+                wf = cvc_output_wellformed_failure(
+                    getattr(result, "stdout", "") or "",
+                    getattr(result, "stderr", "") or "",
+                )
+                if wf is not None and not wf.ok:
+                    bad.add(valid_path)
+                    if lemma_content:
+                        add_illformed_lemma(
+                            base_path,
+                            goal_name,
+                            lemma_content,
+                            wf.message or (wf.kind or "parse_error"),
+                            kind=wf.kind or "parse_error",
+                        )
+                elif result.proved:
                     bad.add(valid_path)
                     if lemma_content:
                         add_invalid_lemma(
@@ -2564,60 +2624,96 @@ def quick_run(
             state.decision_source = decision_source
         save_routing_state(base_path, goal_smt_name, state)
     
-    # 步骤3: 使用LLM生成引理
-    extracted_asserts = generate_lemmas_with_llm(
-        smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name,
-        folder_path, depth=depth,
-        ancestor_stack=ancestor_stack,
-        current_formula=original_forall,
-    )
-
-    # 如果没有生成引理，与调用失败一样进入下一 attempt，不加时。
-    if not extracted_asserts:
-        logging.info("大模型未返回引理，跳过本 attempt（不加时）")
-        return False, [], []
-
-    generated_asserts = list(extracted_asserts)
+    # 步骤3: 使用LLM生成引理；静态筛 kept=0 时同 attempt 最多再生成 LLM_SCREEN_RETRIES 次
     library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
-    extracted_asserts, dropped = apply_static_lemma_screen(
-        extracted_asserts,
-        original_forall=original_forall,
-        smt=solver_content,
-        invalid_records=failed_data.get("invalid_lemmas") or [],
-        same_as_goal=are_formulas_equivalent,
-        library_items=library_items,
-        ancestor_stack=ancestor_stack,
-    )
-    save_last_screen(base_path, goal_smt_name, dropped)
-    for lemma, reason, gate in dropped:
-        if gate == "same_as_ancestor":
-            log_exp(
-                "ancestor_cycle",
-                goal=goal_smt_name,
-                reason=reason,
-                lemma=(lemma or "")[:160],
-            )
-            continue
-        if gate in BENIGN_SCREEN_GATES:
-            continue
-        add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
-    if dropped:
-        known_n = sum(1 for _lemma, _reason, gate in dropped if gate == "known_invalid")
-        if known_n:
-            log_exp("known_invalid", goal=goal_smt_name, n=known_n, kept=len(extracted_asserts))
-        logging.info(
-            "筛选排除 %d 条 (gates=%s)，保留 %d 条",
-            len(dropped),
-            [gate for _lemma, _reason, gate in dropped],
-            len(extracted_asserts),
+    extra_user: Optional[str] = None
+    skip_hint_refresh = False
+    generated_asserts: List[str] = []
+    dropped: List[Tuple[str, str, str]] = []
+    extracted_asserts: List[str] = []
+    screen_budget = llm_screen_retries()
+
+    for screen_round in range(1 + screen_budget):
+        extracted_asserts = generate_lemmas_with_llm(
+            smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name,
+            folder_path, depth=depth,
+            ancestor_stack=ancestor_stack,
+            current_formula=original_forall,
+            extra_user=extra_user,
+            skip_hint_refresh=skip_hint_refresh,
         )
+        if not extracted_asserts:
+            if screen_round == 1:
+                logging.info("大模型未返回引理，跳过本 attempt（不加时）")
+                return False, [], []
+            extracted_asserts = []
+            break
+
+        generated_asserts = list(extracted_asserts)
+        extracted_asserts, dropped = apply_static_lemma_screen(
+            extracted_asserts,
+            original_forall=original_forall,
+            smt=solver_content,
+            invalid_records=failed_data.get("invalid_lemmas") or [],
+            same_as_goal=are_formulas_equivalent,
+            library_items=library_items,
+            ancestor_stack=ancestor_stack,
+        )
+        save_last_screen(base_path, goal_smt_name, dropped)
+        for lemma, reason, gate in dropped:
+            if gate == "same_as_ancestor":
+                log_exp(
+                    "ancestor_cycle",
+                    goal=goal_smt_name,
+                    reason=reason,
+                    lemma=(lemma or "")[:160],
+                )
+                continue
+            if gate in BENIGN_SCREEN_GATES:
+                continue
+            if gate in ILLFORMED_SCREEN_GATES:
+                add_illformed_lemma(
+                    base_path, goal_smt_name, lemma, reason, kind=gate,
+                )
+                continue
+            add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
+        if dropped:
+            known_n = sum(1 for _lemma, _reason, gate in dropped if gate == "known_invalid")
+            if known_n:
+                log_exp("known_invalid", goal=goal_smt_name, n=known_n, kept=len(extracted_asserts))
+            logging.info(
+                "筛选排除 %d 条 (gates=%s)，保留 %d 条",
+                len(dropped),
+                [gate for _lemma, _reason, gate in dropped],
+                len(extracted_asserts),
+            )
+            log_exp(
+                "lemma_filter_drop",
+                goal=goal_smt_name,
+                dropped=len(dropped),
+                kept=len(extracted_asserts),
+                gates=",".join(gate for _lemma, _reason, gate in dropped),
+            )
+        if extracted_asserts:
+            break
+        extra_user = format_screen_retry_user(dropped)
+        skip_hint_refresh = True
+        if screen_round > screen_budget:
+            break
         log_exp(
-            "lemma_filter_drop",
+            "lemma_screen_retry",
             goal=goal_smt_name,
+            round=screen_round,
             dropped=len(dropped),
-            kept=len(extracted_asserts),
             gates=",".join(gate for _lemma, _reason, gate in dropped),
         )
+        logging.info(
+            "静态筛选全灭，同 attempt 再生成一次 (round=%s, gates=%s)",
+            screen_round,
+            [gate for _lemma, _reason, gate in dropped],
+        )
+        failed_data = load_failed_lemmas(base_path, goal_smt_name)
+
     if not extracted_asserts:
         if dropped and all(gate in BENIGN_SCREEN_GATES for _lemma, _reason, gate in dropped):
             if any(gate == "same_as_library" for _lemma, _reason, gate in dropped):
@@ -2630,6 +2726,11 @@ def quick_run(
                     logging.info("筛选后引理已在库中，用当前库证出当前目标")
                     return True, [], generated_asserts
             return False, [], generated_asserts
+        illformed_only = bool(dropped) and all(
+            gate in ILLFORMED_SCREEN_GATES or gate in BENIGN_SCREEN_GATES
+            for _lemma, _reason, gate in dropped
+        ) and any(gate in ILLFORMED_SCREEN_GATES for _lemma, _reason, gate in dropped)
+        attempt_status = "parse_error" if illformed_only else "invalid_lemma"
         record_solver_attempt(
             base_path,
             goal_smt_name,
@@ -2638,7 +2739,7 @@ def quick_run(
                 base_path, goal_smt_name
             ).active_profile,
             result=CvcResult(
-                status="invalid_lemma",
+                status=attempt_status,
                 strategy=solver_profile or "",
             ),
         )

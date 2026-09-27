@@ -1,6 +1,6 @@
 (set-logic ALL)
 (declare-datatypes ((Nat 0)) (((Zero) (Succ (pred Nat)))))
-(declare-datatypes ((Z 0)) ((Z (P (P_0 Nat)) (N (N_0 Nat)))))
+(declare-datatypes ((Z 0)) (((P (P_0 Nat)) (N (N_0 Nat)))))
 (declare-fun plus (Nat Nat) Nat)
 (declare-fun minus (Nat Nat) Z)
 (declare-fun plus2 (Z Z) Z)

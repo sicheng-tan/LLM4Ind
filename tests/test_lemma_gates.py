@@ -41,6 +41,8 @@ from lemma_gates import (
     REVIVAL_ORIGIN_CHILD_PENDING,
     REVIVAL_ORIGIN_SITUATION_A,
     llm_parse_retries,
+    llm_screen_retries,
+    format_screen_retry_user,
     node_attempt_plan,
     parse_final_diagnosis,
     parse_llm_lemmas,
@@ -694,6 +696,75 @@ def test_llm_parse_retries_env() -> None:
     assert hinted[0] is not msgs[0]
 
 
+def test_llm_screen_retries_env() -> None:
+    with patch.dict(os.environ, {"LLM_SCREEN_RETRIES": "1"}):
+        assert llm_screen_retries() == 1
+    with patch.dict(os.environ, {"LLM_SCREEN_RETRIES": "0"}):
+        assert llm_screen_retries() == 0
+    with patch.dict(os.environ, {"LLM_SCREEN_RETRIES": ""}):
+        assert llm_screen_retries() == 1
+    with patch.dict(os.environ, {"LLM_SCREEN_RETRIES": "nope"}):
+        assert llm_screen_retries() == 1
+    txt = format_screen_retry_user([
+        (
+            "(forall ((n Nat)) (= (plus n zero) n))",
+            "same as CURRENT",
+            "same_as_goal",
+        ),
+        (PLUS_LEMMA, "undefined_symbol:plus", "undefined_symbol"),
+        (SNOC_LEMMA, "already_in_library:lib_1", "same_as_library"),
+    ])
+    assert "strictly more local" in txt
+    assert "same as the CURRENT goal" in txt
+    assert "undefined_symbol:plus" in txt
+    assert "already in lemma library lib_1" in txt
+    assert "(assert" not in txt
+
+
+def test_quick_run_screen_retry_regenerates_once() -> None:
+    import Mate_new_vampire as mate
+    from vampire_runner import VampireResult
+
+    timeout = VampireResult(status="timeout", proved=False, elapsed=0.01)
+    calls: list = []
+
+    def fake_gen(*_args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return [PLUS_LEMMA]
+        return [SNOC_LEMMA]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(P2_SMT, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LEMMA_DEFINED_SYMBOLS": "on",
+            "LEMMA_FILTER_DROP": "on",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY_LOCAL": "off",
+            "LLM_SCREEN_RETRIES": "1",
+        }), patch(
+            "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen,
+        ), patch("Mate_new_vampire.run_vampire", return_value=timeout), patch(
+            "Mate_new_vampire.verify_combined_lemmas",
+            return_value=(False, [], timeout),
+        ) as useful:
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+    assert proved is False
+    assert subgoals == []
+    assert lemmas == [SNOC_LEMMA]
+    assert len(calls) == 2
+    assert not calls[0].get("extra_user")
+    assert calls[0].get("skip_hint_refresh") is False
+    assert calls[1].get("skip_hint_refresh") is True
+    extra = calls[1].get("extra_user") or ""
+    assert "strictly more local" in extra
+    assert "plus" in extra
+    useful.assert_called()
+    assert useful.call_args.args[1] == [SNOC_LEMMA]
+
+
 def test_tree_status_sat_is_invalid() -> None:
     status, reason = tree_status_from_child_data({
         "baseline_diag": {"status": "sat"},
@@ -764,6 +835,7 @@ def test_quick_run_rejects_undefined_plus() -> None:
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
             "SOLVER_ROUTING": "off",
+            "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", return_value=[PLUS_LEMMA]
         ), patch("Mate_new_vampire.run_vampire") as vampire:
@@ -826,6 +898,7 @@ def test_quick_run_library_duplicate_retries_goal_not_invalid() -> None:
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
             "SOLVER_ROUTING": "off",
+            "LLM_SCREEN_RETRIES": "0",
         }):
             add_proved_lemma(tmp, SNOC_LEMMA, origin="seed")
             with patch(
@@ -859,6 +932,7 @@ def test_quick_run_filter_drop_off_aborts_whole_group() -> None:
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "off",
             "SOLVER_ROUTING": "off",
+            "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
             return_value=[PLUS_LEMMA, SNOC_LEMMA],
@@ -889,6 +963,7 @@ def test_quick_run_skips_known_invalid_without_solver() -> None:
         with patch.dict(os.environ, {
             "SOLVER_ROUTING": "off",
             "LEMMA_FILTER_DROP": "off",
+            "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
             return_value=[spaced, SNOC_LEMMA],
@@ -1887,6 +1962,8 @@ def main() -> int:
     test_last_attempt_prompt_keeps_latest_group_and_drops()
     test_node_attempt_plan_child_cap()
     test_llm_parse_retries_env()
+    test_llm_screen_retries_env()
+    test_quick_run_screen_retry_regenerates_once()
     test_tree_status_sat_is_invalid()
     test_tree_status_nested_invalid_does_not_mark_parent()
     test_repair_hint_for_prompt_drops_subgoal_atp()

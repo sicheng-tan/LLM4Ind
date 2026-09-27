@@ -1,6 +1,8 @@
 (set-logic UFDT)
+
 (declare-sort sk_a 0)
 (declare-sort fun1 0)
+
 ; datatypes
 (declare-datatypes ((list2 0))
   (((nil2) (cons2 (head2 sk_a) (tail2 list2)))))
@@ -52,10 +54,10 @@
         (append (append (flatten0 (Node_0 x)) (cons2 (Node_1 x) nil2))
           (flatten0 (Node_2 x)))))))
 (assert (forall ((x Tree)) (= (apply1 lam x) (flatten0 x))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((ps list)) (= (flatten1 ps) (concatMap lam ps)))))
 ; proof goal end
 
+(check-sat)

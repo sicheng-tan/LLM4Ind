@@ -36,6 +36,7 @@ from lemma_gates import (
     MAX_REVIVAL_LEMMAS,
     REVIVAL_ORIGIN_CHILD_PENDING,
     REVIVAL_ORIGIN_SITUATION_A,
+    lemma_same_as_goal,
     seed_revival_from_unproved,
     should_promote_child_pending,
 )
@@ -241,18 +242,22 @@ def has_hint_opportunity(
     *,
     library: Optional[Sequence[dict]] = None,
     prev_library_ids: Optional[Sequence[str]] = None,
+    current_goal: Optional[str] = None,
 ) -> bool:
     """True when the revival pool is nonempty *and* the library grew.
 
     Both sides are required so lib-only calls (empty pool → only
     NEW_DIRECTION / NO_ACTION) do not steer generation. Missing
     ``prev_library_ids`` is an empty-library baseline: any current library
-    id counts as a change (the first diagnoser call).
+    id counts as a change (the first diagnoser call). ``current_goal``
+    drops α-equivalent revival formulas (same as the diagnoser pack).
     """
     prev = [] if prev_library_ids is None else list(prev_library_ids)
     lib_new = _library_has_new_ids(library or [], prev_ids=prev)
     return bool(
-        _revival_candidate_items(failed_data or {}, library=library)
+        _revival_candidate_items(
+            failed_data or {}, library=library, current_goal=current_goal,
+        )
     ) and lib_new
 
 
@@ -354,12 +359,13 @@ def _revival_candidate_items(
     failed_data: dict,
     *,
     library: Optional[Sequence[Any]] = None,
+    current_goal: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """Soft-failed lemmas from the independent revival pool; never invalid.
 
     Missing ``revival_lemmas`` seeds from this node's ``unproved_lemmas`` as
-    situation_a (no descendant walk). α-equivalent library formulas are
-    dropped with the same check as ``should_promote_child_pending``.
+    situation_a (no descendant walk). α-equivalent library or CURRENT-goal
+    formulas are dropped with the same check as ``should_promote_child_pending``.
     Overflow keeps the newest ``MAX_REVIVE_CANDIDATES`` entries.
     """
     data = dict(failed_data or {})
@@ -384,7 +390,9 @@ def _revival_candidate_items(
         key = normalize_lemma_formula(formula)
         if not key or key in seen or key in invalid_keys:
             continue
-        if not should_promote_child_pending(formula, library=library or []):
+        if not should_promote_child_pending(
+            formula, library=library or [], current_goal=current_goal,
+        ):
             continue
         status = _normalize_prove_status(rec.get("status") or "unproved")
         if status == "invalid":
@@ -464,6 +472,7 @@ def _source_attempt_id(
     failed_data: dict,
     *,
     library: Optional[Sequence[dict]] = None,
+    current_goal: Optional[str] = None,
 ) -> str:
     hd = _latest_hd_hint(failed_data)
     if hd and hd.get("attempt_id"):
@@ -478,7 +487,9 @@ def _source_attempt_id(
             )
         else:
             base = "baseline"
-    n_revival = len(_revival_candidate_items(failed_data, library=library))
+    n_revival = len(_revival_candidate_items(
+        failed_data, library=library, current_goal=current_goal,
+    ))
     return f"{base}|{_library_fingerprint(library or [])}|r{n_revival}"
 
 
@@ -805,7 +816,9 @@ def build_observation_pack(
         }
 
     lib_items = _library_show_items(library or [], prev_ids=prev_library_ids)
-    revive_pool = _revival_candidate_items(failed_data, library=library)
+    revive_pool = _revival_candidate_items(
+        failed_data, library=library, current_goal=goal,
+    )
     do_not_repeat = _do_not_repeat_items(failed_data, ancestor_stack)
     background = extract_theory_background(smt_content)
     if not (
@@ -831,7 +844,9 @@ def build_observation_pack(
         })
 
     return {
-        "attempt_id": _source_attempt_id(failed_data, library=library),
+        "attempt_id": _source_attempt_id(
+            failed_data, library=library, current_goal=goal,
+        ),
         "dump_complete": dump_complete,
         "goal": {
             "id": "G1",
@@ -1041,16 +1056,22 @@ def _text_from_legacy_json(data: dict) -> str:
     return " ".join(parts).strip()
 
 
-def _extract_revive_list(raw_items: Any) -> List[Dict[str, str]]:
+def _extract_revive_list(
+    raw_items: Any,
+    *,
+    current_goal: Optional[str] = None,
+) -> List[Dict[str, str]]:
     """Extract non-empty revive formulas; no pool-membership filter.
 
-    Legacy ``action: hold`` entries are omitted. Empty formulas are skipped.
-    Dedup by normalized formula text; soft-cap at ``MAX_REVIVE_OUT``.
+    Legacy ``action: hold`` entries are omitted. Empty formulas and
+    α-equivalents of ``current_goal`` are skipped. Dedup by normalized
+    formula text; soft-cap at ``MAX_REVIVE_OUT``.
     """
     if not isinstance(raw_items, list):
         return []
     out: List[Dict[str, str]] = []
     seen: Set[str] = set()
+    goal = str(current_goal or "").strip()
     for item in raw_items:
         formula = ""
         action = ""
@@ -1065,6 +1086,8 @@ def _extract_revive_list(raw_items: Any) -> List[Dict[str, str]]:
             continue
         out_formula = _prompt_formula(formula)
         if not out_formula:
+            continue
+        if goal and lemma_same_as_goal(out_formula, goal):
             continue
         key = normalize_lemma_formula(out_formula)
         if key in seen:
@@ -1113,8 +1136,13 @@ def parse_llm_feedback_hints(
     raw: Optional[str],
     *,
     revival_candidates: Optional[Sequence[Any]] = None,
+    current_goal: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Parse into ``{\"mode\", \"text\", \"revive\": [{formula, note}]}``."""
+    """Parse into ``{\"mode\", \"text\", \"revive\": [{formula, note}]}``.
+
+    α-equivalents of ``current_goal`` are dropped from revive; an empty
+    list demotes REVISE_CANDIDATE to NEW_DIRECTION / NO_ACTION.
+    """
     text = (raw or "").strip()
     if not text:
         return None
@@ -1161,7 +1189,7 @@ def parse_llm_feedback_hints(
     cleaned = _normalize_hint_text(note)
     # revival_candidates kept for call-site compat; revive list is not filtered to it.
     _ = revival_candidates
-    revive = _extract_revive_list(revive_raw)
+    revive = _extract_revive_list(revive_raw, current_goal=current_goal)
     mode = _normalize_hint_mode(
         mode_raw, n_revive=len(revive), has_text=len(cleaned) >= MIN_HINT_CHARS,
     )
@@ -1187,13 +1215,18 @@ def hint_text(hints: Any) -> str:
     return _normalize_hint_text(_text_from_legacy_json(hints))
 
 
-def hint_revive_entries(hints: Any) -> List[Dict[str, str]]:
+def hint_revive_entries(
+    hints: Any,
+    *,
+    current_goal: Optional[str] = None,
+) -> List[Dict[str, str]]:
     if not isinstance(hints, dict):
         return []
     items = hints.get("revive") or hints.get("revival") or []
     if not isinstance(items, list):
         return []
     out: List[Dict[str, str]] = []
+    goal = str(current_goal or "").strip()
     for item in items:
         if isinstance(item, dict):
             formula = str(item.get("formula") or "").strip()
@@ -1201,6 +1234,8 @@ def hint_revive_entries(hints: Any) -> List[Dict[str, str]]:
             if action == "hold":
                 continue
             if not formula:
+                continue
+            if goal and lemma_same_as_goal(formula, goal):
                 continue
             out.append({
                 "id": str(item.get("id") or ""),
@@ -1211,7 +1246,7 @@ def hint_revive_entries(hints: Any) -> List[Dict[str, str]]:
                 out[-1]["note"] = note[:240]
         else:
             formula = str(item or "").strip()
-            if formula:
+            if formula and not (goal and lemma_same_as_goal(formula, goal)):
                 out.append({
                     "id": "",
                     "formula": _prompt_formula(formula),
@@ -1226,14 +1261,14 @@ def hint_revive_list(hints: Any) -> List[str]:
     return [item["formula"] for item in hint_revive_entries(hints)]
 
 
-def hint_mode(hints: Any) -> str:
+def hint_mode(hints: Any, *, current_goal: Optional[str] = None) -> str:
     """Stored or inferred mode: no_action / new_direction / revise_candidate."""
     if isinstance(hints, str):
         text = _normalize_hint_text(hints)
         return HINT_NEW_DIRECTION if len(text) >= MIN_HINT_CHARS else HINT_NO_ACTION
     if not isinstance(hints, dict):
         return HINT_NO_ACTION
-    entries = hint_revive_entries(hints)
+    entries = hint_revive_entries(hints, current_goal=current_goal)
     text = hint_text(hints)
     return _normalize_hint_mode(
         hints.get("mode"),
@@ -1252,16 +1287,20 @@ def format_llm_hints_lines(
     record: Optional[dict],
     *,
     indent: str = "    ",
+    current_goal: Optional[str] = None,
 ) -> List[str]:
     """Lines for SOLVER HINTS nested under LAST ATTEMPT / INITIAL SOLVE."""
     if not isinstance(record, dict):
         return []
     hints = record.get("hints")
-    mode = hint_mode(hints)
+    mode = hint_mode(hints, current_goal=current_goal)
     if mode == HINT_NO_ACTION:
         return []
     text = hint_text(hints)
-    entries = hint_revive_entries(hints) if mode == HINT_REVISE_CANDIDATE else []
+    entries = (
+        hint_revive_entries(hints, current_goal=current_goal)
+        if mode == HINT_REVISE_CANDIDATE else []
+    )
     if not text and not entries:
         return []
     ind = indent
@@ -1295,9 +1334,13 @@ def format_llm_hints_lines(
     return lines
 
 
-def format_llm_hints_for_prompt(record: Optional[dict]) -> str:
+def format_llm_hints_for_prompt(
+    record: Optional[dict],
+    *,
+    current_goal: Optional[str] = None,
+) -> str:
     """Standalone block (tests / callers); prefer nesting via format_attempt_feedback."""
-    lines = format_llm_hints_lines(record, indent="")
+    lines = format_llm_hints_lines(record, indent="", current_goal=current_goal)
     if not lines:
         return ""
     return "\n" + "\n".join(lines)
@@ -1372,7 +1415,10 @@ def maybe_refresh_llm_hints(
     ):
         return existing
     if not has_hint_opportunity(
-        failed_data, library=library, prev_library_ids=baseline,
+        failed_data,
+        library=library,
+        prev_library_ids=baseline,
+        current_goal=current_goal or str((pack.get("goal") or {}).get("formula") or ""),
     ):
         _persist_library_baseline(
             base_path, goal_name, library,
@@ -1414,7 +1460,11 @@ def maybe_refresh_llm_hints(
             item for item in (pack.get("revival_candidates") or [])
             if isinstance(item, dict) and item.get("formula")
         ]
-        hints = parse_llm_feedback_hints(raw, revival_candidates=revive_pool)
+        hints = parse_llm_feedback_hints(
+            raw,
+            revival_candidates=revive_pool,
+            current_goal=current_goal or str((pack.get("goal") or {}).get("formula") or ""),
+        )
         if hints is None:
             parse_error = "empty_or_short_hint"
     except Exception as exc:

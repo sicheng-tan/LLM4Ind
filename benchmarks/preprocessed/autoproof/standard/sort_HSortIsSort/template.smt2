@@ -81,10 +81,10 @@
         (is-Nil x) nil2
         (cons2 (Node_1 x) (toList (hmerge (Node_0 x) (Node_2 x))))))))
 (assert (forall ((x list2)) (= (hsort x) (toList (toHeap x)))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((x list2)) (= (hsort x) (isort x)))))
 ; proof goal end
 
+(check-sat)

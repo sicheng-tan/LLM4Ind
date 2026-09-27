@@ -1,6 +1,6 @@
 (set-logic UFDT)
 (declare-datatypes ((list3 0))
-  ((list3 (nil3) (cons3 (head3 Bool) (tail3 list3)))))
+  (((nil3) (cons3 (head3 Bool) (tail3 list3)))))
 (declare-datatypes ((It 0)) (((A) (B) (C))))
 (declare-datatypes ((list2 0))
   (((nil2) (cons2 (head2 It) (tail2 list2)))))

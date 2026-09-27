@@ -35,6 +35,7 @@ import Mate_new as mate
 
 AX = "(forall ((n Nat) (m Nat)) (= (plus (succ n) m) (succ (plus n m))))"
 GOAL = "(forall ((n Nat)) (= (plus n zero) n))"
+PENDING = "(forall ((x Lst)) (>= (len x) 0))"
 
 
 def _hd_data(**extra):
@@ -84,7 +85,7 @@ def test_skip_without_difficulty() -> None:
 
 
 def test_pack_without_difficulty_omits_hard_axioms() -> None:
-    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    lemma = PENDING
     data = {
         "repair_hints": [],
         "baseline_diag": {},
@@ -759,7 +760,7 @@ def test_maybe_refresh_skips_without_useless_group(tmp_path: Path) -> None:
 
 
 def test_maybe_refresh_runs_without_difficulty(tmp_path: Path) -> None:
-    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    lemma = PENDING
     base = str(tmp_path)
     mate.save_failed_lemmas(base, "template", {
         "repair_hints": [],
@@ -805,7 +806,7 @@ def test_maybe_refresh_runs_without_difficulty(tmp_path: Path) -> None:
 
 
 def test_has_hint_opportunity_revival_and_library_new() -> None:
-    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    lemma = PENDING
     empty = _hd_data(useless_lemma_groups=[{"lemmas": [lemma], "status": "timeout"}])
     empty["revival_lemmas"] = []
     empty["unproved_lemmas"] = []
@@ -1066,7 +1067,7 @@ def test_maybe_refresh_runs_on_library_delta(tmp_path: Path) -> None:
 
 
 def _hd_data_with_useless(**extra):
-    lemma = "(forall ((n Nat)) (= (plus n zero) n))"
+    lemma = PENDING
     data = _hd_data(
         useless_lemma_groups=[{
             "lemmas": [lemma],
@@ -1095,7 +1096,7 @@ def test_maybe_refresh_runs_and_stores(tmp_path: Path) -> None:
     data = _hd_data_with_useless()
     mate.save_failed_lemmas(base, "template", data)
     _write_library(tmp_path)
-    cand = "(forall ((n Nat)) (= (plus n zero) n))"
+    cand = PENDING
     raw = json.dumps({
         "note": (
             "Generalize the accumulator so the inductive hypothesis matches "
@@ -1246,6 +1247,76 @@ def test_format_attempt_suppress_advice_flag() -> None:
     assert "advice:" not in off
 
 
+def test_parse_revive_drops_goal_alpha_and_demotes() -> None:
+    alpha = "(forall ((x Nat)) (= (plus x zero) x))"
+    raw = json.dumps({
+        "mode": "REVISE_CANDIDATE",
+        "note": (
+            "Library now has plus-succ; revive a more local pending lemma "
+            "instead of copying the CURRENT goal."
+        ),
+        "revive": [
+            {"formula": GOAL, "note": "copy of GOAL"},
+            {"formula": alpha, "note": "alpha of GOAL"},
+            {"formula": PENDING, "note": "len nonneg"},
+        ],
+    })
+    diag = parse_llm_feedback_hints(raw, current_goal=GOAL)
+    assert diag is not None
+    assert diag["mode"] == "revise_candidate"
+    assert [item["formula"] for item in diag["revive"]] == [PENDING]
+
+    only_goal = parse_llm_feedback_hints(json.dumps({
+        "mode": "REVISE_CANDIDATE",
+        "note": (
+            "All revive entries were copies of the CURRENT goal up to renaming; "
+            "try a new lemma shape."
+        ),
+        "revive": [{"formula": alpha, "note": "goal rename"}],
+    }), current_goal=GOAL)
+    assert only_goal is not None
+    assert only_goal["mode"] == "new_direction"
+    assert only_goal["revive"] == []
+
+    txt = format_llm_hints_for_prompt({
+        "hints": {
+            "mode": "revise_candidate",
+            "text": "Pending still includes a GOAL copy; drop it at inject time.",
+            "revive": [{"formula": alpha}, {"formula": PENDING}],
+        },
+    }, current_goal=GOAL)
+    assert PENDING in txt
+    assert alpha not in txt
+    assert "pending candidates" in txt
+
+
+def test_revival_pack_drops_goal_alpha() -> None:
+    alpha = "(forall ((x Nat)) (= (plus x zero) x))"
+    data = _hd_data(
+        unproved_lemmas=[
+            {"lemma": GOAL, "status": "timeout"},
+            {"lemma": alpha, "status": "timeout"},
+            {"lemma": PENDING, "status": "timeout"},
+        ],
+        useless_lemma_groups=[{"lemmas": [PENDING], "status": "timeout"}],
+    )
+    pack = build_observation_pack(data, current_goal=GOAL)
+    assert pack is not None
+    revive = [item["formula"] for item in pack["revival_candidates"]]
+    assert PENDING in revive
+    assert GOAL not in revive
+    assert alpha not in revive
+    lib = [{"id": "lib_1", "formula": AX, "role": "pin"}]
+    assert has_hint_opportunity(data, current_goal=GOAL, library=lib) is True
+    only_goal = _hd_data(
+        unproved_lemmas=[{"lemma": alpha, "status": "timeout"}],
+        useless_lemma_groups=[{"lemmas": [alpha], "status": "timeout"}],
+    )
+    assert has_hint_opportunity(
+        only_goal, current_goal=GOAL, library=lib,
+    ) is False
+
+
 if __name__ == "__main__":
     test_flag_default_off()
     test_skip_without_difficulty()
@@ -1297,4 +1368,6 @@ if __name__ == "__main__":
     test_prompt_skips_llm_hints_without_useless_group()
     test_hints_flag_omits_program_repair_without_llm_block()
     test_format_attempt_suppress_advice_flag()
+    test_parse_revive_drops_goal_alpha_and_demotes()
+    test_revival_pack_drops_goal_alpha()
     print("feedback_llm_hints tests passed")

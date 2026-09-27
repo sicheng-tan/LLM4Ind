@@ -42,10 +42,10 @@
     (= (toTree x)
       (ite (is-cons x) (add (head x) (toTree (tail x))) TNil))))
 (assert (forall ((x list)) (= (tsort x) (flatten (toTree x) nil))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((x Int) (y list)) (= (count x (tsort y)) (count x y)))))
 ; proof goal end
 
+(check-sat)

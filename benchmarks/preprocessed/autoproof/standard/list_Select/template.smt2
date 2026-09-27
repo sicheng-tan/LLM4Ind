@@ -1,6 +1,8 @@
 (set-logic UFDT)
+
 (declare-sort sk_t 0)
 (declare-sort fun1 0)
+
 ; datatypes
 (declare-datatypes ((list2 0))
   (((nil2) (cons2 (head2 sk_t) (tail2 list2)))))
@@ -39,10 +41,10 @@
         (is-cons x) (cons2 (apply1 f (head x)) (map2 f (tail x))) nil2))))
 (assert (forall ((x Pair)) (= (fst x) (first x))))
 (assert (forall ((x Pair)) (= (apply1 lam x) (fst x))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((xs list2)) (= (map2 lam (select2 xs)) xs))))
 ; proof goal end
 
+(check-sat)

@@ -12,6 +12,11 @@ not the obligation tree. Skip when that INVALID list is empty.
 ``FEEDBACK_PROGRESS`` remains default off.
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
+LLM_SCREEN_RETRIES extra generation after static screen kept=0 (default 1);
+not mixed with parse retries.
+``LEMMA_WELLFORMED_CHECK`` (default on) runs cvc5 ``--parse-only`` on each
+candidate before validity/usefulness; failures are ``parse_error`` /
+``type_error`` (not mathematical ``invalid``) and feed the screen-retry prompt.
 """
 
 from __future__ import annotations
@@ -128,6 +133,15 @@ PARSE_ERR_EMPTY = "空引理输出"
 PARSE_ERR_UNMATCHED = "引理括号不配平"
 PARSE_ERR_MISSING_TAGS = "响应格式错误，缺少输出标记"
 MAX_FORALL_CLOSE_REPAIR = 2
+MAX_SCREEN_RETRY_DROPS = 6
+SCREEN_RETRY_USER = (
+    "Filter dropped every lemma. Do not repeat them. "
+    "New lemmas must be strictly more local than GOAL and ancestors, "
+    "use only symbols defined in the SMT file, and must not copy the GOAL "
+    "or library axioms up to renaming. "
+    "For parse_error/type_error, fix syntax or sorts "
+    "(e.g. no undeclared plus; rename binder as→xs)."
+)
 
 
 def subgoal_sat_abort_enabled() -> bool:
@@ -136,6 +150,11 @@ def subgoal_sat_abort_enabled() -> bool:
 
 def defined_symbols_enabled() -> bool:
     return _flag_enabled("LEMMA_DEFINED_SYMBOLS")
+
+
+def wellformed_check_enabled() -> bool:
+    """cvc5 ``--parse-only`` gate before validity / usefulness (default on)."""
+    return _flag_enabled("LEMMA_WELLFORMED_CHECK")
 
 
 def lemma_filter_drop_enabled() -> bool:
@@ -184,6 +203,58 @@ def with_parse_retry_hint(
     if snippet:
         out.append({"role": "assistant", "content": snippet})
     out.append({"role": "user", "content": PARSE_RETRY_USER})
+    return out
+
+
+def llm_screen_retries() -> int:
+    """Extra LLM generation after static screen kept=0, same prove-run attempt.
+
+    Default 1. 0 disables. Distinct from ``LLM_PARSE_RETRIES`` (format) and
+    ``LLM_MAX_RETRIES`` (HTTP). Does not retry usefulness timeout or sat.
+    """
+    raw = os.getenv("LLM_SCREEN_RETRIES")
+    if raw is None or str(raw).strip() == "":
+        return 1
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def format_screen_retry_user(
+    dropped: Sequence[Tuple[str, str, str]],
+) -> str:
+    """Compressed (gate, short reason, truncated formula) for one screen retry."""
+    lines = [SCREEN_RETRY_USER, "dropped:"]
+    for lemma, reason, gate in list(dropped or [])[:MAX_SCREEN_RETRY_DROPS]:
+        formula = compact_formula(lemma)
+        if not formula:
+            continue
+        g = str(gate or "")
+        why = str(reason or "").strip()
+        if g == "same_as_library":
+            lib_id = ""
+            if why.startswith("already_in_library:"):
+                lib_id = why.split(":", 1)[-1].strip()
+            label = f"already in lemma library {lib_id}".strip()
+        elif g == "undefined_symbol":
+            label = (why or "undefined symbol")[:MAX_REASON_CHARS]
+        elif g in ("parse_error", "type_error"):
+            label = f"{g}: {(why or g)}"[:MAX_REASON_CHARS]
+        else:
+            label = _SCREEN_GATE_LABEL.get(g) or (why or g or "filtered")
+            label = label[:MAX_REASON_CHARS]
+        lines.append(f"  - {formula}  [{label}]")
+    return "\n".join(lines)
+
+
+def with_screen_retry_hint(
+    messages: Sequence[Dict[str, Any]],
+    dropped: Sequence[Tuple[str, str, str]],
+) -> List[Dict[str, Any]]:
+    """Append a screen-failure user turn; keep the original system/user."""
+    out = [dict(item) for item in messages]
+    out.append({"role": "user", "content": format_screen_retry_user(dropped)})
     return out
 
 
@@ -525,6 +596,77 @@ def lemmas_undefined_symbols(lemmas: Sequence[str], smt: str) -> Dict[str, List[
     return out
 
 
+_BINDER_BLOCK = re.compile(
+    r"\(\s*(?:forall|exists)\s*\((.*?)\)\s*",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_BINDER_VAR = re.compile(r"\(\s*([^\s()]+)")
+
+
+def reserved_binder_names(lemma: str) -> List[str]:
+    """SMT-LIB reserved words used as quantified variable names."""
+    found: List[str] = []
+    seen: Set[str] = set()
+    for block in _BINDER_BLOCK.finditer(lemma or ""):
+        for match in _BINDER_VAR.finditer(block.group(1) or ""):
+            name = match.group(1)
+            key = name.lower()
+            if key in _RESERVED and name not in seen:
+                seen.add(name)
+                found.append(name)
+    return found
+
+
+def check_lemma_syntax_static(lemma: str) -> Optional[Tuple[str, str]]:
+    """Fast local checks before invoking cvc5. Returns ``(gate, reason)`` or None."""
+    reserved = reserved_binder_names(lemma)
+    if reserved:
+        names = ",".join(reserved)
+        return (
+            "parse_error",
+            f"reserved binder name(s): {names} (SMT-LIB keyword; rename e.g. as→tail)",
+        )
+    return None
+
+
+def screen_lemmas_wellformed(
+    lemmas: Sequence[str],
+    smt: str,
+) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    """Drop candidates that fail reserved-binder or cvc5 ``--parse-only`` checks.
+
+    Gates are ``parse_error`` / ``type_error`` only (never mathematical invalid).
+    """
+    from cvc5_runner import check_lemma_wellformed
+
+    current = list(lemmas)
+    dropped: List[Tuple[str, str, str]] = []
+    if not current:
+        return [], dropped
+
+    kept: List[str] = []
+    for lemma in current:
+        static_hit = check_lemma_syntax_static(lemma)
+        if static_hit:
+            gate, reason = static_hit
+            dropped.append((lemma, reason, gate))
+            continue
+        if not wellformed_check_enabled():
+            kept.append(lemma)
+            continue
+        result = check_lemma_wellformed(lemma, smt)
+        if result.ok:
+            kept.append(lemma)
+            continue
+        gate = result.kind or "parse_error"
+        reason = (result.message or gate).strip()
+        dropped.append((lemma, reason, gate))
+
+    if dropped and not lemma_filter_drop_enabled():
+        return [], dropped
+    return kept, dropped
+
+
 def _stored_invalid_formula(record: Any) -> str:
     stored = record.get("lemma") if isinstance(record, dict) else record
     return normalize_lemma_formula(str(stored or ""))
@@ -788,6 +930,12 @@ BENIGN_SCREEN_GATES = frozenset({
     "same_as_ancestor",
 })
 
+# Format / sort failures: retry with feedback; never write mathematical invalid.
+ILLFORMED_SCREEN_GATES = frozenset({
+    "parse_error",
+    "type_error",
+})
+
 
 def lemma_same_as_goal(lemma: str, goal: str) -> bool:
     """True if *lemma* is the goal after whitespace collapse or α-normalization."""
@@ -829,11 +977,13 @@ def apply_static_lemma_screen(
     """Drop known-invalid / same-as-goal / ancestor-cycle / library / undefined members.
 
     Returns ``(kept, dropped)`` where each dropped item is
-    ``(lemma, reason, gate)``. ``gate`` is ``known_invalid``, ``same_as_goal``,
-    ``same_as_ancestor``, ``same_as_library``, or ``undefined_symbol``.
+    ``(lemma, reason, gate)``.     ``gate`` is ``known_invalid``, ``same_as_goal``,
+    ``same_as_ancestor``, ``same_as_library``, ``undefined_symbol``,
+    ``parse_error``, or ``type_error``.
     Known-invalid, library duplicates, and ancestor cycles are not recorded as
     invalid by the caller (ancestor hits are path cycles, often still theorems).
-    Library matches always drop only that member.
+    Parse/type failures are recorded as ``illformed_lemmas``, not mathematical
+    invalid. Library matches always drop only that member.
     """
     from ancestor_stack import lemma_matches_ancestor
     from exp_flags import ancestor_cycle_filter_enabled
@@ -905,6 +1055,13 @@ def apply_static_lemma_screen(
 
         if not _stage("undefined_symbol", _undef_reason):
             return [], dropped
+
+    # Parse / type gate: reserved binders always; cvc5 --parse-only when enabled.
+    wf_kept, wf_dropped = screen_lemmas_wellformed(current, smt)
+    dropped.extend(wf_dropped)
+    current = wf_kept
+    if not current:
+        return [], dropped
     return current, dropped
 
 
@@ -923,6 +1080,8 @@ _SCREEN_GATE_LABEL = {
     "same_as_library": "already in lemma library",
     "same_as_ancestor": "same as a STRICT ANCESTOR on the proof path",
     "same_as_goal": "same as the CURRENT goal",
+    "parse_error": "parse_error (fix syntax / names / reserved binders)",
+    "type_error": "type_error (argument or return sort mismatch)",
 }
 
 _STUCK_SKIP_KINDS = frozenset({
@@ -1022,6 +1181,8 @@ def format_dropped_line(item: dict) -> Optional[str]:
         label = f"already in lemma library {lib_id}".strip()
     elif gate == "undefined_symbol":
         label = (reason or "undefined symbol")[:MAX_REASON_CHARS]
+    elif gate in ("parse_error", "type_error"):
+        label = f"{gate}: {(reason or gate)}"[:MAX_REASON_CHARS]
     else:
         label = _SCREEN_GATE_LABEL.get(gate) or (reason or gate or "filtered")
         label = label[:MAX_REASON_CHARS]
@@ -1151,6 +1312,7 @@ def format_attempt_feedback_for_prompt(
     backend: str = "cvc5",
     include_stuck: bool = True,
     suppress_advice: bool = False,
+    current_goal: Optional[str] = None,
 ) -> str:
     """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
 
@@ -1179,7 +1341,7 @@ def format_attempt_feedback_for_prompt(
     )
     llm_rec = data.get("llm_hints") if isinstance(data.get("llm_hints"), dict) else {}
     llm_lines = (
-        format_llm_hints_lines(llm_rec, indent="    ")
+        format_llm_hints_lines(llm_rec, indent="    ", current_goal=current_goal)
         if llm_hints_eligible(data) else []
     )
     use_llm_hints = bool(llm_lines)

@@ -2,7 +2,7 @@
 (declare-sort sk_a 0)
 (declare-datatypes ((Nat 0)) (((S (p Nat)) (Z))))
 (declare-datatypes ((List2 0))
-  ((List2 (Cons (Cons_0 sk_a) (Cons_1 List2)) (Nil))))
+  (((Cons (Cons_0 sk_a) (Cons_1 List2)) (Nil))))
 (declare-fun take (Nat List2) List2)
 (declare-fun minus (Nat Nat) Nat)
 (declare-fun mod2 (Nat Nat Nat) Nat)

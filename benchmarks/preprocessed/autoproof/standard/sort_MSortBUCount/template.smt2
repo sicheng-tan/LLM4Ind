@@ -1,15 +1,17 @@
 (set-logic UFDTLIA)
+
 (declare-sort fun1 0)
+
 ; datatypes
 (declare-datatypes ((list2 0))
   (((nil2) (cons2 (head2 Int) (tail2 list2)))))
 (declare-datatypes ((list 0))
   (((nil) (cons (head list2) (tail list)))))
 (declare-datatypes ((Nat 0)) (((Z) (S (p Nat)))))
-(declare-const lam fun1)
 ; datatypes end
 
 ; functions declarations
+(declare-const lam fun1)
 (declare-fun apply1 (fun1 Int) list2)
 (declare-fun map2 (fun1 list2) list)
 (declare-fun lmerge (list2 list2) list2)
@@ -66,10 +68,10 @@
         (ite (= x (head2 y)) (S (count x (tail2 y))) (count x (tail2 y)))
         Z))))
 (assert (forall ((y Int)) (= (apply1 lam y) (cons2 y nil2))))
-(check-sat)
 ; functions declarations end
 
 ; proof goal
 (assert (not (forall ((x Int) (y list2)) (= (count x (msortbu y)) (count x y)))))
 ; proof goal end
 
+(check-sat)

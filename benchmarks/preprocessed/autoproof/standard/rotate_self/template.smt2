@@ -1,5 +1,7 @@
 (set-logic UFDT)
+
 (declare-sort sk_a 0)
+
 ; datatypes
 (declare-datatypes ((Nat 0)) (((S (p Nat)) (Z))))
 (declare-datatypes ((List2 0))
