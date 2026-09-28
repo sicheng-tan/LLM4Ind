@@ -375,6 +375,7 @@ def test_parse_llm_reason() -> None:
         "LLM_LEMMA_DIAGNOSIS": "on",
         "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
     }):
         assert allow_unmarked_lemma_output(
             "thinking\n; INVALID_GOAL: plus has no axioms\n",
@@ -618,6 +619,7 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
         "LLM_LEMMA_DIAGNOSIS": "on",
         "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
     }):
         assert parse_llm_lemmas(
             "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
@@ -1039,6 +1041,11 @@ def test_tree_status_sat_is_invalid() -> None:
         "baseline_diag": {"status": "timeout"},
     })
     assert status == "failed"
+    status, _reason = tree_status_from_child_data({
+        "node_outcome": {"kind": "stopped", "reason": "LLM said invalid", "source": "llm"},
+        "baseline_diag": {"status": "timeout"},
+    })
+    assert status == "failed"
 
 
 def test_tree_status_nested_invalid_does_not_mark_parent() -> None:
@@ -1341,6 +1348,7 @@ def test_diagnosis_suffix_flag() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
         }):
             root, _ = mate.create_prompt(
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
@@ -1393,6 +1401,7 @@ def test_should_append_diagnosis_by_depth() -> None:
         "LLM_LEMMA_DIAGNOSIS": "on",
         "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
     }):
         assert should_append_diagnosis_suffix(0) is False
         assert should_append_diagnosis_suffix(1) is True
@@ -1424,6 +1433,7 @@ def test_child_empty_reason_stops_attempts() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
@@ -1489,6 +1499,7 @@ def test_llm_invalid_ce_verify_accepts_and_rejects() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
+            "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "0",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
@@ -1510,6 +1521,7 @@ def test_llm_invalid_ce_verify_accepts_and_rejects() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
+            "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "0",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
@@ -1523,6 +1535,43 @@ def test_llm_invalid_ce_verify_accepts_and_rejects() -> None:
         assert gen.call_count == 2  # CE failed → continue attempts
         outcome2 = mate.load_failed_lemmas(bad, "template").get("node_outcome") or {}
         assert outcome2.get("kind") != "invalid"
+
+
+def test_llm_invalid_only_stop_skips_hard_invalid() -> None:
+    """ONLY_STOP=on: early-stop with kind=stopped; parent sees failed not invalid."""
+    import Mate_new as mate
+    from cvc5_runner import CvcResult
+
+    timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
+
+    def fake_gen(_smt, _strat, _path, base_path, goal_name, _folder, depth=0, **_kwargs):
+        mate._store_last_llm_reason(base_path, goal_name, "goal is not a theorem")
+        return []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LLM_LEMMA_DIAGNOSIS": "on",
+            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+            "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "on",
+            "SUBGOAL_SAT_ABORT": "off",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_LIBRARY": "off",
+            "CHILD_LLM_ATTEMPTS": "2",
+        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+            "Mate_new.generate_lemmas_with_llm", side_effect=fake_gen,
+        ) as gen:
+            ok = mate.prove_run(tmp, "template", depth=1)
+        assert ok is False
+        assert gen.call_count == 1  # early-stop, no second attempt
+        outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
+        assert outcome.get("kind") == "stopped"
+        assert outcome.get("source") == "llm"
+        status, _ = tree_status_from_child_data(
+            mate.load_failed_lemmas(tmp, "template")
+        )
+        assert status == "failed"
 
 
 def test_llm_invalid_ce_retry_recovers_on_second_call() -> None:
@@ -1561,6 +1610,7 @@ def test_llm_invalid_ce_retry_recovers_on_second_call() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
+            "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "1",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
@@ -1638,6 +1688,7 @@ def _run_generate_lemmas(
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "LLM_PARSE_RETRIES": retries,
         }), patch(
             f"{mod_name}.create_prompt",
@@ -1671,6 +1722,7 @@ def test_generate_reason_without_markers_stores_reason() -> None:
                 "LLM_LEMMA_DIAGNOSIS": "on",
                 "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
                 "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
                 "LLM_PARSE_RETRIES": "0",
             }), patch(
                 f"{mod_name}.create_prompt",
@@ -1893,6 +1945,7 @@ def test_parse_retry_does_not_consume_extra_attempt() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "LLM_PARSE_RETRIES": "1",
             "CHILD_LLM_ATTEMPTS": "2",
             "SUBGOAL_SAT_ABORT": "off",
@@ -2033,6 +2086,7 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "FEEDBACK_REPAIR_HINTS": "off",
         }):
             root, root_extra = mate.create_prompt(
@@ -2072,6 +2126,7 @@ def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "SUBGOAL_SAT_ABORT": "off",
             "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
@@ -2330,6 +2385,7 @@ def test_final_diagnosis_marks_goal_invalid() -> None:
             "LEMMA_LIBRARY": "off",
             "LLM_LEMMA_DIAGNOSIS": "on",
             "LLM_INVALID_CE_VERIFY": "off",
+            "LLM_INVALID_ONLY_STOP": "off",
             "OBLIGATION_TREE": "off",
         }), patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
@@ -2457,6 +2513,7 @@ def main() -> int:
     test_child_empty_reason_stops_attempts()
     test_parse_llm_counterexample_smt_block()
     test_llm_invalid_ce_verify_accepts_and_rejects()
+    test_llm_invalid_only_stop_skips_hard_invalid()
     test_llm_invalid_ce_retry_recovers_on_second_call()
     test_final_only_skips_in_loop_invalid_continues_attempts()
     test_generate_reason_without_markers_stores_reason()

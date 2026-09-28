@@ -37,6 +37,7 @@ from lemma_gates import (
     llm_lemma_diagnosis_enabled,
     llm_lemma_diagnosis_final_only,
     llm_invalid_ce_verify_enabled,
+    llm_invalid_only_stop_enabled,
     subgoal_sat_abort_enabled,
 )
 
@@ -57,6 +58,7 @@ _FLAG_NAMES = (
     "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY",
     "LLM_INVALID_CE_VERIFY",
     "LLM_INVALID_CE_RETRIES",
+    "LLM_INVALID_ONLY_STOP",
 )
 
 _FEEDBACK_PAYLOAD = {
@@ -112,7 +114,8 @@ def test_flags_default_on() -> None:
         assert lemma_filter_drop_enabled() is True
         assert llm_lemma_diagnosis_enabled() is True
         assert llm_lemma_diagnosis_final_only() is False
-        assert llm_invalid_ce_verify_enabled() is True
+        assert llm_invalid_ce_verify_enabled() is False
+        assert llm_invalid_only_stop_enabled() is True
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
@@ -146,8 +149,14 @@ def test_flags_default_on() -> None:
             assert llm_lemma_diagnosis_final_only() is False
         with patch.dict(os.environ, {"LLM_INVALID_CE_VERIFY": val}):
             assert llm_invalid_ce_verify_enabled() is False
+        with patch.dict(os.environ, {"LLM_INVALID_ONLY_STOP": val}):
+            assert llm_invalid_only_stop_enabled() is False
     with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on"}):
         assert llm_lemma_diagnosis_final_only() is True
+    with patch.dict(os.environ, {"LLM_INVALID_CE_VERIFY": "on"}):
+        assert llm_invalid_ce_verify_enabled() is True
+    with patch.dict(os.environ, {"LLM_INVALID_ONLY_STOP": "off"}):
+        assert llm_invalid_only_stop_enabled() is False
     with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
         assert progress_feedback_enabled() is True
     with patch.dict(os.environ, {"PROOF_SHAPE_HINT": "on"}):

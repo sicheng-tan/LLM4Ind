@@ -144,6 +144,7 @@ from lemma_gates import (
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
     with_parse_retry_hint,
+    llm_invalid_only_stop_enabled,
 )
 from exp_stats import (
     add_llm_time,
@@ -476,7 +477,11 @@ def _accept_llm_invalid_diagnosis(
     *,
     source: str,
 ) -> Tuple[bool, str]:
-    """Write ``node_outcome.invalid`` for LLM diagnosis; optionally require CE verify.
+    """Accept LLM INVALID_GOAL: early-stop and optionally hard-invalid.
+
+    With ``LLM_INVALID_ONLY_STOP`` (default on): write ``kind=stopped`` and
+    return success so the child exits early, without parent hard INVALID.
+    With the flag off: write ``kind=invalid`` (optionally gated by CE verify).
 
     Returns ``(accepted, reject_detail)``. ``reject_detail`` is non-empty when CE
     verify rejected the claim (for optional same-slot CE retry).
@@ -484,6 +489,17 @@ def _accept_llm_invalid_diagnosis(
     text = (reason or "").strip()
     if not text or not is_invalid_diagnosis_reason(text):
         return False, ""
+    if llm_invalid_only_stop_enabled():
+        _set_node_outcome(
+            base_path, goal_name, kind="stopped", reason=text, source=source,
+        )
+        log_exp(
+            "llm_invalid_only_stop",
+            goal=goal_name,
+            source=source,
+            reason=text[:160],
+        )
+        return True, ""
     if not llm_invalid_ce_verify_enabled():
         _set_node_outcome(
             base_path, goal_name, kind="invalid", reason=text, source=source,

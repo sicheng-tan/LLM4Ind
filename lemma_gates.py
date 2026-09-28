@@ -22,6 +22,8 @@ false; they feed screening and a separate prompt block, never INVALID.
 ``PROOF_SHAPE_HINT`` (default off) appends a short observer/recursion hint after
 LAST ATTEMPT usefulness-fail kept and/or USEFUL BUT UNPROVED (sublemma proof
 fail); not the diagnoser.
+``LLM_INVALID_ONLY_STOP`` (default on) lets LLM INVALID_GOAL early-stop a child
+without writing hard ``node_outcome.invalid`` (parent keeps unproved/failed).
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
 same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 LLM_SCREEN_RETRIES extra generation after static screen kept=0 (default 1);
@@ -232,12 +234,25 @@ def llm_lemma_diagnosis_final_only() -> bool:
 
 
 def llm_invalid_ce_verify_enabled() -> bool:
-    """When on (default), LLM INVALID_GOAL needs a solver-checked CE_SMT model.
+    """When on, LLM INVALID_GOAL needs a solver-checked CE_SMT model.
 
-    Missing or unsat counterexamples do not write hard ``node_outcome.invalid``.
-    Set ``LLM_INVALID_CE_VERIFY=off`` to accept prose INVALID_GOAL alone.
+    Default **off** (prose INVALID_GOAL alone can write hard invalid when
+    ``LLM_INVALID_ONLY_STOP`` is also off).
+    Enable with ``LLM_INVALID_CE_VERIFY=on``; missing/unsat CE then blocks
+    hard ``node_outcome.invalid`` (optional CE retries if configured).
     """
-    return _flag_enabled("LLM_INVALID_CE_VERIFY")
+    return _flag_enabled("LLM_INVALID_CE_VERIFY", default="off")
+
+
+def llm_invalid_only_stop_enabled() -> bool:
+    """When on (default), LLM INVALID_GOAL only early-stops the child.
+
+    Writes ``node_outcome.kind=stopped`` (not ``invalid``), so parents do not
+    hard-write the blocking lemma into ``invalid_lemmas`` / treat the child as
+    mathematically refuted. Set ``LLM_INVALID_ONLY_STOP=off`` to restore
+    LLM→hard invalid (optionally gated by ``LLM_INVALID_CE_VERIFY``).
+    """
+    return _flag_enabled("LLM_INVALID_ONLY_STOP")
 
 
 def llm_invalid_ce_retries() -> int:
@@ -1729,6 +1744,9 @@ def format_repair_header(backend: str, hints: Sequence[dict]) -> List[str]:
 
 def tree_status_from_child_data(failed_data: Optional[dict]) -> Tuple[str, str]:
     """Map this child's json to invalid vs failed. Nested descendants are not inherited.
+
+    ``node_outcome.kind=invalid`` or solver ``sat`` → invalid (parent hard write-back).
+    ``kind=stopped`` (LLM_INVALID_ONLY_STOP) and timeouts → failed / unproved path.
 
     Two callers:
     - obligation-tree node status (only when ``OBLIGATION_TREE`` is on)
