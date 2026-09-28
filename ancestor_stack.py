@@ -78,7 +78,8 @@ def format_proof_path_goals_for_prompt(
         return ""
     lines = [
         "",
-        "PROOF PATH GOALS (do not restate any of these as a lemma):",
+        "PROOF PATH GOALS (do not propose the CURRENT goal or any STRICT ANCESTOR "
+        "as a lemma; do not restate them):",
         f"  CURRENT [id={current_id}, depth={int(current_depth)}]:",
         f"  {cur}",
     ]

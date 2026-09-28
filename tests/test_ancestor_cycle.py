@@ -77,6 +77,7 @@ class AncestorStackTests(unittest.TestCase):
             stack=stack,
         )
         self.assertIn("PROOF PATH GOALS", txt)
+        self.assertIn("CURRENT goal or any STRICT ANCESTOR", txt)
         self.assertIn("CURRENT", txt)
         self.assertIn("ANCESTOR A0", txt)
         self.assertIn(ROOT, txt)
