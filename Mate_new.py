@@ -83,6 +83,7 @@ from exp_flags import (
     collect_difficulty_for_feedback,
     normalize_strategy_mode,
     paper_schedule_prompt,
+    problem_profiler_enabled,
     progress_feedback_enabled,
     prompt_retarget_active,
     repair_hints_enabled,
@@ -1058,8 +1059,14 @@ def format_solver_feedback_for_prompt(
     depth: int = 0,
     *,
     current_formula: Optional[str] = None,
+    include_obligation: bool = True,
 ) -> str:
-    """把 cvc5 失败/进展/难度信号格式化进下一轮 LLM prompt。"""
+    """把 cvc5 失败/进展/难度信号格式化进下一轮 LLM prompt。
+
+    Dynamic trial-and-error blocks first, then optional PROOF_SHAPE / routing.
+    Obligation / library text is included only when *include_obligation* is true
+    (``create_prompt`` usually injects that block earlier, before the ancestor path).
+    """
     parts: List[str] = []
 
     if failed_data.get("invalid_lemmas"):
@@ -1127,7 +1134,9 @@ def format_solver_feedback_for_prompt(
             parts.append(routing_txt)
 
     # Library still injects when OBLIGATION_TREE is off.
-    if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
+    if include_obligation and base_path and (
+        lemma_library_enabled() or obligation_tree_enabled()
+    ):
         obligation_txt = format_obligation_prompt(
             load_lemma_library(base_path),
             failed_data.get("obligation"),
@@ -1159,6 +1168,47 @@ def create_prompt(
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
     failed_info = ""
+    if not diagnosis_only and problem_profiler_enabled():
+        try:
+            from problem_profiler import profile_prompt_block_for_smt
+
+            library_items = []
+            if base_path and lemma_library_enabled():
+                library_items = load_lemma_library(base_path)
+            block = profile_prompt_block_for_smt(
+                smt_file_content,
+                problem_id=goal_name or "",
+                current_goal=current_formula,
+                library_items=library_items,
+                cache_ns=base_path or goal_name or "",
+            )
+            if block:
+                failed_info += block
+                log_exp(
+                    "problem_profiler_inject",
+                    goal=goal_name or "",
+                    n_chars=len(block),
+                    n_library=len(library_items),
+                )
+        except Exception as exc:
+            logging.warning("PROBLEM_PROFILER inject failed: %s", exc)
+    # Order: SMT (in template) → profiler → obligation/library → ancestor →
+    # dynamic feedback (INVALID…UNPROVED) → PROOF_SHAPE → diagnosis suffix.
+    if (
+        not diagnosis_only
+        and base_path
+        and (lemma_library_enabled() or obligation_tree_enabled())
+    ):
+        failed_data_early = (
+            load_failed_lemmas(base_path, goal_name) if goal_name else {}
+        )
+        obligation_txt = format_obligation_prompt(
+            load_lemma_library(base_path),
+            failed_data_early.get("obligation"),
+            depth=depth,
+        )
+        if obligation_txt:
+            failed_info += obligation_txt
     if not diagnosis_only and ancestor_prompt_enabled():
         path_txt = format_proof_path_goals_for_prompt(
             current_id=goal_name or "",
@@ -1178,6 +1228,7 @@ def create_prompt(
             failed_info += format_solver_feedback_for_prompt(
                 failed_data, base_path=base_path, depth=depth,
                 current_formula=current_formula,
+                include_obligation=False,
             )
         log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
     

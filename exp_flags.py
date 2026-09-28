@@ -120,6 +120,16 @@ def proof_shape_hint_enabled() -> bool:
     return _flag_enabled("PROOF_SHAPE_HINT", default="off")
 
 
+def problem_profiler_enabled() -> bool:
+    """Inject deterministic SMT structure facts into lemma-generation prompts.
+
+    Parse / gate / render only. Default **off**. Does not call an LLM and does
+    not replace ``FEEDBACK_LLM_HINTS`` or ``PROOF_SHAPE_HINT``.
+    Enable with ``PROBLEM_PROFILER=on``.
+    """
+    return _flag_enabled("PROBLEM_PROFILER", default="off")
+
+
 def prompt_retarget_enabled() -> bool:
     """Pick / switch generation templates from hint families and consecutive no-help."""
     return _flag_enabled("PROMPT_RETARGET")
