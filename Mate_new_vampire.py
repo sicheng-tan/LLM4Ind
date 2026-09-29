@@ -81,6 +81,8 @@ from exp_flags import (
     ancestor_prompt_enabled,
     paper_schedule_prompt,
     problem_profiler_enabled,
+    problem_profiler_trigger,
+    should_inject_problem_profiler,
     progress_feedback_enabled,
     prompt_retarget_active,
     repair_hints_enabled,
@@ -1074,70 +1076,74 @@ def create_prompt(
         system_prompt_content = apply_advice_system_instruction(file.read())
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
-    # 添加失败引理 + Vampire solver-guided 反馈
     # Order: SMT → profiler → obligation/library → ancestor → dynamic feedback → PROOF_SHAPE.
     failed_info = ""
-    if not diagnosis_only and problem_profiler_enabled():
-        try:
-            from problem_profiler import profile_prompt_block_for_smt
-
-            library_items = []
-            if base_path and lemma_library_enabled():
-                library_items = load_lemma_library(base_path)
-            block = profile_prompt_block_for_smt(
-                smt_file_content,
-                problem_id=goal_name or "",
-                current_goal=current_formula,
-                library_items=library_items,
-                cache_ns=base_path or goal_name or "",
-            )
-            if block:
-                failed_info += block
-                log_exp(
-                    "problem_profiler_inject",
-                    goal=goal_name or "",
-                    n_chars=len(block),
-                    n_library=len(library_items),
-                )
-        except Exception as exc:
-            logging.warning("PROBLEM_PROFILER inject failed: %s", exc)
-    if (
-        not diagnosis_only
-        and base_path
-        and (lemma_library_enabled() or obligation_tree_enabled())
-    ):
-        failed_data_early = (
-            load_failed_lemmas(base_path, goal_name) if goal_name else {}
-        )
-        obligation_txt = format_obligation_prompt(
-            load_lemma_library(base_path),
-            failed_data_early.get("obligation"),
-            depth=depth,
-        )
-        if obligation_txt:
-            failed_info += obligation_txt
-    if not diagnosis_only and ancestor_prompt_enabled():
-        path_txt = format_proof_path_goals_for_prompt(
-            current_id=goal_name or "",
-            current_depth=depth,
-            current_formula=current_formula or "",
-            stack=ancestor_stack,
-        )
-        if path_txt:
-            failed_info += path_txt
+    failed_data: dict = {}
     if base_path and goal_name:
         failed_data = load_failed_lemmas(base_path, goal_name)
-        if diagnosis_only:
-            # Extra invalid-check: INVALID child write-back only (same signal as
-            # in-loop diagnosis). Not the obligation tree.
+
+    if diagnosis_only:
+        if failed_data:
             failed_info = format_diagnosis_invalid_prompt(failed_data)
-        else:
+            log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
+    else:
+        if should_inject_problem_profiler(failed_data):
+            try:
+                from problem_profiler import (
+                    attempt_lemmas_from_failed_data,
+                    profile_prompt_block_for_smt,
+                )
+
+                library_items = []
+                if base_path and lemma_library_enabled():
+                    library_items = load_lemma_library(base_path)
+                attempt_lemmas = attempt_lemmas_from_failed_data(failed_data)
+                block = profile_prompt_block_for_smt(
+                    smt_file_content,
+                    problem_id=goal_name or "",
+                    current_goal=current_formula,
+                    library_items=library_items,
+                    attempt_lemmas=attempt_lemmas,
+                    cache_ns=base_path or goal_name or "",
+                )
+                if block:
+                    failed_info += block
+                    attempts_done = len(failed_data.get("exp_attempts") or [])
+                    log_exp(
+                        "problem_profiler_inject",
+                        goal=goal_name or "",
+                        n_chars=len(block),
+                        n_library=len(library_items),
+                        n_attempt_lemmas=len(attempt_lemmas),
+                        trigger=problem_profiler_trigger(),
+                        attempt=attempts_done + 1,
+                    )
+            except Exception as exc:
+                logging.warning("PROBLEM_PROFILER inject failed: %s", exc)
+        if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
+            obligation_txt = format_obligation_prompt(
+                load_lemma_library(base_path),
+                failed_data.get("obligation"),
+                depth=depth,
+            )
+            if obligation_txt:
+                failed_info += obligation_txt
+        if ancestor_prompt_enabled():
+            path_txt = format_proof_path_goals_for_prompt(
+                current_id=goal_name or "",
+                current_depth=depth,
+                current_formula=current_formula or "",
+                stack=ancestor_stack,
+            )
+            if path_txt:
+                failed_info += path_txt
+        if base_path and goal_name:
             failed_info += format_solver_feedback_for_prompt(
                 failed_data, base_path=base_path, depth=depth,
                 current_formula=current_formula,
                 include_obligation=False,
             )
-        log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
+            log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
     
     # 构建结构化消息列表
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info

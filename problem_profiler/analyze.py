@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from smt_patterns import equality_lhs, sexpr_head_args
+from smt_patterns import equality_lhs, forall_matrix, peel_implication, sexpr_head_args
 
 from .types import (
     GoalRelation,
@@ -12,6 +12,12 @@ from .types import (
     ProblemProfile,
     RecursionFact,
 )
+
+_LOGIC = frozenset({
+    "=", "not", "and", "or", "=>", "implies", "ite", "true", "false",
+    "forall", "exists", "let", "!", "_", "match", "as", "par",
+    "+", "-", "*", "div", "mod", "<", ">", "<=", ">=",
+})
 
 
 def enrich_profile(profile: ProblemProfile) -> ProblemProfile:
@@ -49,24 +55,49 @@ def _analyze_recursion(
     profile: ProblemProfile, constructors: Set[str],
 ) -> List[RecursionFact]:
     facts: List[RecursionFact] = []
+    selectors: Set[str] = set(profile.signature.get("selectors") or [])
+    selector_to_ctor: Dict[str, str] = {
+        str(k): str(v)
+        for k, v in (profile.signature.get("selector_to_ctor") or {}).items()
+    }
+    if not selectors and selector_to_ctor:
+        selectors = set(selector_to_ctor.keys())
+    datatype_ctors: Dict[str, List[str]] = {
+        str(k): [str(x) for x in (v or [])]
+        for k, v in (profile.signature.get("datatype_constructors") or {}).items()
+    }
+    fun_sorts: Dict[str, dict] = dict(profile.signature.get("fun_sorts") or {})
+    declared = set(profile.signature.get("functions") or []) | selectors
+
     # Per function: equations with self-call, and those with ctor pattern on LHS.
     recursive_eqs: Dict[str, List[str]] = {}
     ctor_eqs: Dict[str, List[str]] = {}
     structural_eqs: Dict[str, List[str]] = {}  # same equation: ctor LHS + self-call
+    selector_struct_eqs: Dict[str, List[str]] = {}
     ctor_names_used: Dict[str, Set[str]] = {}
 
     for rec in profile.formulas:
         if rec.role == "goal":
             continue
-        # Library lemmas are properties, not defining equations.
-        if rec.role_source == "lemma_library":
+        # Library / attempt lemmas are properties, not defining equations.
+        if rec.role_source in ("lemma_library", "attempt_feedback"):
             continue
+
+        # D: non-equality clauses (pref nil x) / (not (pref (cons…) nil)) still
+        # contribute constructor coverage for case_split notes.
+        for head, ctors in _clause_ctor_patterns(rec.raw, constructors, declared):
+            if not ctors:
+                continue
+            ctor_eqs.setdefault(head, []).append(rec.formula_id)
+            ctor_names_used.setdefault(head, set()).update(ctors)
+
         lhs = equality_lhs(rec.raw)
         if not lhs:
             continue
         head, args = sexpr_head_args(lhs) if lhs.startswith("(") else (lhs, [])
         if not head:
             continue
+        declared.add(head)
         calls = _count_head_apps(rec.raw, head)
         has_rec = calls >= 2
         ctor_args = [a for a in args if _is_ctor_pattern(a, constructors)]
@@ -82,16 +113,46 @@ def _analyze_recursion(
         if has_rec and has_ctor:
             structural_eqs.setdefault(head, []).append(rec.formula_id)
 
-    all_funs = sorted({*recursive_eqs.keys(), *ctor_eqs.keys()})
+        # A: selector/tester style — (= (f x y) (ite (is-S x) … (f (p x) y) …))
+        lhs_vars = [
+            a.strip() for a in args
+            if a and not str(a).startswith("(") and a not in constructors
+        ]
+        if has_rec and lhs_vars and selectors:
+            testers = _find_tester_apps(rec.raw, constructors)
+            tester_ctors = {
+                ctor for ctor, var in testers if var in lhs_vars
+            }
+            if tester_ctors and _has_selector_self_call(
+                rec.raw, head, selectors, lhs_vars,
+            ):
+                selector_struct_eqs.setdefault(head, []).append(rec.formula_id)
+                ctor_names_used.setdefault(head, set()).update(tester_ctors)
+                # ite with one is-C and an else branch covers the other ctors.
+                scrutinee_sorts = _arg_sorts_for_vars(head, args, lhs_vars, fun_sorts)
+                for sort in scrutinee_sorts:
+                    dt = datatype_ctors.get(sort) or []
+                    if len(dt) >= 2:
+                        ctor_names_used.setdefault(head, set()).update(dt)
+
+    all_funs = sorted({
+        *recursive_eqs.keys(),
+        *ctor_eqs.keys(),
+        *selector_struct_eqs.keys(),
+    })
     for fun in all_funs:
         rec_ids = recursive_eqs.get(fun) or []
         ctor_ids = ctor_eqs.get(fun) or []
         struct_ids = structural_eqs.get(fun) or []
-        # Structural: same-eq ctor+rec, or base ctor cases + separate recursive eq.
-        if struct_ids or (rec_ids and ctor_ids):
-            fids = sorted(set(struct_ids) | set(rec_ids) | set(ctor_ids))
+        sel_ids = selector_struct_eqs.get(fun) or []
+        # Structural: classic ctor-LHS, or selector/tester style, or base+rec split.
+        if struct_ids or sel_ids or (rec_ids and ctor_ids):
+            fids = sorted(set(struct_ids) | set(sel_ids) | set(rec_ids) | set(ctor_ids))
             used = sorted(ctor_names_used.get(fun) or [])
-            detail = "LHS constructor pattern with self-call in defining equations"
+            if sel_ids and not struct_ids:
+                detail = "selector/tester defining equation with self-call"
+            else:
+                detail = "LHS constructor pattern with self-call in defining equations"
             if used:
                 detail += f"; constructors={', '.join(used)}"
             facts.append(RecursionFact(
@@ -101,12 +162,11 @@ def _analyze_recursion(
                 evidence_level="structural",
                 detail=detail,
             ))
-            # Also note multi-ctor case split when ≥2 distinct ctors appear on LHS.
             if len(used) >= 2:
                 facts.append(RecursionFact(
                     function=fun,
                     kind="constructor_case_split",
-                    source_formula_ids=sorted(set(ctor_ids)),
+                    source_formula_ids=sorted(set(ctor_ids) | set(sel_ids)),
                     evidence_level="structural",
                     detail=f"defining equations cover constructors {', '.join(used)}",
                 ))
@@ -119,7 +179,7 @@ def _analyze_recursion(
                 kind="other_decreasing_recursion",
                 source_formula_ids=sorted(set(rec_ids)),
                 evidence_level="heuristic",
-                detail="self-call with pred/succ/- style argument",
+                detail="self-call with pred/succ/-/(+ 1 n) style argument",
             ))
         else:
             facts.append(RecursionFact(
@@ -136,8 +196,7 @@ def _analyze_recursion(
     for rec in profile.formulas:
         if rec.role == "goal":
             continue
-        # Library lemmas are properties, not defining equations.
-        if rec.role_source == "lemma_library":
+        if rec.role_source in ("lemma_library", "attempt_feedback"):
             continue
         lhs = equality_lhs(rec.raw)
         if not lhs:
@@ -161,6 +220,155 @@ def _analyze_recursion(
                     detail=f"{a} and {b} call each other",
                 ))
     return facts
+
+
+def _arg_sorts_for_vars(
+    fun: str,
+    args: List[str],
+    vars_: List[str],
+    fun_sorts: Dict[str, dict],
+) -> List[str]:
+    meta = fun_sorts.get(fun) or {}
+    input_sorts = [str(s) for s in (meta.get("input_sorts") or [])]
+    out: List[str] = []
+    for i, a in enumerate(args):
+        if a in vars_ and i < len(input_sorts) and input_sorts[i]:
+            out.append(input_sorts[i])
+    return out
+
+
+def _clause_ctor_patterns(
+    formula: str,
+    constructors: Set[str],
+    declared: Set[str],
+) -> List[Tuple[str, List[str]]]:
+    """Collect (head, ctor-names) from atoms, including non-equality clauses."""
+    out: List[Tuple[str, List[str]]] = []
+    for atom in _iter_atoms(formula):
+        text = (atom or "").strip()
+        if not text.startswith("("):
+            continue
+        head, args = sexpr_head_args(text)
+        if head == "=" and len(args) >= 1:
+            lhs = args[0].strip()
+            if lhs.startswith("("):
+                head, args = sexpr_head_args(lhs)
+            else:
+                continue
+        if not head or head in _LOGIC:
+            continue
+        if declared and head not in declared and head not in constructors:
+            # Still accept unknown heads that look like defined symbols.
+            pass
+        ctors = []
+        for a in args:
+            cname = _ctor_name(a, constructors)
+            if cname:
+                ctors.append(cname)
+        if ctors:
+            out.append((head, ctors))
+    return out
+
+
+def _iter_atoms(formula: str) -> Iterable[str]:
+    body = peel_implication(forall_matrix(formula or ""))
+    yield from _walk_bool(body)
+
+
+def _walk_bool(expr: str) -> Iterable[str]:
+    text = (expr or "").strip()
+    if not text:
+        return
+    if not text.startswith("("):
+        yield text
+        return
+    head, args = sexpr_head_args(text)
+    if head in ("and", "or"):
+        for a in args:
+            yield from _walk_bool(a)
+        return
+    if head == "not" and args:
+        yield from _walk_bool(args[0])
+        return
+    if head in ("=>", "implies") and len(args) >= 2:
+        for a in args:
+            yield from _walk_bool(a)
+        return
+    yield text
+
+
+def _find_tester_apps(
+    expr: str, constructors: Set[str],
+) -> List[Tuple[str, str]]:
+    """Return (ctor, scrutinee) for ``(is-C t)`` and ``((_ is C) t)``."""
+    found: List[Tuple[str, str]] = []
+
+    def walk(text: str) -> None:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return
+        head, args = sexpr_head_args(text)
+        if head is None:
+            return
+        # (is-S x)
+        if (
+            isinstance(head, str)
+            and head.startswith("is-")
+            and len(head) > 3
+            and len(args) == 1
+        ):
+            ctor = head[3:]
+            if ctor in constructors or not constructors:
+                scr = args[0].strip()
+                if scr and not scr.startswith("("):
+                    found.append((ctor, scr))
+        # ((_ is S) x)
+        if head.startswith("(") and len(args) == 1:
+            ih, ia = sexpr_head_args(head)
+            if ih == "_" and len(ia) >= 2 and ia[0].strip() == "is":
+                ctor = ia[1].strip()
+                if ctor in constructors or not constructors:
+                    scr = args[0].strip()
+                    if scr and not scr.startswith("("):
+                        found.append((ctor, scr))
+        for a in args:
+            walk(a)
+        if head.startswith("("):
+            walk(head)
+
+    walk(expr)
+    return found
+
+
+def _has_selector_self_call(
+    expr: str,
+    fun: str,
+    selectors: Set[str],
+    scrutinee_vars: List[str],
+) -> bool:
+    """True if a self-call passes ``(sel v)`` for selector sel and var v."""
+    vars_ = set(scrutinee_vars)
+
+    def is_sel_arg(term: str) -> bool:
+        t = (term or "").strip()
+        if not t.startswith("("):
+            return False
+        h, a = sexpr_head_args(t)
+        return bool(h and h in selectors and a and a[0].strip() in vars_)
+
+    def walk(text: str) -> bool:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return False
+        head, args = sexpr_head_args(text)
+        if head == fun and any(is_sel_arg(a) for a in args):
+            return True
+        for a in args:
+            if walk(a):
+                return True
+        return False
+
+    return walk(expr)
 
 
 def _count_head_apps(formula: str, head: str) -> int:
@@ -188,10 +396,49 @@ def _looks_numeric_decrease(profile: ProblemProfile, fun: str) -> bool:
     for rec in profile.formulas:
         if fun not in rec.symbols:
             continue
+        if rec.role == "goal" or rec.role_source in ("lemma_library", "attempt_feedback"):
+            continue
         raw = rec.raw
-        if any(tok in raw for tok in (f"({fun} (pred ", f"({fun} (- ", f"({fun} (suc")):
+        if any(tok in raw for tok in (
+            f"({fun} (pred ", f"({fun} (- ", f"({fun} (suc",
+        )):
+            return True
+        # B: Int Peano via (+ 1 n) / (+ n 1) on a self-call argument.
+        if _fun_has_int_succ_arg(raw, fun):
+            return True
+        # Guarded Int recursion: (>= n 0) / (> n 0) with ≥2 apps.
+        if _count_head_apps(raw, fun) >= 2 and (
+            "(>= " in raw or "(> " in raw or "(<= 0 " in raw
+        ):
             return True
     return False
+
+
+def _fun_has_int_succ_arg(raw: str, fun: str) -> bool:
+    """True if some ``(fun …)`` argument is ``(+ 1 _)`` / ``(+ _ 1)`` (nested ok)."""
+
+    def is_succ(term: str) -> bool:
+        t = (term or "").strip()
+        if not t.startswith("("):
+            return False
+        h, a = sexpr_head_args(t)
+        if h != "+" or len(a) < 2:
+            return False
+        # (+ 1 n) or (+ n 1) or (+ 1 (+ 1 n))
+        if a[0].strip() == "1" or a[1].strip() == "1":
+            return True
+        return any(is_succ(x) for x in a)
+
+    def walk(text: str) -> bool:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return False
+        head, args = sexpr_head_args(text)
+        if head == fun and any(is_succ(a) for a in args):
+            return True
+        return any(walk(a) for a in args)
+
+    return walk(raw)
 
 
 def _analyze_observers(
@@ -204,11 +451,17 @@ def _analyze_observers(
     for rec in profile.formulas:
         if rec.role == "goal":
             continue
-        # Library lemmas are properties, not defining equations.
-        if rec.role_source == "lemma_library":
+        if rec.role_source in ("lemma_library", "attempt_feedback"):
             continue
         lhs = equality_lhs(rec.raw)
         if not lhs:
+            # D: atomic Bool defs still count as defining for observers.
+            for atom in _iter_atoms(rec.raw):
+                if not atom.startswith("("):
+                    continue
+                h, _a = sexpr_head_args(atom)
+                if h and h not in _LOGIC:
+                    defining.setdefault(h, []).append(rec.formula_id)
             continue
         head, _ = sexpr_head_args(lhs) if lhs.startswith("(") else (lhs, [])
         if head:
@@ -253,7 +506,11 @@ def _analyze_relations(profile: ProblemProfile) -> List[GoalRelation]:
     rec_funs = {
         r.function.split("/")[0]
         for r in profile.recursion_structure
-        if r.kind in ("structural_recursion", "recursive_call", "other_decreasing_recursion")
+        if r.kind in (
+            "structural_recursion",
+            "recursive_call",
+            "other_decreasing_recursion",
+        )
     }
     # mutual: function field is "a/b"
     for r in profile.recursion_structure:

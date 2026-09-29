@@ -162,6 +162,8 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "LLM_SCREEN_RETRIES=" in compact
     assert "PROOF_SHAPE_HINT=" in compact
     assert "PROBLEM_PROFILER=" in compact
+    assert "PROBLEM_PROFILER_MIN_ATTEMPT=" in compact
+    assert "PROBLEM_PROFILER_TRIGGER=" in compact
     assert "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=" in compact
     assert "LLM_INVALID_CE_VERIFY=" in compact
     assert "LLM_INVALID_CE_RETRIES=" in compact

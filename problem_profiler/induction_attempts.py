@@ -8,13 +8,22 @@ from smt_patterns import normalize_lemma_formula, sexpr_head_args
 
 from .types import FormulaRecord, InductionAttempt, ProblemProfile
 
+_INT_SORTS = frozenset({"Int"})
+_INT_BASE = "0"
+_INT_STEP = "(+ 1 _)"
+
 
 def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt]:
     """Find strict base@ctor / step@ctor fragments for the current goal matrix.
 
     Multiple ADT binders are returned in binder order (outer→inner) with
-    ``nest_level``. If any layer has known fragments, sibling ADT binders
-    without fragments are kept as ``candidate`` slots for nested display.
+    ``nest_level``. Binders without matching background fragments are kept as
+    neutral ``candidate`` rows (``attempt=none``), including when *no* known
+    fragment exists for the goal.
+
+    ``Int`` binders are included when the background mentions Int-style
+    successor recursion (``(+ 1 n)``) on a goal symbol, using pseudo-constructors
+    ``0`` / ``(+ 1 _)``.
     """
     goal = _goal_raw(profile)
     if not goal:
@@ -38,12 +47,22 @@ def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt
         rec for rec in profile.formulas
         if rec.role != "goal" and rec.raw
     ]
-    adt_binders = [(v, s) for v, s in binders if s in datatypes]
-    if not adt_binders:
+    allow_int = _goal_has_int_recursion_context(profile)
+    inductive_binders = [
+        (v, s) for v, s in binders
+        if s in datatypes or (allow_int and s in _INT_SORTS)
+    ]
+    if not inductive_binders:
         return []
 
     attempts: List[InductionAttempt] = []
-    for nest_level, (var, sort) in enumerate(adt_binders):
+    for nest_level, (var, sort) in enumerate(inductive_binders):
+        if sort in _INT_SORTS:
+            attempts.append(_analyze_int_binder(
+                binders, matrix, var, sort, nest_level, axioms,
+            ))
+            continue
+
         allowed = set(dt_ctors.get(sort) or [])
         if not allowed:
             allowed = set(ctor_arities.keys())
@@ -114,14 +133,115 @@ def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt
                 status="candidate",
             ))
 
-    # Only keep the chain if at least one layer has known fragments.
-    if not any(a.status == "known" for a in attempts):
-        return []
-    # Single ADT binder: drop the empty case (already impossible if known).
-    # Multi-binder: keep candidates so the nest can be shown.
-    if len(adt_binders) == 1:
-        return [a for a in attempts if a.status == "known"]
     return attempts
+
+
+def _goal_has_int_recursion_context(profile: ProblemProfile) -> bool:
+    """True when some goal-related function uses ``(+ 1 …)`` style recursion."""
+    goal_syms = set()
+    for rec in profile.formulas:
+        if rec.formula_id == profile.goal_formula_id or rec.role == "goal":
+            goal_syms = set(rec.symbols)
+            break
+    if not goal_syms:
+        return False
+    for fact in profile.recursion_structure:
+        funs = fact.function.split("/")
+        if not any(f in goal_syms for f in funs):
+            continue
+        if fact.kind in ("other_decreasing_recursion", "structural_recursion"):
+            return True
+        if "(+ 1" in (fact.detail or ""):
+            return True
+    # Fallback: background axioms for goal symbols contain (+ 1 …) self-calls.
+    for rec in profile.formulas:
+        if rec.role == "goal":
+            continue
+        for sym in goal_syms:
+            if sym in rec.symbols and f"({sym} (+ 1" in rec.raw:
+                return True
+            if sym in rec.symbols and "(+ 1" in rec.raw and _count_apps(rec.raw, sym) >= 2:
+                return True
+    return False
+
+
+def _count_apps(formula: str, head: str) -> int:
+    return formula.count(f"({head} ") + formula.count(f"({head})")
+
+
+def _analyze_int_binder(
+    binders: Sequence[Tuple[str, str]],
+    matrix: str,
+    var: str,
+    sort: str,
+    nest_level: int,
+    axioms: Sequence[FormulaRecord],
+) -> InductionAttempt:
+    bases: List[str] = []
+    steps: List[str] = []
+    src: List[str] = []
+
+    inst0 = _instantiate_goal(binders, matrix, var, _INT_BASE)
+    hit0 = _find_matching_axiom(inst0, axioms)
+    if hit0:
+        bases.append(_INT_BASE)
+        src.append(hit0.formula_id)
+
+    step_f = _make_int_step_formula(binders, matrix, var)
+    if step_f:
+        hit_s = _find_matching_axiom(step_f, axioms)
+        if hit_s:
+            steps.append(_INT_STEP)
+            src.append(hit_s.formula_id)
+
+    covered = sorted(set(bases) | set(steps))
+    if bases or steps:
+        detail_parts = []
+        if bases:
+            detail_parts.append("base@" + ",".join(bases))
+        if steps:
+            detail_parts.append("step@" + ",".join(steps))
+        detail_parts.append(
+            "case_split=" + ("yes" if len(covered) >= 2 else "no")
+            + (f" ({','.join(covered)})" if covered else "")
+        )
+        return InductionAttempt(
+            induct_var=var,
+            induct_sort=sort,
+            base_ctors=bases,
+            step_ctors=steps,
+            case_split=len(covered) >= 2,
+            source_formula_ids=sorted(set(src)),
+            evidence_level="structural",
+            detail="; ".join(detail_parts),
+            nest_level=nest_level,
+            status="known",
+        )
+    return InductionAttempt(
+        induct_var=var,
+        induct_sort=sort,
+        base_ctors=[],
+        step_ctors=[],
+        case_split=False,
+        source_formula_ids=[],
+        evidence_level="heuristic",
+        detail="attempt=none",
+        nest_level=nest_level,
+        status="candidate",
+    )
+
+
+def _make_int_step_formula(
+    binders: Sequence[Tuple[str, str]],
+    matrix: str,
+    var: str,
+) -> Optional[str]:
+    """Build ``(forall (…n:Int…) (=> P[n] P[(+ 1 n)]))``."""
+    ih = matrix
+    concl = _subst_free(matrix, {var: f"(+ 1 {var})"})
+    body = f"(=> {ih} {concl})"
+    parts = " ".join(f"({v} {s})" if s else f"({v})" for v, s in binders)
+    return normalize_lemma_formula(f"(forall ({parts}) {body})")
 
 
 def _goal_raw(profile: ProblemProfile) -> Optional[str]:

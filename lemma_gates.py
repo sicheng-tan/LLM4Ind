@@ -346,6 +346,28 @@ def llm_screen_retries() -> int:
         return 1
 
 
+def screen_drop_label(gate: str, reason: str = "") -> str:
+    """Human-readable screen-drop reason for retry / LAST ATTEMPT lines."""
+    g = str(gate or "")
+    why = str(reason or "").strip()
+    if g == "same_as_library":
+        # Do not surface library entry ids (lib_1 / L3); the LLM cannot use them.
+        return "already in lemma library"
+    if g == "duplicate_in_group":
+        kept = ""
+        if why.startswith("same_as_in_group:"):
+            kept = why.split(":", 1)[-1].strip()
+        if kept:
+            return f"same as earlier lemma in this group: {kept}"[:MAX_REASON_CHARS]
+        return "same as earlier lemma in this group"
+    if g == "undefined_symbol":
+        return (why or "undefined symbol")[:MAX_REASON_CHARS]
+    if g in ("parse_error", "type_error"):
+        return f"{g}: {(why or g)}"[:MAX_REASON_CHARS]
+    label = _SCREEN_GATE_LABEL.get(g) or (why or g or "filtered")
+    return label[:MAX_REASON_CHARS]
+
+
 def format_screen_retry_user(
     dropped: Sequence[Tuple[str, str, str]],
 ) -> str:
@@ -355,21 +377,7 @@ def format_screen_retry_user(
         formula = compact_formula(lemma)
         if not formula:
             continue
-        g = str(gate or "")
-        why = str(reason or "").strip()
-        if g == "same_as_library":
-            lib_id = ""
-            if why.startswith("already_in_library:"):
-                lib_id = why.split(":", 1)[-1].strip()
-            label = f"already in lemma library {lib_id}".strip()
-        elif g == "undefined_symbol":
-            label = (why or "undefined symbol")[:MAX_REASON_CHARS]
-        elif g in ("parse_error", "type_error"):
-            label = f"{g}: {(why or g)}"[:MAX_REASON_CHARS]
-        else:
-            label = _SCREEN_GATE_LABEL.get(g) or (why or g or "filtered")
-            label = label[:MAX_REASON_CHARS]
-        lines.append(f"  - {formula}  [{label}]")
+        lines.append(f"  - {formula}  [{screen_drop_label(gate, reason)}]")
     return "\n".join(lines)
 
 
@@ -1150,6 +1158,7 @@ BENIGN_SCREEN_GATES = frozenset({
     "known_soft_rejected",
     "same_as_library",
     "same_as_ancestor",
+    "duplicate_in_group",
 })
 
 # Soft (node-local) screen hits: write soft_rejected_lemmas, not hard invalid.
@@ -1195,6 +1204,35 @@ def drop_failing_members(
     return kept, dropped
 
 
+def dedupe_lemmas_in_group(
+    lemmas: Sequence[str],
+) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    """Keep the first of each α-equivalence class; drop later duplicates.
+
+    Always drops only the duplicate members (like ``same_as_library``), never
+    the whole group — ``LEMMA_FILTER_DROP`` does not apply here.
+    """
+    kept: List[str] = []
+    dropped: List[Tuple[str, str, str]] = []
+    for lemma in lemmas or []:
+        text = str(lemma or "").strip()
+        if not text:
+            continue
+        match = next(
+            (prev for prev in kept if lemmas_equivalent(text, prev)),
+            None,
+        )
+        if match is not None:
+            dropped.append((
+                text,
+                f"same_as_in_group:{compact_formula(match)}",
+                "duplicate_in_group",
+            ))
+        else:
+            kept.append(text)
+    return kept, dropped
+
+
 def apply_static_lemma_screen(
     lemmas: Sequence[str],
     *,
@@ -1211,12 +1249,14 @@ def apply_static_lemma_screen(
     Returns ``(kept, dropped)`` where each dropped item is
     ``(lemma, reason, gate)``.     ``gate`` is ``known_invalid``,
     ``known_soft_rejected``, ``same_as_goal``, ``same_as_ancestor``,
-    ``same_as_library``, ``undefined_symbol``, ``parse_error``, or ``type_error``.
-    Known-invalid, known soft-rejected, library duplicates, and ancestor cycles
-    are not re-recorded by the caller (ancestor hits are path cycles, often
-    still theorems). Soft hits (same_as_goal / undefined_symbol) go to
-    ``soft_rejected_lemmas``. Parse/type failures are ``illformed_lemmas``, not
-    mathematical invalid. Library matches always drop only that member.
+    ``same_as_library``, ``duplicate_in_group``, ``undefined_symbol``,
+    ``parse_error``, or ``type_error``.
+    Known-invalid, known soft-rejected, library duplicates, in-group α-dups,
+    and ancestor cycles are not re-recorded by the caller (ancestor hits are
+    path cycles, often still theorems). Soft hits (same_as_goal /
+    undefined_symbol) go to ``soft_rejected_lemmas``. Parse/type failures are
+    ``illformed_lemmas``, not mathematical invalid. Library and in-group
+    duplicates always drop only that member.
     """
     from ancestor_stack import lemma_matches_ancestor
     from exp_flags import ancestor_cycle_filter_enabled
@@ -1231,6 +1271,12 @@ def apply_static_lemma_screen(
             dropped.append((lemma, reason, gate))
         current = kept
         return bool(current)
+
+    # In-group α-dedup first: keep one of each class before other gates.
+    current, dup_drop = dedupe_lemmas_in_group(current)
+    dropped.extend(dup_drop)
+    if not current:
+        return [], dropped
 
     if not _stage(
         "known_invalid",
@@ -1320,6 +1366,7 @@ def repair_hint_for_prompt(hint: dict) -> bool:
 
 _SCREEN_GATE_LABEL = {
     "same_as_library": "already in lemma library",
+    "duplicate_in_group": "same as earlier lemma in this group",
     "same_as_ancestor": "same as a STRICT ANCESTOR on the proof path",
     "same_as_goal": "same as the CURRENT goal",
     "known_soft_rejected": "already suppressed at this node",
@@ -1445,19 +1492,7 @@ def format_dropped_line(item: dict) -> Optional[str]:
     if not lemma:
         return None
     reason = str((item or {}).get("reason") or "").strip()
-    if gate == "same_as_library":
-        lib_id = ""
-        if reason.startswith("already_in_library:"):
-            lib_id = reason.split(":", 1)[-1].strip()
-        label = f"already in lemma library {lib_id}".strip()
-    elif gate == "undefined_symbol":
-        label = (reason or "undefined symbol")[:MAX_REASON_CHARS]
-    elif gate in ("parse_error", "type_error"):
-        label = f"{gate}: {(reason or gate)}"[:MAX_REASON_CHARS]
-    else:
-        label = _SCREEN_GATE_LABEL.get(gate) or (reason or gate or "filtered")
-        label = label[:MAX_REASON_CHARS]
-    return f"    {lemma}  [{label}]"
+    return f"    {lemma}  [{screen_drop_label(gate, reason)}]"
 
 
 def format_stuck_lines(

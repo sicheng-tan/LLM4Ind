@@ -32,7 +32,6 @@ def _qid_list(names: List[str]) -> str:
 def _ctors_from_detail(detail: str) -> List[str]:
     m = re.search(r"constructors=([^;]+)", detail or "")
     if not m:
-        # "defining equations cover constructors cons, nil"
         m = re.search(r"constructors\s+([^;]+)$", detail or "")
     if not m:
         return []
@@ -42,7 +41,8 @@ def _ctors_from_detail(detail: str) -> List[str]:
 def _merge_recursion_facts(facts: List[RecursionFact]) -> List[Tuple[RecursionFact, bool]]:
     """Collapse structural_recursion + constructor_case_split for the same function.
 
-    Returns (fact, case_split_flag) in stable order.
+    Returns (fact, case_split_flag) in stable order. Notes (constructors /
+    link_with) are not rendered.
     """
     groups: Dict[str, List[RecursionFact]] = {}
     order: List[str] = []
@@ -64,45 +64,17 @@ def _merge_recursion_facts(facts: List[RecursionFact]) -> List[Tuple[RecursionFa
         ]
         if struct or cases:
             primary = struct[0] if struct else cases[0]
-            # Prefer constructors / peers from any sibling.
-            ctors: List[str] = []
-            peers: List[str] = []
-            for f in struct + cases:
-                for c in _ctors_from_detail(f.detail):
-                    if c not in ctors:
-                        ctors.append(c)
-                for p in f.link_peers or []:
-                    if p not in peers:
-                        peers.append(p)
-            detail = f"constructors={', '.join(ctors)}" if ctors else ""
             merged = replace(
                 primary,
                 kind="structural_recursion" if struct else primary.kind,
-                detail=detail,
-                link="",  # not rendered
-                link_peers=peers,
+                detail="",
+                link="",
+                link_peers=[],
             )
             out.append((merged, bool(cases)))
         for f in others:
-            out.append((replace(f, link=""), False))
+            out.append((replace(f, link="", link_peers=[], detail=""), False))
     return out
-
-
-def _recursion_note(fact: RecursionFact) -> str:
-    parts: List[str] = []
-    ctors = _ctors_from_detail(fact.detail)
-    if ctors:
-        parts.append("constructors=" + _qid_list(ctors))
-    elif fact.detail and fact.detail.startswith("constructors="):
-        parts.append(_decorate_ctors_only(fact.detail))
-    if fact.link_peers:
-        parts.append("link_with=" + _qid_list(fact.link_peers))
-    return "; ".join(parts)
-
-
-def _decorate_ctors_only(detail: str) -> str:
-    ctors = _ctors_from_detail(detail)
-    return "constructors=" + _qid_list(ctors) if ctors else ""
 
 
 def _induction_detail_line(att: InductionAttempt) -> str:
@@ -145,9 +117,6 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
             lines.append(
                 f"    - {_qid_fun(fact.function)}: {fact.kind} ({ev})"
             )
-            note = _recursion_note(fact)
-            if note:
-                lines.append(f"      note: {note}")
     if gated.observers:
         lines.append(
             "  Observer candidates (goal-related maps from an ADT to another sort):"
@@ -164,27 +133,7 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
                 f"    - {_qid(obs.function)}: {sig} "
                 f"(evidence={obs.evidence_level})"
             )
-    if gated.relations:
-        lines.append(
-            "  Goal relations (which recursive/observer symbols the goal mentions):"
-        )
-        for rel in gated.relations:
-            sym = ", ".join(_qid(s) for s in rel.symbols)
-            lines.append(
-                f"    - {rel.kind}: [{sym}] (evidence={rel.evidence_level})"
-            )
-    if gated.function_links:
-        lines.append(
-            "  Function links (goal functions that co-occur — or not — in axioms):"
-        )
-        related = [lk for lk in gated.function_links if lk.kind == "theorem_related"]
-        missing = [lk for lk in gated.function_links if lk.kind == "missing_bridge"]
-        for lk in related:
-            pair = "–".join(_qid(s) for s in lk.symbols)
-            lines.append(f"    - related: {pair}")
-        for lk in missing:
-            pair = "–".join(_qid(s) for s in lk.symbols)
-            lines.append(f"    - missing_bridge: {pair}")
+    # Goal relations / Function links are not rendered.
     if gated.induction_attempts:
         lines.append(
             "  Known induction attempts "
@@ -193,7 +142,10 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
         lines.append(
             "    Legend: base@`C` = goal with induct var := `C`; "
             "step@`C` = `P(t)` => `P(C(...t...))`; "
-            "attempt=none = missing; nested = inner binder."
+            "for `Int`, base@`0` / step@`(+ 1 _)` are the Peano-style cases; "
+            "attempt=none = no base/step instance of the current goal over this "
+            "variable is present in the background; "
+            "nested = inner ADT binder."
         )
         ordered = sorted(
             enumerate(gated.induction_attempts),

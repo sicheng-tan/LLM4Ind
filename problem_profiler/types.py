@@ -149,7 +149,5 @@ class GatedProfileFacts:
         return not (
             self.recursion
             or self.observers
-            or self.relations
             or self.induction_attempts
-            or self.function_links
         )

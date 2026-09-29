@@ -26,9 +26,11 @@ from lemma_gates import (
     allow_unmarked_lemma_output,
     apply_static_lemma_screen,
     attach_source_lemmas,
+    dedupe_lemmas_in_group,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
     format_diagnosis_invalid_prompt,
+    format_dropped_line,
     format_repair_header,
     PROOF_SHAPE_HINT_BLOCK,
     should_append_proof_shape_hint,
@@ -147,6 +149,66 @@ def test_static_screen_drops_library_alpha_keeps_rest() -> None:
     assert len(dropped) == 1
     assert dropped[0][2] == "same_as_library"
     assert dropped[0][1] == "already_in_library:lib_1"
+
+
+def test_static_screen_dedupes_alpha_within_group() -> None:
+    """Keep first; drop later α-equivalent members (never whole group)."""
+    from obligation_tree import compact_formula
+
+    alpha = (
+        "(forall ((xs Lst) (n Nat)) (= (len (append xs (cons n nil))) (succ (len xs))))"
+    )
+    # Even with LEMMA_FILTER_DROP=off, only the duplicate is dropped.
+    with patch.dict(os.environ, {
+        "LEMMA_FILTER_DROP": "off",
+        "LEMMA_DEFINED_SYMBOLS": "off",
+    }):
+        kept, dropped = apply_static_lemma_screen(
+            [SNOC_LEMMA, alpha, PLUS_LEMMA, SNOC_LEMMA],
+            original_forall="(forall ((x Lst)) (= (len (rev x)) (len x)))",
+            smt=P2_SMT,
+            invalid_records=[],
+            same_as_goal=lemma_same_as_goal,
+        )
+    assert kept == [SNOC_LEMMA, PLUS_LEMMA]
+    assert len(dropped) == 2
+    assert all(gate == "duplicate_in_group" for _l, _r, gate in dropped)
+    assert dropped[0][1].startswith("same_as_in_group:")
+    assert "len" in dropped[0][1]
+
+    kept2, dropped2 = dedupe_lemmas_in_group([SNOC_LEMMA, alpha, SNOC_LEMMA])
+    assert kept2 == [SNOC_LEMMA]
+    assert len(dropped2) == 2
+
+    retry = format_screen_retry_user(dropped)
+    assert "same as earlier lemma in this group:" in retry
+    assert compact_formula(SNOC_LEMMA) in retry or "len" in retry
+
+    line = format_dropped_line({
+        "lemma": alpha,
+        "reason": dropped[0][1],
+        "gate": "duplicate_in_group",
+    })
+    assert line is not None
+    assert "same as earlier lemma in this group:" in line
+
+    feedback = format_attempt_feedback_for_prompt(
+        {
+            "useless_lemma_groups": [{
+                "lemmas": [PLUS_LEMMA],
+                "status": "timeout",
+            }],
+            "last_screen": [{
+                "lemma": alpha,
+                "reason": dropped[0][1],
+                "gate": "duplicate_in_group",
+            }],
+        },
+        backend="cvc5",
+    )
+    assert "LAST ATTEMPT" in feedback
+    assert "dropped:" in feedback
+    assert "same as earlier lemma in this group:" in feedback
 
 
 def test_known_invalid_match_whitespace_not_substring() -> None:
@@ -818,7 +880,8 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     assert older not in txt
     assert "Combination 2" not in txt
     assert "Do not emit the exact same set" not in txt
-    assert "already in lemma library L3" in txt
+    assert "already in lemma library" in txt
+    assert "L3" not in txt.split("already in lemma library", 1)[-1].split("\n", 1)[0]
     assert "known_invalid" not in txt
     assert "(bad)" not in txt
     assert "repair hints:" in txt
@@ -976,7 +1039,8 @@ def test_llm_screen_retries_env() -> None:
     assert "strictly more local" in txt
     assert "same as the CURRENT goal" in txt
     assert "undefined_symbol:plus" in txt
-    assert "already in lemma library lib_1" in txt
+    assert "already in lemma library" in txt
+    assert "lib_1" not in txt
     assert "(assert" not in txt
 
 

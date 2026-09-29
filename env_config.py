@@ -80,6 +80,8 @@ def setup_environment():
     feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
     proof_shape_hint = os.getenv('PROOF_SHAPE_HINT', 'off')
     problem_profiler = os.getenv('PROBLEM_PROFILER', 'off')
+    problem_profiler_min_attempt = os.getenv('PROBLEM_PROFILER_MIN_ATTEMPT', '1')
+    problem_profiler_trigger = os.getenv('PROBLEM_PROFILER_TRIGGER', 'always')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
@@ -158,6 +160,8 @@ def setup_environment():
         'FEEDBACK_PROGRESS': feedback_progress,
         'PROOF_SHAPE_HINT': proof_shape_hint,
         'PROBLEM_PROFILER': problem_profiler,
+        'PROBLEM_PROFILER_MIN_ATTEMPT': problem_profiler_min_attempt,
+        'PROBLEM_PROFILER_TRIGGER': problem_profiler_trigger,
         'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,

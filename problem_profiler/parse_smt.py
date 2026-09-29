@@ -130,6 +130,7 @@ def parse_smt_profile(smt_text: str, *, problem_id: str = "") -> ProblemProfile:
     constructors: Set[str] = set()
     ctor_arities: Dict[str, List[str]] = {}
     datatype_ctors: Dict[str, List[str]] = {}
+    selector_to_ctor: Dict[str, str] = {}
     f_idx = 0
     g_idx = 0
 
@@ -157,14 +158,24 @@ def parse_smt_profile(smt_text: str, *, problem_id: str = "") -> ProblemProfile:
                     sorts.append(s)
             continue
         if head in ("declare-datatype", "declare-datatypes"):
-            # Best-effort: record datatype names and constructors.
+            # Best-effort: record datatype names, constructors, and selectors.
             _collect_datatypes(
-                expr, datatypes, constructors, sorts, ctor_arities, datatype_ctors,
+                expr,
+                datatypes,
+                constructors,
+                sorts,
+                ctor_arities,
+                datatype_ctors,
+                selector_to_ctor,
             )
             continue
         if head == "define-fun" and len(args) >= 4:
             name = args[0].strip()
             functions.append(name)
+            arg_sorts = _binder_sorts(args[1])
+            ret = args[2].strip() if len(args) >= 3 else ""
+            if name:
+                fun_sorts[name] = {"input_sorts": arg_sorts, "return_sort": ret}
             body = args[-1]
             fid = f"F{f_idx}"
             f_idx += 1
@@ -175,6 +186,54 @@ def parse_smt_profile(smt_text: str, *, problem_id: str = "") -> ProblemProfile:
                 role_source="define-fun",
                 symbols=collect_symbols(body) + [name],
             ))
+            continue
+        if head == "define-fun-rec" and len(args) >= 4:
+            name = args[0].strip()
+            functions.append(name)
+            params = _binder_names(args[1])
+            arg_sorts = _binder_sorts(args[1])
+            ret = args[2].strip() if len(args) >= 3 else ""
+            if name:
+                fun_sorts[name] = {"input_sorts": arg_sorts, "return_sort": ret}
+            body = args[-1]
+            lhs = f"({name} {' '.join(params)})" if params else name
+            eq = normalize_lemma_formula(f"(= {lhs} {body})")
+            fid = f"F{f_idx}"
+            f_idx += 1
+            profile.formulas.append(FormulaRecord(
+                formula_id=fid,
+                raw=eq,
+                role="definition",
+                role_source="define-fun-rec",
+                symbols=collect_symbols(eq),
+            ))
+            continue
+        if head == "define-funs-rec" and len(args) >= 2:
+            decls = _parse_sexpr_list(args[0])
+            bodies = _parse_sexpr_list(args[1])
+            for decl, body in zip(decls, bodies):
+                d_head, d_args = sexpr_head_args(decl) if decl.startswith("(") else (decl, [])
+                name = (d_head or "").strip()
+                if not name:
+                    continue
+                functions.append(name)
+                # (f ((x S)...) R)  or  (f (x S) R) — binders usually in d_args[0]
+                binders_blob = d_args[0] if d_args else "()"
+                params = _binder_names(binders_blob)
+                arg_sorts = _binder_sorts(binders_blob)
+                ret = d_args[1].strip() if len(d_args) >= 2 else ""
+                fun_sorts[name] = {"input_sorts": arg_sorts, "return_sort": ret}
+                lhs = f"({name} {' '.join(params)})" if params else name
+                eq = normalize_lemma_formula(f"(= {lhs} {body})")
+                fid = f"F{f_idx}"
+                f_idx += 1
+                profile.formulas.append(FormulaRecord(
+                    formula_id=fid,
+                    raw=eq,
+                    role="definition",
+                    role_source="define-funs-rec",
+                    symbols=collect_symbols(eq),
+                ))
             continue
         if head != "assert" or not args:
             continue
@@ -252,9 +311,36 @@ def parse_smt_profile(smt_text: str, *, problem_id: str = "") -> ProblemProfile:
         "datatype_constructors": {
             k: list(v) for k, v in sorted(datatype_ctors.items())
         },
+        "selectors": sorted(selector_to_ctor.keys()),
+        "selector_to_ctor": dict(selector_to_ctor),
         "fun_sorts": fun_sorts,
     }
     return profile
+
+
+def _binder_names(blob: str) -> List[str]:
+    """Names from ``((x S) (y T))`` or ``(x S)``."""
+    out: List[str] = []
+    for item in _parse_sexpr_list(blob):
+        if item.startswith("("):
+            h, _a = sexpr_head_args(item)
+            if h:
+                out.append(h.strip())
+        elif item.strip():
+            out.append(item.strip())
+    return out
+
+
+def _binder_sorts(blob: str) -> List[str]:
+    """Sorts from ``((x S) (y T))``."""
+    out: List[str] = []
+    for item in _parse_sexpr_list(blob):
+        if item.startswith("("):
+            _h, a = sexpr_head_args(item)
+            out.append(a[0].strip() if a else "")
+        else:
+            out.append("")
+    return out
 
 
 def _collect_datatypes(
@@ -264,6 +350,7 @@ def _collect_datatypes(
     sorts: List[str],
     ctor_arities: Optional[Dict[str, List[str]]] = None,
     datatype_ctors: Optional[Dict[str, List[str]]] = None,
+    selector_to_ctor: Optional[Dict[str, str]] = None,
 ) -> None:
     head, args = sexpr_head_args(expr)
     if head == "declare-datatype" and args:
@@ -272,7 +359,9 @@ def _collect_datatypes(
             datatypes.append(name)
             sorts.append(name)
         if len(args) >= 2:
-            names = _add_ctors_from_group(args[1], constructors, ctor_arities)
+            names = _add_ctors_from_group(
+                args[1], constructors, ctor_arities, selector_to_ctor,
+            )
             if datatype_ctors is not None and name:
                 datatype_ctors[name] = names
         return
@@ -293,7 +382,9 @@ def _collect_datatypes(
         # One constructor-group per datatype declaration.
         groups = _parse_sexpr_list(args[1])
         for idx, group in enumerate(groups):
-            names = _add_ctors_from_group(group, constructors, ctor_arities)
+            names = _add_ctors_from_group(
+                group, constructors, ctor_arities, selector_to_ctor,
+            )
             if datatype_ctors is not None and idx < len(dt_names):
                 datatype_ctors[dt_names[idx]] = names
 
@@ -320,8 +411,9 @@ def _add_ctors_from_group(
     group: str,
     constructors: Set[str],
     ctor_sigs: Optional[Dict[str, List[str]]] = None,
+    selector_to_ctor: Optional[Dict[str, str]] = None,
 ) -> List[str]:
-    """Extract ctor names / arg sorts from ``((nil) (cons (head Nat) (tail Lst)))``."""
+    """Extract ctor names / arg sorts / selectors from datatype ctor groups."""
     found: List[str] = []
     for ctor_decl in _parse_sexpr_list(group):
         text = (ctor_decl or "").strip()
@@ -334,11 +426,20 @@ def _add_ctors_from_group(
             for a in args:
                 a = (a or "").strip()
                 if a.startswith("("):
-                    _sel, sel_args = sexpr_head_args(a)
+                    sel, sel_args = sexpr_head_args(a)
+                    sel_name = (sel or "").strip()
                     if sel_args:
                         arg_sorts.append(sel_args[-1].strip())
-                    elif _sel:
-                        arg_sorts.append(_sel.strip())
+                    elif sel_name:
+                        arg_sorts.append(sel_name)
+                    if (
+                        sel_name
+                        and name
+                        and selector_to_ctor is not None
+                        and sel_name not in _BUILTIN
+                        and not sel_name.startswith(":")
+                    ):
+                        selector_to_ctor[sel_name] = name
                 elif a:
                     arg_sorts.append(a)
         else:

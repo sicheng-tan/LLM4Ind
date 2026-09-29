@@ -28,3 +28,6 @@ cvc/cvc5-Linux-x86_64-static/lib/
 cvc/cvc5-Linux-x86_64-static/licenses/
 cvc/cvc5-Linux-x86_64-static/AUTHORS
 cvc/cvc5-Linux-x86_64-static/COPYING
+
+# 本地论文稿件与投稿模板，不纳入版本控制
+/paper/

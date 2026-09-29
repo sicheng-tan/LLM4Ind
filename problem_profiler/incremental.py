@@ -148,9 +148,10 @@ def build_problem_profile_incremental(
     problem_id: str = "",
     current_goal: Optional[str] = None,
     library_items: Sequence[Any] = (),
+    attempt_lemmas: Sequence[Any] = (),
     cache_ns: str = "",
 ) -> ProblemProfile:
-    """Background cache ⊕ library records ⊕ current goal; refresh goal-dependent facts."""
+    """Background cache ⊕ library records ⊕ attempt lemmas ⊕ current goal."""
     profile = get_cached_background_profile(smt_text, problem_id=problem_id)
     # Drop any residual goal rows from a stale cache shape.
     profile.formulas = [f for f in profile.formulas if f.role != "goal"]
@@ -162,6 +163,20 @@ def build_problem_profile_incremental(
     for rec in lib_recs:
         if rec.raw not in bg_raw:
             profile.formulas.append(rec)
+            bg_raw.add(rec.raw)
+
+    # C: useless / unproved lemmas from the current node (not cached — per attempt).
+    for i, form in enumerate(_library_formula_strings(attempt_lemmas)):
+        if form in bg_raw:
+            continue
+        profile.formulas.append(FormulaRecord(
+            formula_id=f"A{i}",
+            raw=form,
+            role="axiom",
+            role_source="attempt_feedback",
+            symbols=collect_symbols(form),
+        ))
+        bg_raw.add(form)
 
     goal = extract_goal_formula(smt_text, current_goal)
     if goal:

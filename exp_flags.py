@@ -130,6 +130,52 @@ def problem_profiler_enabled() -> bool:
     return _flag_enabled("PROBLEM_PROFILER", default="off")
 
 
+def problem_profiler_min_attempt() -> int:
+    """Earliest 1-based attempt index that may receive the profiler block.
+
+    Default **1** (old behaviour). Set ``PROBLEM_PROFILER_MIN_ATTEMPT=2`` to
+    skip the first generation attempt.
+    """
+    raw = (os.getenv("PROBLEM_PROFILER_MIN_ATTEMPT") or "1").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def problem_profiler_trigger() -> str:
+    """When to inject relative to usefulness history.
+
+    ``always`` (default): inject whenever attempt ≥ MIN_ATTEMPT.
+    ``after_useless``: also require the last finished ``exp_attempts`` entry to
+    have ``kind == "useless"`` (strict previous attempt).
+    """
+    raw = (os.getenv("PROBLEM_PROFILER_TRIGGER") or "always").strip().lower()
+    if raw in ("after_useless", "useless", "last_useless"):
+        return "after_useless"
+    return "always"
+
+
+def should_inject_problem_profiler(failed_data: Optional[dict] = None) -> bool:
+    """Whether this lemma-generation call should append the profiler block."""
+    if not problem_profiler_enabled():
+        return False
+    data = failed_data if isinstance(failed_data, dict) else {}
+    attempts = data.get("exp_attempts") or []
+    if not isinstance(attempts, list):
+        attempts = []
+    attempts_done = len(attempts)
+    current_attempt = attempts_done + 1
+    if current_attempt < problem_profiler_min_attempt():
+        return False
+    if problem_profiler_trigger() == "always":
+        return True
+    if attempts_done == 0:
+        return False
+    last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+    return str(last.get("kind") or "") == "useless"
+
+
 def prompt_retarget_enabled() -> bool:
     """Pick / switch generation templates from hint families and consecutive no-help."""
     return _flag_enabled("PROMPT_RETARGET")
