@@ -37,6 +37,7 @@ from .dispatch import (
 from .generate import (
     generate_scheme,
     generate_scheme_candidates,
+    peek_structural_induct_sort,
     select_induct_var,
     select_induct_var_for_measure,
     select_measure_fun,
@@ -86,6 +87,7 @@ __all__ = [
     "latest_scheme_attempt",
     "load_scheme_attempts",
     "pick_or_synthesize_measure",
+    "peek_structural_induct_sort",
     "pop_scheme_dispatch",
     "prove_goal_gate",
     "prove_obligations",

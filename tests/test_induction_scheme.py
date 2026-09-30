@@ -345,7 +345,10 @@ def test_nest_dispatch_when_budget_allows() -> None:
             return MagicMock(proved=True, status="unsat", elapsed=0.05)
         return MagicMock(proved=False, status="timeout", elapsed=1.0)
 
-    with patch.dict(os.environ, {"INDUCTION_SCHEME_GOAL_GATE": "on"}):
+    with patch.dict(
+        os.environ,
+        {"INDUCTION_SCHEME_GOAL_GATE": "on", "INDUCTION_SCHEME_NEST": "on"},
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             rr = run_scheme_round(
                 smt_content=smt,
@@ -374,7 +377,10 @@ def test_mid_depth_can_still_nest_for_next_var() -> None:
             return MagicMock(proved=True, status="unsat", elapsed=0.05)
         return MagicMock(proved=False, status="timeout", elapsed=1.0)
 
-    with patch.dict(os.environ, {"INDUCTION_SCHEME_GOAL_GATE": "on"}):
+    with patch.dict(
+        os.environ,
+        {"INDUCTION_SCHEME_GOAL_GATE": "on", "INDUCTION_SCHEME_NEST": "on"},
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             rr = run_scheme_round(
                 smt_content=smt,
@@ -612,7 +618,10 @@ def test_measure_obligations_do_not_nest() -> None:
             return MagicMock(proved=True, status="unsat", elapsed=0.05)
         return MagicMock(proved=False, status="timeout", elapsed=1.0)
 
-    with patch.dict(os.environ, {"INDUCTION_SCHEME_GOAL_GATE": "on"}):
+    with patch.dict(
+        os.environ,
+        {"INDUCTION_SCHEME_GOAL_GATE": "on", "INDUCTION_SCHEME_NEST": "on"},
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             rr = run_scheme_round(
                 smt_content=smt,
@@ -634,6 +643,87 @@ def test_measure_obligations_do_not_nest() -> None:
         for o in meas
         if o.status != "proved"
     )
+
+
+def test_cross_sort_blocks_same_sort_nest() -> None:
+    """Default cross_sort: Bin→Bin (and Lst→Lst) obligations stay frontier."""
+    from exp_flags import induction_scheme_nest_policy
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("INDUCTION_SCHEME_NEST", None)
+        assert induction_scheme_nest_policy() == "cross_sort"
+
+    smt = _load("bin_plus_assoc.smt2")
+
+    def _mock_prove(path, timeout, profiles):
+        if "goal_gate" in str(path):
+            return MagicMock(proved=True, status="unsat", elapsed=0.05)
+        return MagicMock(proved=False, status="timeout", elapsed=1.0)
+
+    with patch.dict(
+        os.environ,
+        {"INDUCTION_SCHEME_GOAL_GATE": "on", "INDUCTION_SCHEME_NEST": "cross_sort"},
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            rr = run_scheme_round(
+                smt_content=smt,
+                goal_name="bin_plus",
+                work_dir=Path(tmp),
+                mode="structural",
+                depth=0,
+                nest_budget=1,
+                max_depth=3,
+                prove_fn=_mock_prove,
+                do_prove=True,
+            )
+    assert rr.attempt.induct_sort == "Bin"
+    assert not rr.nest_children, "same-sort Bin nest must be blocked"
+    failed = [
+        o for o in rr.attempt.obligations
+        if o.status not in ("proved", "invalid")
+    ]
+    assert failed
+    assert all(o.status == "frontier" or o.no_nest for o in failed)
+
+
+def test_cross_sort_allows_queue_to_lst() -> None:
+    """cross_sort keeps amortize Queue→Lst structural nest."""
+    from induction_scheme.generate import peek_structural_induct_sort
+
+    smt_path = (
+        ROOT / "benchmarks" / "preprocessed" / "dtt" / "dtt-leon"
+        / "amortize-queue-goal7" / "template.smt2"
+    )
+    smt = smt_path.read_text(encoding="utf-8")
+
+    def _mock_prove(path, timeout, profiles):
+        if "goal_gate" in str(path):
+            return MagicMock(proved=True, status="unsat", elapsed=0.05)
+        return MagicMock(proved=False, status="timeout", elapsed=1.0)
+
+    with patch.dict(
+        os.environ,
+        {"INDUCTION_SCHEME_GOAL_GATE": "on", "INDUCTION_SCHEME_NEST": "cross_sort"},
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            rr = run_scheme_round(
+                smt_content=smt,
+                goal_name="amortize-queue-goal7",
+                work_dir=Path(tmp),
+                mode="structural",
+                depth=0,
+                nest_budget=1,
+                max_depth=3,
+                prove_fn=_mock_prove,
+                do_prove=True,
+            )
+    assert rr.attempt.induct_sort == "Queue"
+    assert rr.nest_children, "Queue→Lst nest must remain"
+    for c in rr.nest_children:
+        child_sort = peek_structural_induct_sort(
+            smt, c.formula or "", goal_name=c.obl_id,
+        )
+        assert child_sort == "Lst"
 
 
 def test_library_prompt_filters_current_scheme_only() -> None:
@@ -776,6 +866,8 @@ def main() -> int:
         test_qsort_emits_descent_not_isort_templates,
         test_heap_r1_r2_bridges_goal10_12_13,
         test_measure_obligations_do_not_nest,
+        test_cross_sort_blocks_same_sort_nest,
+        test_cross_sort_allows_queue_to_lst,
         test_library_prompt_filters_current_scheme_only,
         test_scheme_sat_marks_invalid_and_harvests,
     ]

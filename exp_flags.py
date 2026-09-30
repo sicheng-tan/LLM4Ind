@@ -227,6 +227,26 @@ def induction_scheme_prompt_enabled() -> bool:
     return _flag_enabled("INDUCTION_SCHEME_PROMPT", default="on")
 
 
+def induction_scheme_nest_policy() -> str:
+    """Scheme→child nest policy: ``cross_sort`` | ``on`` | ``off``.
+
+    Default **``cross_sort``**: nest only when a peek of ``select_induct_var`` on
+    the child obligation would pick a **different** ADT/sort than the current
+    scheme round (keeps Queue→Lst amortize paths; cuts Bin/Nat same-sort fanout).
+
+    ``on``: previous behavior (any unproved structural base/step may nest).
+    ``off``: never nest (frontier only).
+    """
+    raw = (os.getenv("INDUCTION_SCHEME_NEST") or "cross_sort").strip().lower()
+    if raw in _OFF_VALUES:
+        return "off"
+    if raw in ("on", "all", "any", "same_ok", "same-ok"):
+        return "on"
+    if raw in ("cross_sort", "cross-sort", "cross"):
+        return "cross_sort"
+    return "cross_sort"
+
+
 def should_run_induction_scheme(
     failed_data: Optional[dict] = None,
     *,

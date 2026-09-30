@@ -87,6 +87,7 @@ def setup_environment():
     induction_scheme_trigger = os.getenv('INDUCTION_SCHEME_TRIGGER', 'after_useless')
     induction_scheme_goal_gate = os.getenv('INDUCTION_SCHEME_GOAL_GATE', 'on')
     induction_scheme_prompt = os.getenv('INDUCTION_SCHEME_PROMPT', 'on')
+    induction_scheme_nest = os.getenv('INDUCTION_SCHEME_NEST', 'cross_sort')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
@@ -172,6 +173,7 @@ def setup_environment():
         'INDUCTION_SCHEME_TRIGGER': induction_scheme_trigger,
         'INDUCTION_SCHEME_GOAL_GATE': induction_scheme_goal_gate,
         'INDUCTION_SCHEME_PROMPT': induction_scheme_prompt,
+        'INDUCTION_SCHEME_NEST': induction_scheme_nest,
         'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,

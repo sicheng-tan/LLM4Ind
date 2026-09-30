@@ -20,7 +20,7 @@ from .constants import (
     SCHEME_DISPATCH_KEY,
     SCHEME_PENDING_KEY,
 )
-from .generate import generate_scheme
+from .generate import generate_scheme, peek_structural_induct_sort
 from .ledger import save_scheme_attempt, scheme_formulas_for_usefulness
 from .prove import mark_frontier, prove_goal_gate, prove_obligations
 from .types import SchemeAttempt, SchemeObligation, SchemeRoundResult
@@ -256,7 +256,13 @@ def run_scheme_round(
     # (child at depth+DEPTH_COST can still induct; the leaf cannot nest again).
     nest_children: List[SchemeObligation] = []
     seen_forms: Set[str] = set()
-    can_nest = can_afford_nest(depth, max_depth, nest_budget)
+    can_nest_depth = can_afford_nest(depth, max_depth, nest_budget)
+    try:
+        from exp_flags import induction_scheme_nest_policy
+        nest_policy = induction_scheme_nest_policy()
+    except Exception:
+        nest_policy = "cross_sort"
+    n_blocked_same_sort = 0
     for att in viable:
         if att.gate_blocks_scheme():
             continue
@@ -269,20 +275,24 @@ def run_scheme_round(
             if key:
                 seen_forms.add(key)
             # Measure bridges (descent / R1 / R2) stay on this node: short-prove
-            # or frontier. Nest depth is reserved for structural base/step
-            # (xs → ys → zs).
+            # or frontier. Nest depth is reserved for structural base/step.
             if obl.kind == "measure":
                 mark_frontier(att, [obl.obl_id])
                 continue
-            if can_nest:
-                obl.skip_initial = True
-                nest_children.append(obl)
-            else:
+            if not can_nest_depth or nest_policy == "off":
                 mark_frontier(att, [obl.obl_id])
-
-    if not can_nest and not nest_children:
-        # Frontiers already marked per-axis above when !can_nest.
-        pass
+                continue
+            if nest_policy == "cross_sort":
+                parent_sort = (att.induct_sort or primary.induct_sort or "").strip()
+                child_sort = peek_structural_induct_sort(
+                    smt_content, obl.formula or "", goal_name=goal_name,
+                )
+                if not child_sort or child_sort == parent_sort:
+                    n_blocked_same_sort += 1
+                    mark_frontier(att, [obl.obl_id])
+                    continue
+            obl.skip_initial = True
+            nest_children.append(obl)
 
     log_exp(
         "scheme_prove",
@@ -298,6 +308,8 @@ def run_scheme_round(
         bridge_primary=int(bool(getattr(primary, "bridge_primary", False))),
         n_axes=len(viable),
         n_nest=len(nest_children),
+        nest_policy=nest_policy,
+        nest_blocked_same_sort=n_blocked_same_sort,
     )
 
     # Fold companion-axis obligations into the ledger attempt so harvest/prompt

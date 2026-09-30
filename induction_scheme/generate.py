@@ -674,6 +674,27 @@ def select_induct_var(
     return None
 
 
+def peek_structural_induct_sort(
+    smt_text: str,
+    goal_formula: str,
+    *,
+    goal_name: str = "",
+) -> Optional[str]:
+    """Sort ``select_induct_var`` would pick for ``goal_formula`` (no obligations)."""
+    formula = normalize_lemma_formula(goal_formula or "")
+    if not formula:
+        return None
+    profile = build_problem_profile(smt_text, problem_id=goal_name or "scheme_peek")
+    binders, matrix = _split_forall(formula)
+    if not matrix:
+        matrix = formula
+        binders = []
+    if not binders and matrix.startswith("(forall"):
+        binders, matrix = _split_forall(matrix)
+    choice = select_induct_var(profile, binders, matrix)
+    return choice[1] if choice else None
+
+
 def validate_scheme(
     obligations: Sequence[SchemeObligation],
     *,
