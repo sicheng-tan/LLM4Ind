@@ -1409,6 +1409,10 @@ def compact_repair_snapshot(hints: Sequence[dict]) -> List[dict]:
         "goal_fragments",
         "induction_focus",
         "induction_formulas",
+        "induction_schemas",
+        "induction_vars",
+        "induction_kinds",
+        "induction_obligations",
         "source_lemmas",
         "attempt_id",
         "samples",
@@ -1607,8 +1611,47 @@ def format_stuck_lines(
         focus = hint.get("induction_focus") or []
         if focus:
             lines.append(f"    induction focus: {'; '.join(str(x) for x in focus[:4])}")
-        for schema in (hint.get("induction_formulas") or [])[:2]:
-            lines.append(f"    induction schema: {schema}")
+        vars_ = [str(v) for v in (hint.get("induction_vars") or []) if v]
+        kinds = [str(k) for k in (hint.get("induction_kinds") or []) if k and k != "unknown"]
+        if vars_ or kinds:
+            bits = []
+            if vars_:
+                bits.append("vars " + ", ".join(vars_[:4]))
+            if kinds:
+                bits.append("kinds " + ", ".join(kinds[:3]))
+            lines.append(f"    induction meta: {'; '.join(bits)}")
+        schema_recs = [
+            item for item in (hint.get("induction_schemas") or [])
+            if isinstance(item, dict)
+        ]
+        if schema_recs:
+            for sch in schema_recs[:2]:
+                var = str(sch.get("induct_var") or "").strip()
+                sort = str(sch.get("induct_sort") or "").strip()
+                skind = str(sch.get("kind") or "").strip()
+                head_bits = []
+                if var and sort:
+                    head_bits.append(f"{var}:{sort}")
+                elif var:
+                    head_bits.append(var)
+                if skind and skind != "unknown":
+                    head_bits.append(skind)
+                head = f"[{', '.join(head_bits)}] " if head_bits else ""
+                if sch.get("base"):
+                    lines.append(f"    induction base: {head}{sch['base']}")
+                if sch.get("step"):
+                    lines.append(f"    induction step: {head}{sch['step']}")
+                if sch.get("conclusion"):
+                    lines.append(f"    induction concl: {head}{sch['conclusion']}")
+                if not (sch.get("base") or sch.get("step") or sch.get("conclusion")):
+                    summary = str(sch.get("raw") or "").strip()
+                    if summary:
+                        lines.append(f"    induction schema: {head}{summary}")
+        else:
+            for schema in (hint.get("induction_formulas") or [])[:2]:
+                lines.append(f"    induction schema: {schema}")
+        for obl in (hint.get("induction_obligations") or [])[:3]:
+            lines.append(f"    induction obligation: {compact_formula(str(obl))}")
     return lines
 
 

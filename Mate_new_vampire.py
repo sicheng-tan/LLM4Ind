@@ -783,6 +783,8 @@ def _compact_vampire_diag(result: VampireResult) -> dict:
         "stats": dict(result.stats or {}),
         "induction_focus": list(result.induction_focus or []),
         "induction_formulas": list(result.induction_formulas or []),
+        "induction_schemas": list(result.induction_schemas or []),
+        "induction_obligations": list(result.induction_obligations or []),
     }
 
 
@@ -797,6 +799,11 @@ def _vampire_diag_from_compact(data: Optional[dict]) -> Optional[VampireResult]:
         stats=dict(data.get("stats") or {}),
         induction_focus=list(data.get("induction_focus") or []),
         induction_formulas=list(data.get("induction_formulas") or []),
+        induction_schemas=[
+            dict(item) for item in (data.get("induction_schemas") or [])
+            if isinstance(item, dict)
+        ],
+        induction_obligations=list(data.get("induction_obligations") or []),
     )
 
 
@@ -893,7 +900,12 @@ def _usefulness_has_mix_signal(result: VampireResult) -> bool:
         return False
     if _result_has_stats(result):
         return True
-    return bool(result.induction_focus or result.induction_formulas)
+    return bool(
+        result.induction_focus
+        or result.induction_formulas
+        or result.induction_schemas
+        or result.induction_obligations
+    )
 
 
 def _record_failed_usefulness_mix(

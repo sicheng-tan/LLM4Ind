@@ -637,10 +637,15 @@ def test_vampire_prompt_includes_induction_schema() -> None:
         "unproved_lemmas": [],
         "routing": {},
     })
-    assert "induction schema:" in txt
+    assert (
+        "induction schema:" in txt
+        or "induction step:" in txt
+        or "induction concl:" in txt
+        or "induction base:" in txt
+    )
     assert "plus" in txt
     assert "INITIAL SOLVE" in txt
-    assert "[structural]" not in txt
+    assert "[structural induction" not in txt
 
 
 def test_prompt_includes_compressed_obligation_tree() -> None:

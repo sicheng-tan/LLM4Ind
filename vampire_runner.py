@@ -75,8 +75,34 @@ _VAMPIRE_SUPERPOSITION_KEYS = (
     "Forward superposition",
     "Backward superposition",
 )
+_INDUCTION_FOCUS_MAX = 8
+_INDUCTION_FORMULA_STORE_MAX = 32
 _INDUCTION_SCHEMA_MAX = 2
 _INDUCTION_SCHEMA_CHARS = 180
+_INDUCTION_OBLIGATION_MAX = 6
+_INDUCTION_KIND_TAG_RE = re.compile(
+    r"\[((?:structural|integer|generalized)[^\]]*)\]\s*$",
+    re.I,
+)
+_INDUCTION_BINDER_RE = re.compile(
+    r"!\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*'?"
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?'?\s*\]"
+)
+_INDUCTION_GENERATE_RE = re.compile(
+    r"\[Induction\] generate \d+\.\s*(.+?)\s*"
+    r"\[((?:generalized )?induction[^\]]*)\]\s*$",
+    re.I,
+)
+
+
+@dataclass
+class InductionTrace:
+    """Parsed --show_induction trace (focus + formulas + structured schemas)."""
+    focus: List[str] = field(default_factory=list)
+    formulas: List[str] = field(default_factory=list)
+    formula_tags: List[str] = field(default_factory=list)
+    schemas: List[dict] = field(default_factory=list)
+    obligations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +115,8 @@ class VampireResult:
     stats: Dict[str, int] = field(default_factory=dict)
     induction_focus: List[str] = field(default_factory=list)
     induction_formulas: List[str] = field(default_factory=list)
+    induction_schemas: List[dict] = field(default_factory=list)
+    induction_obligations: List[str] = field(default_factory=list)
     used_lemma_names: List[str] = field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
@@ -472,12 +500,19 @@ def _vampire_result_from_output(
     )
     result.proved = result.status == "unsat"
     result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
-    focus, formulas = parse_induction_trace(result.stdout + "\n" + result.stderr)
-    result.induction_focus = focus
-    result.induction_formulas = formulas
+    _apply_induction_trace(
+        result, parse_induction_trace_rich(result.stdout + "\n" + result.stderr)
+    )
     if collect_ucore and result.proved:
         result.used_lemma_names = parse_ucore_lemma_names(result.stdout)
     return result
+
+
+def _apply_induction_trace(result: VampireResult, trace: InductionTrace) -> None:
+    result.induction_focus = list(trace.focus)
+    result.induction_formulas = list(trace.formulas)
+    result.induction_schemas = list(trace.schemas)
+    result.induction_obligations = list(trace.obligations)
 
 
 def _richest_vampire(results: List[VampireResult]) -> Optional[VampireResult]:
@@ -487,6 +522,7 @@ def _richest_vampire(results: List[VampireResult]) -> Optional[VampireResult]:
         results,
         key=lambda r: (
             len(r.stats or {}),
+            len(r.induction_schemas or []),
             len(r.induction_focus or []),
             len(r.stdout or ""),
         ),
@@ -644,6 +680,10 @@ def _run_vampire_parallel(
             stats=dict(richest.stats) if richest else {},
             induction_focus=list(richest.induction_focus) if richest else [],
             induction_formulas=list(richest.induction_formulas) if richest else [],
+            induction_schemas=list(richest.induction_schemas) if richest else [],
+            induction_obligations=(
+                list(richest.induction_obligations) if richest else []
+            ),
             stdout=richest.stdout if richest else "",
             stderr=richest.stderr if richest else "",
             portfolio_results=summaries,
@@ -688,28 +728,294 @@ def parse_vampire_stats(text: str) -> Dict[str, int]:
     return stats
 
 
-def parse_induction_trace(text: str) -> Tuple[List[str], List[str]]:
-    """
-    Extract induction focus literals/terms and induction formulas from
-    --show_induction output.
-    """
-    focus: List[str] = []
-    formulas: List[str] = []
-    for line in text.splitlines():
-        line = line.strip()
+def _balanced_outer_parens(text: str) -> bool:
+    s = (text or "").strip()
+    if len(s) < 2 or s[0] != "(" or s[-1] != ")":
+        return False
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i == len(s) - 1
+            if depth < 0:
+                return False
+    return False
+
+
+def _split_top_level(expr: str, sep: str) -> Optional[Tuple[str, str]]:
+    """Split on the first top-level occurrence of ``sep`` (e.g. ``=>`` or ``&``)."""
+    depth = 0
+    i = 0
+    n = len(expr or "")
+    sep_len = len(sep)
+    while i < n:
+        ch = expr[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and expr.startswith(sep, i):
+            left = expr[:i].strip()
+            right = expr[i + sep_len :].strip()
+            if left or right:
+                return left, right
+        i += 1
+    return None
+
+
+def _normalize_induction_sort(sort: str) -> str:
+    return (sort or "").strip().strip("'").rstrip("()").strip()
+
+
+def _strip_induction_tag(text: str) -> Tuple[str, str]:
+    """Return (body, tag) for a formula that may still carry a kind tag."""
+    s = re.sub(r"\s+", " ", text or "").strip()
+    tag_m = _INDUCTION_KIND_TAG_RE.search(s)
+    if not tag_m:
+        return s, ""
+    return s[: tag_m.start()].strip(), tag_m.group(1).strip()
+
+
+def structure_induction_formula(formula: str, tag: str = "") -> dict:
+    """Parse a Vampire induction formula into var/sort/base/step/conclusion."""
+    body, found_tag = _strip_induction_tag(formula)
+    tag = (tag or found_tag or "").strip()
+    low = tag.lower()
+    kind = "unknown"
+    if "structural" in low:
+        kind = "structural"
+    elif "integer" in low:
+        kind = "integer"
+    elif "generalized" in low:
+        kind = "generalized"
+    mode = "one" if "(one)" in low else ""
+
+    binders = _INDUCTION_BINDER_RE.findall(body)
+    induct_var = binders[0][0] if binders else ""
+    induct_sort = _normalize_induction_sort(binders[0][1]) if binders else ""
+    if not induct_var:
+        m_var = re.search(r"!\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]", body)
+        if m_var:
+            induct_var = m_var.group(1)
+
+    payload = body
+    pref = re.match(r"!\s*\[[^\]]+\]\s*:\s*(.*)$", body)
+    if pref:
+        payload = pref.group(1).strip()
+
+    def _implication_parts(text: str) -> Optional[Tuple[str, str]]:
+        split = _split_top_level(text, "=>")
+        if split:
+            return split
+        if _balanced_outer_parens(text):
+            return _split_top_level(text[1:-1].strip(), "=>")
+        return None
+
+    base = ""
+    step = ""
+    conclusion = ""
+    split_concl = _implication_parts(payload)
+    if split_concl:
+        ante, conclusion = split_concl
+        if _balanced_outer_parens(ante):
+            ante = ante[1:-1].strip()
+        split_base = _split_top_level(ante, "&")
+        if split_base:
+            base, step = split_base
+            if _balanced_outer_parens(step):
+                step = step[1:-1].strip()
+        else:
+            # Compact schemas often look like (IH => step-concl) with no separate base.
+            inner = _implication_parts(ante)
+            if inner:
+                base, step_rhs = inner
+                step = f"{base} => {step_rhs}"
+            else:
+                base = ante
+    else:
+        conclusion = payload
+
+    return {
+        "kind": kind,
+        "mode": mode,
+        "induct_var": induct_var,
+        "induct_sort": induct_sort,
+        "base": compress_induction_formula(base, 120) if base else "",
+        "step": compress_induction_formula(step, 140) if step else "",
+        "conclusion": compress_induction_formula(conclusion, 120) if conclusion else "",
+        "raw": compress_induction_formula(body, _INDUCTION_SCHEMA_CHARS),
+        "tag": tag,
+    }
+
+
+def format_induction_schema_summary(schema: dict) -> str:
+    """One-line prompt summary of a structured induction schema."""
+    bits: List[str] = []
+    var = str(schema.get("induct_var") or "").strip()
+    sort = str(schema.get("induct_sort") or "").strip()
+    kind = str(schema.get("kind") or "").strip()
+    if var and sort:
+        bits.append(f"on {var}:{sort}")
+    elif var:
+        bits.append(f"on {var}")
+    if kind and kind != "unknown":
+        bits.append(kind)
+    head = f"[{', '.join(bits)}] " if bits else ""
+    step = str(schema.get("step") or "").strip()
+    if step:
+        return head + f"step {step}"
+    concl = str(schema.get("conclusion") or "").strip()
+    if concl:
+        return head + f"concl {concl}"
+    return head + str(schema.get("raw") or "").strip()
+
+
+
+def parse_induction_trace_rich(text: str) -> InductionTrace:
+    """Parse --show_induction into focus, formulas, structured schemas, obligations."""
+    focus_raw: List[str] = []
+    formula_bodies: List[str] = []
+    formula_tags: List[str] = []
+    obligations_raw: List[str] = []
+    pending: Optional[List[str]] = None
+
+    def _flush_pending(tag: str = "") -> None:
+        nonlocal pending
+        if pending is None:
+            return
+        body = " ".join(part for part in pending if part).strip()
+        pending = None
+        if body:
+            formula_bodies.append(body)
+            formula_tags.append(tag)
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if pending is not None:
+            if line.startswith("[Induction]"):
+                _flush_pending("")
+            else:
+                tag_m = _INDUCTION_KIND_TAG_RE.search(line)
+                if tag_m:
+                    pending.append(line[: tag_m.start()].strip())
+                    _flush_pending(tag_m.group(1).strip())
+                else:
+                    pending.append(line)
+                continue
+
         if not line.startswith("[Induction]"):
             continue
+
         m_proc = re.search(r"\[Induction\] process (.+?) in \d+\.", line)
         if m_proc:
-            focus.append(m_proc.group(1).strip())
+            focus_raw.append(m_proc.group(1).strip())
             continue
-        m_form = re.search(r"\[Induction\] formula \d+\.\s*(.+?)(?:\s*\[|$)", line)
+
+        m_form = re.match(r"\[Induction\] formula \d+\.\s*(.*)$", line)
         if m_form:
-            formulas.append(m_form.group(1).strip())
-    # De-duplicate while preserving order; keep short list for prompts.
-    focus = _dedup_preserve(focus)[:8]
-    formulas = _dedup_preserve(formulas)[:4]
-    return focus, formulas
+            rest = m_form.group(1).strip()
+            if not rest:
+                pending = []
+                continue
+            tag_m = _INDUCTION_KIND_TAG_RE.search(rest)
+            if tag_m:
+                formula_bodies.append(rest[: tag_m.start()].strip())
+                formula_tags.append(tag_m.group(1).strip())
+            else:
+                formula_bodies.append(rest)
+                formula_tags.append("")
+            continue
+
+        m_gen = _INDUCTION_GENERATE_RE.match(line)
+        if m_gen:
+            obligations_raw.append(m_gen.group(1).strip())
+
+    _flush_pending("")
+
+    seen_forms = set()
+    dedup_bodies: List[str] = []
+    dedup_tags: List[str] = []
+    for body, tag in zip(formula_bodies, formula_tags):
+        key = re.sub(r"\s+", " ", body).strip()
+        if not key or key in seen_forms:
+            continue
+        # Skip the old broken-parser artifact / empty bang-only bodies.
+        if key in ("!", "!!"):
+            continue
+        seen_forms.add(key)
+        dedup_bodies.append(key)
+        dedup_tags.append(tag)
+
+    focus_all = _dedup_preserve(focus_raw)
+    diseq = [lit for lit in focus_all if "!=" in lit or "≠" in lit]
+    diseq.sort(key=lambda lit: (-lit.count("("), -len(lit)))
+    rest = [lit for lit in focus_all if lit not in diseq]
+    focus = (diseq + rest)[:_INDUCTION_FOCUS_MAX]
+
+    structured = []
+    for body, tag in zip(dedup_bodies, dedup_tags):
+        rec = structure_induction_formula(body, tag)
+        rec["_body"] = body
+        structured.append(rec)
+    ranked_schemas = select_induction_schema_records(
+        structured,
+        focus,
+        limit=_INDUCTION_FORMULA_STORE_MAX,
+    )
+    formulas: List[str] = []
+    tags: List[str] = []
+    schemas: List[dict] = []
+    for schema in ranked_schemas:
+        body = str(schema.pop("_body", "") or "")
+        formulas.append(body or str(schema.get("raw") or ""))
+        tags.append(str(schema.get("tag") or ""))
+        schemas.append(schema)
+
+    return InductionTrace(
+        focus=focus,
+        formulas=formulas,
+        formula_tags=tags,
+        schemas=schemas,
+        obligations=_select_induction_obligations(obligations_raw, focus),
+    )
+
+
+def parse_induction_trace(text: str) -> Tuple[List[str], List[str]]:
+    """Backward-compatible: return (focus, formula bodies) from --show_induction."""
+    trace = parse_induction_trace_rich(text)
+    return trace.focus, trace.formulas
+
+
+def _select_induction_obligations(
+    obligations: List[str],
+    focus: Optional[List[str]] = None,
+    *,
+    limit: int = _INDUCTION_OBLIGATION_MAX,
+) -> List[str]:
+    """Keep a few generate-clause obligations; prefer focus overlap / constructors."""
+    cleaned = _dedup_preserve(
+        [re.sub(r"\s+", " ", item).strip() for item in (obligations or []) if item]
+    )
+    if not cleaned:
+        return []
+    focus_blob = " ".join(focus or []).lower()
+    tokens = {
+        tok for tok in re.findall(r"[A-Za-z][A-Za-z0-9_]*", focus_blob)
+        if len(tok) > 1
+    }
+
+    def rank(text: str) -> Tuple[int, int, int]:
+        low = text.lower()
+        overlap = sum(1 for tok in tokens if tok.lower() in low)
+        has_ctor = 1 if re.search(r"\bs\s*\(|\bcons\s*\(|\bsucc\s*\(", low) else 0
+        has_diseq = 1 if "!=" in text else 0
+        return (overlap, has_ctor + has_diseq, -len(text))
+
+    cleaned.sort(key=rank, reverse=True)
+    return cleaned[:limit]
 
 
 def parse_ucore_lemma_names(text: str) -> List[str]:
@@ -774,10 +1080,74 @@ def compress_induction_formula(formula: str, limit: int = _INDUCTION_SCHEMA_CHAR
     """Shorten Vampire TPTP-like induction formulas for LLM prompts."""
     s = re.sub(r"\s+", " ", formula or "").strip()
     s = re.sub(r"'([A-Za-z][A-Za-z0-9_]*)\(\)'", r"\1", s)
-    s = re.sub(r"\s*\[(?:structural|integer)[^\]]*\]\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*\[(?:structural|integer|generalized)[^\]]*\]\s*$", "", s, flags=re.I)
     if len(s) > limit:
         s = s[: max(0, limit - 3)].rstrip() + "..."
     return s
+
+
+def select_induction_schema_records(
+    schemas: List[dict],
+    focus: Optional[List[str]] = None,
+    *,
+    limit: int = _INDUCTION_SCHEMA_MAX,
+) -> List[dict]:
+    """Rank structured induction schemas; prefer focus overlap / step shape / kind."""
+    cleaned: List[dict] = []
+    seen = set()
+    for raw in schemas or []:
+        if not isinstance(raw, dict):
+            continue
+        rec = dict(raw)
+        key = (
+            str(rec.get("induct_var") or ""),
+            str(rec.get("induct_sort") or ""),
+            str(rec.get("step") or ""),
+            str(rec.get("conclusion") or ""),
+            str(rec.get("raw") or ""),
+        )
+        if not any(key) or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(rec)
+    if not cleaned:
+        return []
+
+    diseq_focus = [lit for lit in (focus or []) if "!=" in lit or "≠" in lit]
+    diseq_focus.sort(key=lambda lit: (-lit.count("("), -len(lit)))
+    preferred_focus = diseq_focus[:2] or list(focus or [])
+    focus_blob = " ".join(preferred_focus).lower()
+    tokens = {
+        tok for tok in re.findall(r"[A-Za-z][A-Za-z0-9_]*", focus_blob)
+        if len(tok) > 1 and tok.lower() not in {"sk", "x0", "x1", "x2"}
+    }
+
+    def rank(rec: dict) -> Tuple[int, int, int, int, int]:
+        blob = " ".join(
+            str(rec.get(k) or "")
+            for k in ("conclusion", "step", "base", "raw", "induct_sort")
+        ).lower()
+        overlap = sum(1 for tok in tokens if tok.lower() in blob)
+        concl = str(rec.get("conclusion") or "").lower()
+        concl_overlap = sum(1 for tok in tokens if tok.lower() in concl)
+        # Prefer non-trivial conclusions (binary eq / both sides non-zero constant).
+        nontrivial = 1
+        if concl.startswith("zero =") or concl.startswith("0 ="):
+            nontrivial = 0
+        has_step = 1 if str(rec.get("step") or "").strip() else 0
+        kind = str(rec.get("kind") or "")
+        kind_score = 2 if kind == "structural" else (1 if kind == "integer" else 0)
+        has_var = 1 if rec.get("induct_var") and rec.get("induct_sort") else 0
+        return (
+            nontrivial + concl_overlap,
+            overlap,
+            has_step + has_var,
+            kind_score,
+            -len(str(rec.get("raw") or "")),
+        )
+
+    cleaned.sort(key=rank, reverse=True)
+    return cleaned[:limit]
 
 
 def select_induction_schemas(
@@ -786,32 +1156,13 @@ def select_induction_schemas(
     *,
     limit: int = _INDUCTION_SCHEMA_MAX,
 ) -> List[str]:
-    """Pick a few induction formulas; prefer those overlapping focus or containing =>."""
-    cleaned = []
-    seen = set()
-    for raw in formulas or []:
-        text = compress_induction_formula(raw)
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        cleaned.append(text)
-    if not cleaned:
-        return []
-
-    focus_blob = " ".join(focus or []).lower()
-    tokens = {
-        tok for tok in re.findall(r"[A-Za-z][A-Za-z0-9_]*", focus_blob)
-        if len(tok) > 1 and tok not in {"sk", "sk0", "sk1"}
-    }
-
-    def rank(text: str) -> Tuple[int, int]:
-        low = text.lower()
-        overlap = sum(1 for tok in tokens if tok in low)
-        has_step = 1 if "=>" in text or "->" in text else 0
-        return (overlap, has_step)
-
-    cleaned.sort(key=rank, reverse=True)
-    return cleaned[:limit]
+    """Pick a few induction formula summaries for prompts (string view)."""
+    records = select_induction_schema_records(
+        [structure_induction_formula(raw) for raw in formulas or []],
+        focus,
+        limit=limit,
+    )
+    return [format_induction_schema_summary(rec) for rec in records if format_induction_schema_summary(rec)]
 
 
 def compute_progress_score(
@@ -925,12 +1276,33 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
     _struct_like, int_ind, ind = _vampire_induction_counts(stats)
     mix = ind + dem
     arithmetic_dominant = ind > 0 and int_ind / ind >= INTEGER_INDUCTION_SHARE_MIN
-    schemas = select_induction_schemas(
-        list(result.induction_formulas or []),
+    schema_records = list(result.induction_schemas or [])
+    if not schema_records and result.induction_formulas:
+        schema_records = [
+            structure_induction_formula(raw) for raw in result.induction_formulas
+        ]
+    schema_records = select_induction_schema_records(
+        schema_records,
         list(result.induction_focus or []),
+        limit=_INDUCTION_SCHEMA_MAX,
+    )
+    schemas = [format_induction_schema_summary(rec) for rec in schema_records]
+    schemas = [s for s in schemas if s]
+    obligations = list(result.induction_obligations or [])[:_INDUCTION_OBLIGATION_MAX]
+    induct_vars = _dedup_preserve(
+        [
+            f"{rec.get('induct_var')}:{rec.get('induct_sort')}"
+            if rec.get("induct_sort")
+            else str(rec.get("induct_var") or "")
+            for rec in schema_records
+            if rec.get("induct_var")
+        ]
+    )
+    induct_kinds = _dedup_preserve(
+        [str(rec.get("kind") or "") for rec in schema_records if rec.get("kind")]
     )
 
-    if result.induction_focus or schemas:
+    if result.induction_focus or schemas or obligations:
         hint = {
             "kind": "induction_stuck",
             "context": context,
@@ -941,6 +1313,10 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
             ),
             "induction_focus": result.induction_focus[:6],
             "induction_formulas": schemas,
+            "induction_schemas": schema_records,
+            "induction_vars": induct_vars,
+            "induction_kinds": induct_kinds,
+            "induction_obligations": obligations,
             # Binary signal: moderate vote so it does not drown mix overshoot.
             "strength": 0.5,
             "suggested_actions": [
@@ -954,6 +1330,10 @@ def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[di
                 "Prefer a lemma that discharges the inductive step in the schema (RHS after unfolding)",
                 "If the schema IH does not match the conclusion, generalize the inductive lemma",
             ] + hint["suggested_actions"][:1]
+        if obligations:
+            hint["suggested_actions"] = [
+                "Target open induction obligations (base/step clauses) listed below",
+            ] + hint["suggested_actions"]
         hints.append(hint)
 
     # Disabled: need_rewrite — demod/induction mix mainly asks for equational
@@ -1124,9 +1504,9 @@ def _execute_vampire(
         )
         result.proved = result.status == "unsat"
         result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
-        focus, formulas = parse_induction_trace(result.stdout + "\n" + result.stderr)
-        result.induction_focus = focus
-        result.induction_formulas = formulas
+        _apply_induction_trace(
+            result, parse_induction_trace_rich(result.stdout + "\n" + result.stderr)
+        )
         if collect_ucore and result.proved:
             result.used_lemma_names = parse_ucore_lemma_names(result.stdout)
 
