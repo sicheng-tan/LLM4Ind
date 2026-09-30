@@ -106,9 +106,20 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
     ]
     if gated.recursion:
         lines.append(
-            "  Recursion (constructor cases in definitions of goal-related functions):"
+            "  Recursion (definitions of goal-related functions; "
+            "`recursive_call` = self-call not on constructor selectors):"
         )
         for fact, case_split in _merge_recursion_facts(gated.recursion):
+            if fact.kind == "recursive_call":
+                ev = "evidence=structural"
+                note = "not on constructor selectors"
+                peers = list(fact.bridge_peers or [])
+                if peers:
+                    note += "; via " + ", ".join(_qid(p) for p in peers)
+                lines.append(
+                    f"    - {_qid_fun(fact.function)}: {fact.kind} ({ev}; {note})"
+                )
+                continue
             ev = "evidence=structural"
             if case_split:
                 ev += ", case_split"
@@ -143,9 +154,7 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
             "    Legend: base@`C` = goal with induct var := `C`; "
             "step@`C` = `P(t)` => `P(C(...t...))`; "
             "for `Int`, base@`0` / step@`(+ 1 _)` are the Peano-style cases; "
-            "attempt=none = no base/step instance of the current goal over this "
-            "variable is present in the background; "
-            "nested = inner ADT binder."
+            "nested = inner binder among known attempts."
         )
         ordered = sorted(
             enumerate(gated.induction_attempts),

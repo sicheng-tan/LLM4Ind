@@ -123,9 +123,9 @@ def test_gate_injects_when_goal_mentions_symbols() -> None:
     assert "link_with=" not in block
     assert ", case_split" in block
     assert "constructor_case_split" not in block
-    assert "Known induction attempts" in block
-    assert "attempt=none" in block
-    assert "no base/step instance of the current goal" in block
+    # Without library base/step hits, induction section stays silent.
+    assert "attempt=none" not in block
+    assert "Known induction attempts" not in block
 
 
 def test_rev_recursion_without_link_notes() -> None:
@@ -152,7 +152,7 @@ def test_rev_recursion_without_link_notes() -> None:
     assert "`rev`" in block
     assert "link_with=" not in block
     assert "Function links" not in block
-    assert "attempt=none" in block
+    assert "attempt=none" not in block
 
 
 def test_gate_empty_when_goal_unrelated() -> None:
@@ -175,9 +175,8 @@ def test_incremental_cache_and_library_induction() -> None:
     p1 = build_problem_profile_incremental(
         SAMPLE_SMT, problem_id="t", current_goal=GOAL, cache_ns="taskA",
     )
-    assert p1.induction_attempts
-    assert p1.induction_attempts[0].status == "candidate"
-    assert p1.induction_attempts[0].detail == "attempt=none"
+    # No library → no known induction rows (attempt=none suppressed).
+    assert p1.induction_attempts == []
     assert profiler_cache_stats()["bg_miss"] >= 1
 
     p2 = build_problem_profile_incremental(
@@ -206,7 +205,7 @@ def test_incremental_cache_and_library_induction() -> None:
     assert "Known induction attempts" in block
     assert "base@`nil`" in block
     assert "step@`cons`" in block
-    assert "no base/step instance of the current goal" in block
+    assert "attempt=none" not in block
 
     before_incr = profiler_cache_stats()["lib_incr"]
     lib2 = lib + [{"id": "lib_3", "formula": "(forall ((xs Lst)) (= xs xs))"}]
@@ -221,7 +220,7 @@ def test_incremental_cache_and_library_induction() -> None:
 
 
 def test_nested_induction_progressive_list() -> None:
-    """Two ADT binders: outer known + inner candidate → indented nest."""
+    """Outer known base; inner with no match → only outer is injected."""
     clear_profiler_caches()
     smt = """(set-logic ALL)
 (declare-datatypes ((Lst 0)) (((nil) (cons (head Nat) (tail Lst)))))
@@ -253,18 +252,16 @@ def test_nested_induction_progressive_list() -> None:
         library_items=[{"id": "lib_1", "formula": base_xs}],
         cache_ns="nestTask",
     )
-    assert len(p.induction_attempts) == 2
-    outer, inner = p.induction_attempts
+    assert len(p.induction_attempts) == 1
+    outer = p.induction_attempts[0]
     assert outer.status == "known" and "nil" in outer.base_ctors
-    assert inner.status == "candidate" and inner.detail == "attempt=none"
+    assert outer.induct_var == "xs"
 
     gated = gate_profile_for_prompt(p, current_goal=goal)
     block = format_profile_prompt_block(gated)
     assert "- var=`xs`:`Lst`; base@`nil`" in block
-    assert "- nested var=`ys`:`Lst`; attempt=none" in block
-    lines = [ln for ln in block.splitlines() if "var=`xs`" in ln or "var=`ys`" in ln]
-    assert len(lines) == 2
-    assert lines[1].index("- nested") > lines[0].index("- var")
+    assert "attempt=none" not in block
+    assert "var=`ys`" not in block
 
 
 def test_create_prompt_respects_after_useless_trigger() -> None:
@@ -327,7 +324,7 @@ def test_create_prompt_respects_after_useless_trigger() -> None:
                 current_formula=GOAL,
             )
         assert "PROBLEM STRUCTURE" in failed1
-        assert "attempt=none" in failed1 or "base@" in failed1
+        assert "structural_recursion" in failed1 or "recursive_call" in failed1 or "Observer" in failed1
 
 
 def test_create_prompt_injects_when_flag_on() -> None:
@@ -530,6 +527,7 @@ def test_attempt_lemmas_feed_induction_matching() -> None:
 
 
 def test_int_induction_candidate_when_goal_binds_int() -> None:
+    """Int Peano context is recognized, but attempt=none rows are not emitted."""
     smt = """(set-logic UFLIA)
 (declare-fun even (Int) Bool)
 (assert (= (even 0) true))
@@ -540,10 +538,12 @@ def test_int_induction_candidate_when_goal_binds_int() -> None:
 (check-sat)
 """
     profile = build_problem_profile(smt, problem_id="intind")
-    assert profile.induction_attempts
-    att = profile.induction_attempts[0]
-    assert att.induct_sort == "Int"
-    assert att.detail == "attempt=none"
+    assert profile.induction_attempts == []
+    gated = gate_profile_for_prompt(profile)
+    block = format_profile_prompt_block(gated)
+    assert "`even`" in block
+    assert "attempt=none" not in block
+    assert "Known induction attempts" not in block
 
 
 # ---------------------------------------------------------------------------
@@ -707,8 +707,8 @@ def test_attempt_lemmas_feed_induction_matching() -> None:
     assert "nil" in att.base_ctors
 
 
-def test_int_binder_attempt_none_when_int_recursion_in_goal() -> None:
-    """Goals quantifying over Int get attempt=none with Peano pseudo-ctors context."""
+def test_int_binder_not_emitted_without_known_match() -> None:
+    """Int recursion context alone does not inject attempt=none rows."""
     smt = """(set-logic UFLIA)
 (declare-fun even (Int) Bool)
 (assert (= (even 0) true))
@@ -719,9 +719,75 @@ def test_int_binder_attempt_none_when_int_recursion_in_goal() -> None:
 (check-sat)
 """
     profile = build_problem_profile(smt, problem_id="int_ind")
-    assert any(a.induct_sort == "Int" for a in profile.induction_attempts)
+    assert profile.induction_attempts == []
     gated = gate_profile_for_prompt(profile)
     block = format_profile_prompt_block(gated)
-    assert "var=`n`:`Int`" in block
-    assert "attempt=none" in block
-    assert "(+ 1 _)" in block  # legend
+    assert "`even`" in block
+    assert "attempt=none" not in block
+    assert "Known induction attempts" not in block
+
+
+def test_qsort_non_structural_recursive_call_with_filter_bridge() -> None:
+    smt = Path(
+        "benchmarks/preprocessed/autoproof/standard/sort_QSortCount/template.smt2"
+    ).read_text(encoding="utf-8")
+    profile = build_problem_profile(smt, problem_id="qsort")
+    qsort = [r for r in profile.recursion_structure if r.function == "qsort"]
+    assert qsort and qsort[0].kind == "recursive_call"
+    assert "filter" in (qsort[0].bridge_peers or [])
+    gated = gate_profile_for_prompt(profile)
+    block = format_profile_prompt_block(gated)
+    assert "`qsort`: recursive_call" in block
+    assert "not on constructor selectors" in block
+    assert "via `filter`" in block
+    assert "attempt=none" not in block
+
+
+def test_bubsort_let_expanded_bridge_via_bubble() -> None:
+    smt = Path(
+        "benchmarks/preprocessed/autoproof/standard/sort_BubSortCount/template.smt2"
+    ).read_text(encoding="utf-8")
+    profile = build_problem_profile(smt, problem_id="bubsort")
+    bub = [r for r in profile.recursion_structure if r.function == "bubsort"]
+    assert bub and bub[0].kind == "recursive_call"
+    assert "bubble" in (bub[0].bridge_peers or [])
+    gated = gate_profile_for_prompt(profile)
+    block = format_profile_prompt_block(gated)
+    assert "`bubsort`: recursive_call" in block
+    assert "via `bubble`" in block
+
+
+def test_count_int_list_to_int_is_observer() -> None:
+    smt = """(set-logic UFDTLIA)
+(declare-datatypes ((Lst 0)) (((nil) (cons (head Int) (tail Lst)))))
+(declare-fun count (Int Lst) Int)
+(assert (forall ((x Int)) (= (count x nil) 0)))
+(assert (forall ((x Int) (y Int) (z Lst))
+  (= (count x (cons y z)) (ite (= x y) (+ 1 (count x z)) (count x z)))))
+; proof goal
+(assert (not (forall ((x Int) (l Lst)) (= (count x l) (count x l)))))
+; proof goal end
+(check-sat)
+"""
+    profile = build_problem_profile(smt, problem_id="count")
+    obs = [o for o in profile.observer_candidates if o.function == "count"]
+    assert obs
+    assert obs[0].evidence_level == "structural"
+    gated = gate_profile_for_prompt(profile)
+    block = format_profile_prompt_block(gated)
+    assert "`count`" in block
+    assert "`Int`, `Lst` -> `Int`" in block or "`Int`, `Lst` -> `Int`" in block.replace(
+        " ", ""
+    ) or "Int" in block and "Lst" in block
+
+
+def test_list_goal_int_element_binder_not_induction_candidate() -> None:
+    """Int quantifiers that are only list elements must not become induction rows."""
+    smt = Path(
+        "benchmarks/preprocessed/autoproof/standard/sort_QSortCount/template.smt2"
+    ).read_text(encoding="utf-8")
+    profile = build_problem_profile(smt, problem_id="qsort_int")
+    assert not any(a.induct_sort == "Int" for a in profile.induction_attempts)
+    gated = gate_profile_for_prompt(profile)
+    block = format_profile_prompt_block(gated)
+    assert "var=`x`:`Int`" not in block

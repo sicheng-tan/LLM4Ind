@@ -16,14 +16,13 @@ _INT_STEP = "(+ 1 _)"
 def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt]:
     """Find strict base@ctor / step@ctor fragments for the current goal matrix.
 
-    Multiple ADT binders are returned in binder order (outer→inner) with
-    ``nest_level``. Binders without matching background fragments are kept as
-    neutral ``candidate`` rows (``attempt=none``), including when *no* known
-    fragment exists for the goal.
+    Only *known* hits are returned. Empty ``attempt=none`` placeholders are not
+    emitted: literal α-matching against the library almost never fires, so those
+    rows were constant prompt noise.
 
-    ``Int`` binders are included when the background mentions Int-style
-    successor recursion (``(+ 1 n)``) on a goal symbol, using pseudo-constructors
-    ``0`` / ``(+ 1 _)``.
+    ``Int`` binders are considered only when a goal-related Int-decreasing
+    function actually takes that binder as an argument in the goal matrix
+    (avoids treating list-element ``Int`` quantifiers as induction variables).
     """
     goal = _goal_raw(profile)
     if not goal:
@@ -47,10 +46,10 @@ def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt
         rec for rec in profile.formulas
         if rec.role != "goal" and rec.raw
     ]
-    allow_int = _goal_has_int_recursion_context(profile)
+    int_ok_vars = _int_binders_used_by_int_recursion(profile, binders, matrix)
     inductive_binders = [
         (v, s) for v, s in binders
-        if s in datatypes or (allow_int and s in _INT_SORTS)
+        if s in datatypes or (s in _INT_SORTS and v in int_ok_vars)
     ]
     if not inductive_binders:
         return []
@@ -58,9 +57,11 @@ def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt
     attempts: List[InductionAttempt] = []
     for nest_level, (var, sort) in enumerate(inductive_binders):
         if sort in _INT_SORTS:
-            attempts.append(_analyze_int_binder(
+            att = _analyze_int_binder(
                 binders, matrix, var, sort, nest_level, axioms,
-            ))
+            )
+            if att.base_ctors or att.step_ctors:
+                attempts.append(att)
             continue
 
         allowed = set(dt_ctors.get(sort) or [])
@@ -95,78 +96,97 @@ def analyze_induction_attempts(profile: ProblemProfile) -> List[InductionAttempt
                 steps.append(ctor)
                 src.append(hit.formula_id)
 
+        if not (bases or steps):
+            continue
         covered = sorted(set(bases) | set(steps))
         case_split = len(covered) >= 2
-        if bases or steps:
-            detail_parts = []
-            if bases:
-                detail_parts.append("base@" + ",".join(bases))
-            if steps:
-                detail_parts.append("step@" + ",".join(steps))
-            detail_parts.append(
-                "case_split=" + ("yes" if case_split else "no")
-                + (f" ({','.join(covered)})" if covered else "")
-            )
-            attempts.append(InductionAttempt(
-                induct_var=var,
-                induct_sort=sort,
-                base_ctors=bases,
-                step_ctors=steps,
-                case_split=case_split,
-                source_formula_ids=sorted(set(src)),
-                evidence_level="structural",
-                detail="; ".join(detail_parts),
-                nest_level=nest_level,
-                status="known",
-            ))
-        else:
-            attempts.append(InductionAttempt(
-                induct_var=var,
-                induct_sort=sort,
-                base_ctors=[],
-                step_ctors=[],
-                case_split=False,
-                source_formula_ids=[],
-                evidence_level="heuristic",
-                detail="attempt=none",
-                nest_level=nest_level,
-                status="candidate",
-            ))
+        detail_parts = []
+        if bases:
+            detail_parts.append("base@" + ",".join(bases))
+        if steps:
+            detail_parts.append("step@" + ",".join(steps))
+        detail_parts.append(
+            "case_split=" + ("yes" if case_split else "no")
+            + (f" ({','.join(covered)})" if covered else "")
+        )
+        attempts.append(InductionAttempt(
+            induct_var=var,
+            induct_sort=sort,
+            base_ctors=bases,
+            step_ctors=steps,
+            case_split=case_split,
+            source_formula_ids=sorted(set(src)),
+            evidence_level="structural",
+            detail="; ".join(detail_parts),
+            nest_level=nest_level,
+            status="known",
+        ))
 
     return attempts
 
 
-def _goal_has_int_recursion_context(profile: ProblemProfile) -> bool:
-    """True when some goal-related function uses ``(+ 1 …)`` style recursion."""
+def _int_binders_used_by_int_recursion(
+    profile: ProblemProfile,
+    binders: Sequence[Tuple[str, str]],
+    matrix: str,
+) -> Set[str]:
+    """Int vars that appear as args of a goal-related Int-style recursive function."""
+    int_vars = {v for v, s in binders if s in _INT_SORTS}
+    if not int_vars:
+        return set()
     goal_syms = set()
     for rec in profile.formulas:
         if rec.formula_id == profile.goal_formula_id or rec.role == "goal":
             goal_syms = set(rec.symbols)
             break
-    if not goal_syms:
-        return False
+    int_rec_funs: Set[str] = set()
+    fun_sorts = dict(profile.signature.get("fun_sorts") or {})
     for fact in profile.recursion_structure:
-        funs = fact.function.split("/")
+        funs = [f for f in fact.function.split("/") if f]
         if not any(f in goal_syms for f in funs):
             continue
-        if fact.kind in ("other_decreasing_recursion", "structural_recursion"):
-            return True
-        if "(+ 1" in (fact.detail or ""):
-            return True
-    # Fallback: background axioms for goal symbols contain (+ 1 …) self-calls.
+        if fact.kind not in ("other_decreasing_recursion", "recursive_call"):
+            # structural on ADT is not Int Peano context by itself
+            if "(+ 1" not in (fact.detail or "") and fact.kind != "other_decreasing_recursion":
+                continue
+        for f in funs:
+            meta = fun_sorts.get(f) or {}
+            inputs = [str(s) for s in (meta.get("input_sorts") or [])]
+            if "Int" in inputs or fact.kind == "other_decreasing_recursion":
+                int_rec_funs.add(f)
+    # Fallback: axioms with (f (+ 1 …
     for rec in profile.formulas:
         if rec.role == "goal":
             continue
         for sym in goal_syms:
             if sym in rec.symbols and f"({sym} (+ 1" in rec.raw:
-                return True
-            if sym in rec.symbols and "(+ 1" in rec.raw and _count_apps(rec.raw, sym) >= 2:
-                return True
-    return False
+                int_rec_funs.add(sym)
+    if not int_rec_funs:
+        return set()
+    used: Set[str] = set()
+    for fun in int_rec_funs:
+        used |= _vars_used_as_args(matrix, fun, int_vars)
+    return used
 
 
-def _count_apps(formula: str, head: str) -> int:
-    return formula.count(f"({head} ") + formula.count(f"({head})")
+def _vars_used_as_args(expr: str, fun: str, candidates: Set[str]) -> Set[str]:
+    hit: Set[str] = set()
+
+    def walk(text: str) -> None:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return
+        head, args = sexpr_head_args(text)
+        if head == fun:
+            for a in args:
+                a = (a or "").strip()
+                if a in candidates:
+                    hit.add(a)
+        for a in args:
+            walk(a)
+
+    walk(expr)
+    return hit
 
 
 def _analyze_int_binder(
@@ -349,10 +369,8 @@ def _make_step_formula(
         fresh_args.append(name)
         fresh_binders.append((name, asort))
         if asort == sort and tail_var is None:
-            # Prefer the last recursive position as IH source.
             tail_var = name
     if tail_var is None:
-        # pick last arg of inducted sort
         for name, asort in reversed(list(zip(fresh_args, arg_sorts))):
             if asort == sort:
                 tail_var = name
@@ -363,7 +381,6 @@ def _make_step_formula(
     ih = _subst_free(matrix, {var: tail_var})
     concl = _subst_free(matrix, {var: ctor_term})
     body = f"(=> {ih} {concl})"
-    # Outer binders: remaining goal binders (except induct var) + fresh.
     outer = [(v, s) for v, s in binders if v != var] + fresh_binders
     parts = " ".join(f"({v} {s})" if s else f"({v})" for v, s in outer)
     return normalize_lemma_formula(f"(forall ({parts}) {body})")
@@ -390,8 +407,6 @@ def _find_matching_axiom(
     for rec in axioms:
         if _formulas_match(rec.raw, target):
             return rec
-        # Also accept bare matrix without matching outer binder set when target
-        # has no remaining binders.
         th, ta = sexpr_head_args(rec.raw)
         if th == "forall" and len(ta) >= 2 and _formulas_match(ta[-1], target):
             return rec

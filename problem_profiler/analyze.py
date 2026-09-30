@@ -182,12 +182,22 @@ def _analyze_recursion(
                 detail="self-call with pred/succ/-/(+ 1 n) style argument",
             ))
         else:
+            bridges = _bridge_symbols_for_fun(
+                profile, fun, selectors, constructors,
+            )
+            detail = (
+                "self-call not on constructor selectors "
+                "(structural induction on the argument does not unfold this definition)"
+            )
+            if bridges:
+                detail += f"; recursive args mention {', '.join(bridges)}"
             facts.append(RecursionFact(
                 function=fun,
                 kind="recursive_call",
                 source_formula_ids=sorted(set(rec_ids)),
                 evidence_level="structural",
-                detail="self-call present; decrease pattern not established",
+                detail=detail,
+                bridge_peers=bridges,
             ))
 
     # Mutual recursion: two functions each call the other in defining equations.
@@ -235,6 +245,123 @@ def _arg_sorts_for_vars(
         if a in vars_ and i < len(input_sorts) and input_sorts[i]:
             out.append(input_sorts[i])
     return out
+
+
+def _expand_lets(expr: str) -> str:
+    """Substitute ``(let ((x e)…) body)`` bindings (best-effort, non-shadowing)."""
+    text = (expr or "").strip()
+    if not text.startswith("("):
+        return text
+    head, args = sexpr_head_args(text)
+    if head == "let" and len(args) >= 2:
+        bindings_blob = args[0]
+        body = args[-1]
+        mapping: Dict[str, str] = {}
+        for item in _parse_binding_list(bindings_blob):
+            if not item.startswith("("):
+                continue
+            bh, ba = sexpr_head_args(item)
+            if bh and ba:
+                mapping[bh.strip()] = _expand_lets(ba[0])
+        expanded_body = _expand_lets(body)
+        return _subst_free_vars(expanded_body, mapping)
+    new_args = [_expand_lets(a) for a in args]
+    if head is None:
+        return text
+    return "(" + " ".join([head] + new_args) + ")"
+
+
+def _parse_binding_list(blob: str) -> List[str]:
+    text = (blob or "").strip()
+    if not text:
+        return []
+    if not text.startswith("("):
+        return [text]
+    inner = text[1:-1].strip() if text.endswith(")") else text[1:].strip()
+    from smt_patterns import read_sexpr
+    out: List[str] = []
+    j = 0
+    while True:
+        tok, j = read_sexpr(inner, j)
+        if tok is None:
+            break
+        out.append(tok)
+    return out
+
+
+def _subst_free_vars(expr: str, mapping: Dict[str, str]) -> str:
+    text = (expr or "").strip()
+    if not text:
+        return text
+    if not text.startswith("("):
+        return mapping.get(text, text)
+    head, args = sexpr_head_args(text)
+    if head is None:
+        return text
+    if head in ("forall", "exists", "let") and args:
+        # Do not substitute under binders; expand lets separately.
+        return "(" + " ".join([head] + [_subst_free_vars(a, mapping) for a in args]) + ")"
+    return "(" + " ".join([head] + [_subst_free_vars(a, mapping) for a in args]) + ")"
+
+
+def _bridge_symbols_for_fun(
+    profile: ProblemProfile,
+    fun: str,
+    selectors: Set[str],
+    constructors: Set[str],
+) -> List[str]:
+    """Heads mentioned in self-call args that are not ctor selectors (e.g. filter)."""
+    bridges: Set[str] = set()
+    for rec in profile.formulas:
+        if rec.role == "goal" or rec.role_source in ("lemma_library", "attempt_feedback"):
+            continue
+        if fun not in rec.symbols:
+            continue
+        raw = _expand_lets(rec.raw)
+        bridges.update(
+            _bridge_heads_in_self_calls(raw, fun, selectors, constructors)
+        )
+    return sorted(bridges)
+
+
+def _bridge_heads_in_self_calls(
+    expr: str,
+    fun: str,
+    selectors: Set[str],
+    constructors: Set[str],
+) -> Set[str]:
+    found: Set[str] = set()
+
+    def peel(arg: str) -> None:
+        t = (arg or "").strip()
+        if not t.startswith("("):
+            return
+        h, a = sexpr_head_args(t)
+        if not h:
+            return
+        if h in selectors:
+            for sub in a:
+                peel(sub)
+            return
+        if h in constructors or h in _LOGIC or h == fun:
+            for sub in a:
+                peel(sub)
+            return
+        found.add(h)
+
+    def walk(text: str) -> None:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return
+        head, args = sexpr_head_args(text)
+        if head == fun:
+            for a in args:
+                peel(a)
+        for a in args:
+            walk(a)
+
+    walk(expr)
+    return found
 
 
 def _clause_ctor_patterns(
@@ -476,9 +603,9 @@ def _analyze_observers(
         adt_in = any(s in datatypes for s in inputs)
         if not adt_in:
             continue
-        # Observer: ADT domain to a *different* sort (Nat/Int/Bool/other ADT).
-        # Peano Nat is itself an ADT — still a valid observer return for lists.
-        if any(s == ret for s in inputs):
+        # Observer: ADT domain to a different *ADT-or-not* return. Exclude
+        # Lst→Lst (same ADT in and out), but keep Int×Lst→Int / Lst→Nat.
+        if any(s in datatypes and s == ret for s in inputs):
             continue
         fids = defining.get(name) or []
         if fids:

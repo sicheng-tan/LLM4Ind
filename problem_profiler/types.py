@@ -39,6 +39,8 @@ class RecursionFact:
     # Goal-relative association (filled in refresh_goal_dependent_facts).
     link: str = ""  # theorem-related | def-only | ""
     link_peers: List[str] = field(default_factory=list)
+    # Non-structural self-call bridges (filter/bubble); not overwritten by links.
+    bridge_peers: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

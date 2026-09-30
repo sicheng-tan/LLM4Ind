@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional, Set
 
 from .types import GatedProfileFacts, ProblemProfile
@@ -14,11 +15,12 @@ def gate_profile_for_prompt(
 ) -> GatedProfileFacts:
     """Conservative injection rules.
 
-    - Structural recursion only if the recursive function appears in the goal.
+    - Structural / other-decreasing / non-structural recursive_call if the
+      function appears in the goal.
     - Observer only if it has defining equations (structural) and appears in goal.
     - Signature-only / heuristic observers are never injected.
     - Goal relations and function links are not injected (v2; reduce noise).
-    - Induction: known base/step and neutral ``attempt=none`` candidates.
+    - Induction: only *known* base@/step@ hits (no constant attempt=none rows).
     """
     goal_syms = _symbols_from_goal(profile, current_goal)
     gated = GatedProfileFacts()
@@ -31,10 +33,11 @@ def gate_profile_for_prompt(
             "constructor_case_split",
             "other_decreasing_recursion",
             "mutual_recursion",
+            "recursive_call",
         ):
             continue
         if fact.evidence_level not in ("explicit", "structural"):
-            if fact.kind != "other_decreasing_recursion":
+            if fact.kind not in ("other_decreasing_recursion", "recursive_call"):
                 continue
         funs = fact.function.split("/")
         if not any(f in goal_syms for f in funs):
@@ -54,21 +57,19 @@ def gate_profile_for_prompt(
 
     # relations / function_links intentionally omitted from injection.
 
+    known = []
     for att in profile.induction_attempts:
-        # Drop binders that are not part of the current goal (profile may
-        # have been built from a different / outer SMT goal).
         if att.induct_var and att.induct_var not in goal_syms:
             continue
-        if att.base_ctors or att.step_ctors:
-            if att.evidence_level not in ("explicit", "structural"):
-                continue
-            gated.induction_attempts.append(att)
-            gated.related_formula_ids.extend(att.source_formula_ids)
-        elif att.status == "candidate" and att.evidence_level in (
-            "heuristic",
-            "structural",
-        ):
-            gated.induction_attempts.append(att)
+        if not (att.base_ctors or att.step_ctors):
+            continue
+        if att.evidence_level not in ("explicit", "structural"):
+            continue
+        known.append(att)
+        gated.related_formula_ids.extend(att.source_formula_ids)
+    # Re-number nest among injected rows only (skip silent attempt=none parents).
+    for i, att in enumerate(known):
+        gated.induction_attempts.append(replace(att, nest_level=i))
 
     gated.related_formula_ids = sorted({fid for fid in gated.related_formula_ids if fid})
     gated.formula_snippets = []
