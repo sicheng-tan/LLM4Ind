@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from smt_patterns import equality_lhs, forall_matrix, peel_implication, sexpr_head_args
 
@@ -679,3 +679,117 @@ def _analyze_relations(profile: ProblemProfile) -> List[GoalRelation]:
             evidence_level="structural",
         ))
     return rels
+
+
+def structural_rec_arg_positions(
+    profile: ProblemProfile,
+) -> Dict[str, Set[int]]:
+    """Map structural functions to 0-based argument indices they recurse on.
+
+    Derived from defining equations (not the goal):
+    - ctor-LHS: ``(= (f (C …) y) … (f …) …)`` → index of ctor-pattern args
+    - selector/tester: ``(= (f x y) (ite (is-C x) … (f (sel x) y) …))`` →
+      indices of LHS vars that are tester scrutinees with selector self-calls
+    """
+    constructors: Set[str] = set(profile.signature.get("constructors") or [])
+    selectors: Set[str] = set(profile.signature.get("selectors") or [])
+    selector_to_ctor = {
+        str(k): str(v)
+        for k, v in (profile.signature.get("selector_to_ctor") or {}).items()
+    }
+    if not selectors and selector_to_ctor:
+        selectors = set(selector_to_ctor.keys())
+
+    struct_funs = {
+        f
+        for fact in profile.recursion_structure
+        if fact.kind == "structural_recursion"
+        for f in fact.function.split("/")
+        if f
+    }
+    out: Dict[str, Set[int]] = {f: set() for f in struct_funs}
+    if not struct_funs:
+        return out
+
+    for rec in profile.formulas:
+        if rec.role == "goal":
+            continue
+        if rec.role_source in ("lemma_library", "attempt_feedback"):
+            continue
+        lhs = equality_lhs(rec.raw)
+        if not lhs:
+            continue
+        head, args = sexpr_head_args(lhs) if lhs.startswith("(") else (lhs, [])
+        if head not in struct_funs or not args:
+            continue
+        calls = _count_head_apps(rec.raw, head)
+        if calls < 2:
+            # Base cases (no self-call) still mark ctor positions as inductive axes.
+            pass
+
+        for i, a in enumerate(args):
+            if _is_ctor_pattern(a, constructors):
+                out[head].add(i)
+
+        lhs_vars = [
+            a.strip() for a in args
+            if a and not str(a).startswith("(") and a not in constructors
+        ]
+        if calls >= 2 and lhs_vars and selectors:
+            # Only positions whose variable is peeled by a selector in a self-call
+            # (not every is-C scrutinee — binary plus may test both args).
+            peeled = _vars_peeled_in_self_calls(rec.raw, head, selectors, lhs_vars)
+            for i, a in enumerate(args):
+                if a.strip() in peeled:
+                    out[head].add(i)
+
+    # Fallback: single ADT-typed input → that index, when still empty.
+    fun_sorts = dict(profile.signature.get("fun_sorts") or {})
+    datatypes = set(profile.signature.get("datatypes") or [])
+    for fun, positions in list(out.items()):
+        if positions:
+            continue
+        meta = fun_sorts.get(fun) or {}
+        inputs = [str(s) for s in (meta.get("input_sorts") or [])]
+        adt_idxs = [i for i, s in enumerate(inputs) if s in datatypes]
+        if len(adt_idxs) == 1:
+            out[fun].add(adt_idxs[0])
+
+    # Primary structural axis = leftmost recursive position (v1). Binary ops that
+    # case-split on several ADT args still usually induct on the first.
+    for fun, positions in list(out.items()):
+        if len(positions) > 1:
+            out[fun] = {min(positions)}
+    return out
+
+
+def _vars_peeled_in_self_calls(
+    expr: str,
+    fun: str,
+    selectors: Set[str],
+    scrutinee_vars: Sequence[str],
+) -> Set[str]:
+    """LHS vars ``v`` such that some self-call passes ``(sel v)``."""
+    vars_ = set(scrutinee_vars)
+    peeled: Set[str] = set()
+
+    def walk(text: str) -> None:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return
+        head, args = sexpr_head_args(text)
+        if head == fun:
+            for a in args:
+                t = (a or "").strip()
+                if not t.startswith("("):
+                    continue
+                h, aa = sexpr_head_args(t)
+                if h and h in selectors and aa:
+                    v = aa[0].strip()
+                    if v in vars_:
+                        peeled.add(v)
+        for a in args:
+            walk(a)
+
+    walk(expr)
+    return peeled

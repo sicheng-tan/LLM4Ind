@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from typing import Dict, List, Tuple
 
-from .types import GatedProfileFacts, InductionAttempt, RecursionFact
+from .types import GatedProfileFacts, RecursionFact
 
 
 def _qid(name: str) -> str:
@@ -23,19 +22,6 @@ def _qid_fun(name: str) -> str:
     if not parts:
         return _qid(name)
     return "/".join(_qid(p) for p in parts)
-
-
-def _qid_list(names: List[str]) -> str:
-    return ", ".join(_qid(n) for n in names if n)
-
-
-def _ctors_from_detail(detail: str) -> List[str]:
-    m = re.search(r"constructors=([^;]+)", detail or "")
-    if not m:
-        m = re.search(r"constructors\s+([^;]+)$", detail or "")
-    if not m:
-        return []
-    return [x.strip() for x in m.group(1).split(",") if x.strip()]
 
 
 def _merge_recursion_facts(facts: List[RecursionFact]) -> List[Tuple[RecursionFact, bool]]:
@@ -75,24 +61,6 @@ def _merge_recursion_facts(facts: List[RecursionFact]) -> List[Tuple[RecursionFa
         for f in others:
             out.append((replace(f, link="", link_peers=[], detail=""), False))
     return out
-
-
-def _induction_detail_line(att: InductionAttempt) -> str:
-    if att.status == "candidate" and not att.base_ctors and not att.step_ctors:
-        return "attempt=none"
-    parts: List[str] = []
-    if att.base_ctors:
-        parts.append("base@" + ",".join(_qid(c) for c in att.base_ctors))
-    if att.step_ctors:
-        parts.append("step@" + ",".join(_qid(c) for c in att.step_ctors))
-    if att.base_ctors or att.step_ctors:
-        covered = sorted(set(att.base_ctors) | set(att.step_ctors))
-        parts.append(
-            "case_split="
-            + ("yes" if att.case_split else "no")
-            + (f" ({_qid_list(covered)})" if covered else "")
-        )
-    return "; ".join(parts) if parts else "attempt=none"
 
 
 def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
@@ -144,28 +112,7 @@ def format_profile_prompt_block(gated: GatedProfileFacts) -> str:
                 f"    - {_qid(obs.function)}: {sig} "
                 f"(evidence={obs.evidence_level})"
             )
-    # Goal relations / Function links are not rendered.
-    if gated.induction_attempts:
-        lines.append(
-            "  Known induction attempts "
-            "(base/step fragments already in the background for the CURRENT goal):"
-        )
-        lines.append(
-            "    Legend: base@`C` = goal with induct var := `C`; "
-            "step@`C` = `P(t)` => `P(C(...t...))`; "
-            "for `Int`, base@`0` / step@`(+ 1 _)` are the Peano-style cases; "
-            "nested = inner binder among known attempts."
-        )
-        ordered = sorted(
-            enumerate(gated.induction_attempts),
-            key=lambda it: (it[1].nest_level, it[0]),
-        )
-        for _i, att in ordered:
-            pad = "    " + ("  " * max(0, int(att.nest_level)))
-            bullet = "- nested " if att.nest_level else "- "
-            detail = _induction_detail_line(att)
-            lines.append(
-                f"{pad}{bullet}var={_qid(att.induct_var)}:{_qid(att.induct_sort)}; "
-                f"{detail}"
-            )
+    # Goal relations / Function links / Known induction attempts are not
+    # rendered. Scheme (when on) injects its own ledger via mate_glue; Known
+    # α-match rows are omitted even when scheme is off (low hit rate / noise).
     return "\n".join(lines) + "\n"

@@ -81,6 +81,7 @@ from obligation_tree import (
 from exp_flags import (
     ancestor_prompt_enabled,
     collect_difficulty_for_feedback,
+    induction_scheme_enabled,
     normalize_strategy_mode,
     paper_schedule_prompt,
     problem_profiler_enabled,
@@ -91,6 +92,7 @@ from exp_flags import (
     resolve_cvc_patterns_enabled,
     resolve_prompt_pack,
     should_inject_problem_profiler,
+    should_run_induction_scheme,
     unproved_not_invalid_enabled,
 )
 from smt_patterns import (
@@ -1139,8 +1141,15 @@ def format_solver_feedback_for_prompt(
     if include_obligation and base_path and (
         lemma_library_enabled() or obligation_tree_enabled()
     ):
+        lib_items = load_lemma_library(base_path)
+        try:
+            from induction_scheme.mate_glue import library_for_prompt
+
+            lib_items = library_for_prompt(lib_items, failed_data)
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME library filter failed: %s", exc)
         obligation_txt = format_obligation_prompt(
-            load_lemma_library(base_path),
+            lib_items,
             failed_data.get("obligation"),
             depth=depth,
         )
@@ -1213,9 +1222,27 @@ def create_prompt(
                     )
             except Exception as exc:
                 logging.warning("PROBLEM_PROFILER inject failed: %s", exc)
+        if induction_scheme_enabled():
+            try:
+                from induction_scheme.mate_glue import scheme_prompt_suffix
+
+                scheme_block = scheme_prompt_suffix(failed_data, goal_name=goal_name)
+                if scheme_block:
+                    failed_info += scheme_block
+            except Exception as exc:
+                logging.warning("INDUCTION_SCHEME prompt inject failed: %s", exc)
         if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
+            lib_items = load_lemma_library(base_path)
+            try:
+                from induction_scheme.mate_glue import library_for_prompt
+
+                lib_items = library_for_prompt(
+                    lib_items, failed_data, goal_name=goal_name,
+                )
+            except Exception as exc:
+                logging.warning("INDUCTION_SCHEME library filter failed: %s", exc)
             obligation_txt = format_obligation_prompt(
-                load_lemma_library(base_path),
+                lib_items,
                 failed_data.get("obligation"),
                 depth=depth,
             )
@@ -2795,6 +2822,7 @@ def quick_run(
     depth: int = 0,
     ancestor_stack: AncestorStack = (),
     seed_extra_user: Optional[str] = None,
+    scheme_nest_budget: int = 1,
 ) -> Tuple[bool, List[str], List[str]]:
     """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
     smt_file_path = Path(base_path)
@@ -2840,6 +2868,52 @@ def quick_run(
         if decision_source:
             state.decision_source = decision_source
         save_routing_state(base_path, goal_smt_name, state)
+
+    # InductionScheme: overlap short prove with this attempt's LLM/usefulness.
+    scheme_session = None
+    if induction_scheme_enabled():
+        try:
+            from induction_scheme.mate_glue import maybe_start_scheme_session
+
+            scheme_session = maybe_start_scheme_session(
+                failed_data=failed_data,
+                smt_content=solver_content,
+                goal_name=goal_smt_name,
+                work_dir=smt_file_path,
+                depth=depth,
+                max_depth=int(config.get("MAX_RECURSION_DEPTH") or 3),
+                current_goal=original_forall,
+                nest_budget=scheme_nest_budget,
+                scheme_only=False,
+            )
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME start failed: %s", exc)
+            scheme_session = None
+
+    def _scheme_fin(usefulness_ok: bool):
+        if scheme_session is None:
+            return
+        try:
+            from induction_scheme.mate_glue import barrier_and_finalize
+
+            barrier_and_finalize(
+                scheme_session,
+                load_failed=lambda: load_failed_lemmas(base_path, goal_smt_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, goal_smt_name, d),
+                usefulness_succeeded=usefulness_ok,
+                base_path=base_path,
+                depth=depth,
+            )
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME finalize failed: %s", exc)
+
+    def _scheme_pending_success() -> bool:
+        try:
+            from induction_scheme.constants import SCHEME_PENDING_KEY
+            data = load_failed_lemmas(base_path, goal_smt_name)
+            return bool(data.get(SCHEME_PENDING_KEY))
+        except Exception:
+            return False
     
     # 步骤3: 使用LLM生成引理；静态筛 kept=0 时同 attempt 最多再生成 LLM_SCREEN_RETRIES 次
     library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
@@ -2862,6 +2936,9 @@ def quick_run(
         if not extracted_asserts:
             if screen_round == 1:
                 logging.info("大模型未返回引理，跳过本 attempt（不加时）")
+                _scheme_fin(False)
+                if _scheme_pending_success():
+                    return True, [], []
                 return False, [], []
             extracted_asserts = []
             break
@@ -2947,7 +3024,11 @@ def quick_run(
                 )
                 if ok:
                     logging.info("筛选后引理已在库中，用当前库证出当前目标")
+                    _scheme_fin(True)
                     return True, [], generated_asserts
+            _scheme_fin(False)
+            if _scheme_pending_success():
+                return True, [], generated_asserts
             return False, [], generated_asserts
         illformed_only = bool(dropped) and all(
             gate in ILLFORMED_SCREEN_GATES or gate in BENIGN_SCREEN_GATES
@@ -2966,6 +3047,9 @@ def quick_run(
                 strategy=solver_profile or "",
             ),
         )
+        _scheme_fin(False)
+        if _scheme_pending_success():
+            return True, [], generated_asserts
         return False, [], generated_asserts
 
     # 步骤5: 创建验证文件并并行验证引理有效性
@@ -2986,6 +3070,9 @@ def quick_run(
                 strategy=solver_profile or "",
             ),
         )
+        _scheme_fin(False)
+        if _scheme_pending_success():
+            return True, [], generated_asserts
         return False, [], generated_asserts
 
 
@@ -3021,6 +3108,7 @@ def quick_run(
         profiles=HARVEST_CVC_PROFILES,
     )
     if useful:
+        _scheme_fin(True)
         return _finish_usefulness_unsat(
             selected_lemmas=selected_lemmas or list(extracted_asserts),
             slots=slots,
@@ -3033,7 +3121,8 @@ def quick_run(
         )
     status = str(getattr(cres, "status", "") or "").lower()
     if harvest_on and status == "timeout":
-        return _finish_usefulness_timeout(
+        _scheme_fin(False)
+        result = _finish_usefulness_timeout(
             slots=slots,
             extracted_asserts=extracted_asserts,
             goal_smt_file=goal_smt_file,
@@ -3041,7 +3130,15 @@ def quick_run(
             goal_smt_name=goal_smt_name,
             depth=depth,
         )
+        if result[0]:
+            return result
+        if _scheme_pending_success():
+            return True, [], extracted_asserts
+        return result
     logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    _scheme_fin(False)
+    if _scheme_pending_success():
+        return True, [], extracted_asserts
     return False, [], extracted_asserts
 
 def prove_subgoals_parallel(
@@ -3264,6 +3361,8 @@ def prove_run(
     *,
     cvc_patterns: Optional[bool] = None,
     skip_initial_diag: Optional[dict] = None,
+    scheme_only: bool = False,
+    scheme_nest_budget: int = 1,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口
 
@@ -3285,6 +3384,8 @@ def prove_run(
             ancestor_stack=ancestor_stack or empty_ancestor_stack(),
             cvc_patterns=cvc_patterns,
             skip_initial_diag=skip_initial_diag,
+            scheme_only=scheme_only,
+            scheme_nest_budget=scheme_nest_budget,
         )
     finally:
         if depth == 0:
@@ -3314,6 +3415,8 @@ def _prove_run_body(
     ancestor_stack: AncestorStack = (),
     cvc_patterns: Optional[bool] = None,
     skip_initial_diag: Optional[dict] = None,
+    scheme_only: bool = False,
+    scheme_nest_budget: int = 1,
 ) -> bool:
     """提示策略的递归验证函数 主程序入口"""
     # 检查递归深度限制
@@ -3369,6 +3472,61 @@ def _prove_run_body(
         seed_baseline_repair_hints(
             base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
         )
+
+    # Scheme-only NEST children: no LLM.
+    if scheme_only and induction_scheme_enabled():
+        if skip_initial:
+            log_exp("skip_initial_prove", goal=base_name, because="scheme_nest")
+        elif perform_initial_verification(
+            goal_smt_file, base_path=base_path, goal_name=base_name
+        ):
+            return _done(True, "direct_prove")
+        try:
+            from induction_scheme.mate_glue import run_scheme_only_node
+
+            solver_content = solver_smt_content(
+                goal_smt_file.read_text(encoding="utf-8"),
+                base_path,
+                add_patterns=False,
+            )
+
+            def _child_prove(
+                child_name, *, depth, nest_budget, skip_initial, scheme_only, mode,
+            ):
+                return prove_run(
+                    base_path,
+                    child_name,
+                    depth=depth,
+                    strategy_mode=strategy_mode,
+                    baseline_only=False,
+                    parent_goal_name=base_name,
+                    skip_initial=skip_initial,
+                    ancestor_stack=ancestor_stack,
+                    cvc_patterns=patterns_enabled,
+                    scheme_only=scheme_only,
+                    scheme_nest_budget=nest_budget,
+                )
+
+            ok = run_scheme_only_node(
+                smt_content=solver_content,
+                goal_name=base_name,
+                work_dir=Path(base_path),
+                depth=depth,
+                max_depth=max_depth,
+                nest_budget=scheme_nest_budget,
+                skip_initial=skip_initial,
+                current_goal=current_formula,
+                load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, base_name, d),
+                set_outcome=lambda **kw: _set_node_outcome(
+                    base_path, base_name, **kw
+                ),
+                child_prove_fn=_child_prove,
+            )
+            return _done(ok, "scheme" if ok else "scheme_fail")
+        except Exception as exc:
+            logging.warning("scheme_only node failed: %s", exc)
+            return _done(False, "scheme_fail")
 
     # 执行初始验证检查
     if skip_initial:
@@ -3492,6 +3650,7 @@ def _prove_run_body(
                     depth=depth,
                     ancestor_stack=ancestor_stack,
                     seed_extra_user=seed_extra,
+                    scheme_nest_budget=scheme_nest_budget,
                 )
                 if ret or extracted_asserts:
                     break
@@ -3539,6 +3698,69 @@ def _prove_run_body(
                     ce_rounds,
                     ce_budget,
                 )
+            # After attempt: scheme may close parent (waited until attempt ended).
+            if induction_scheme_enabled():
+                try:
+                    from induction_scheme.mate_glue import (
+                        try_scheme_close_after_attempt,
+                        try_scheme_nest_after_attempt,
+                    )
+
+                    if try_scheme_close_after_attempt(
+                        load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                        save_failed=lambda d: save_failed_lemmas(
+                            base_path, base_name, d
+                        ),
+                        set_outcome=lambda **kw: _set_node_outcome(
+                            base_path, base_name, **kw
+                        ),
+                        goal_name=base_name,
+                    ):
+                        return _done(True, "scheme")
+                    if not ret:
+                        solver_content = solver_smt_content(
+                            goal_smt_file.read_text(encoding="utf-8"),
+                            base_path,
+                            add_patterns=False,
+                        )
+
+                        def _nest_child(
+                            child_name, *, depth, nest_budget, skip_initial,
+                            scheme_only, mode,
+                        ):
+                            return prove_run(
+                                base_path,
+                                child_name,
+                                depth=depth,
+                                strategy_mode=strategy_mode,
+                                parent_goal_name=base_name,
+                                skip_initial=skip_initial,
+                                ancestor_stack=ancestor_stack,
+                                cvc_patterns=patterns_enabled,
+                                scheme_only=True,
+                                scheme_nest_budget=nest_budget,
+                            )
+
+                        if try_scheme_nest_after_attempt(
+                            load_failed=lambda: load_failed_lemmas(
+                                base_path, base_name
+                            ),
+                            save_failed=lambda d: save_failed_lemmas(
+                                base_path, base_name, d
+                            ),
+                            parent_smt_content=solver_content,
+                            parent_goal=base_name,
+                            work_dir=Path(base_path),
+                            depth=depth,
+                            max_depth=max_depth,
+                            child_prove_fn=_nest_child,
+                            set_outcome=lambda **kw: _set_node_outcome(
+                                base_path, base_name, **kw
+                            ),
+                        ):
+                            return _done(True, "scheme_nest")
+                except Exception as exc:
+                    logging.warning("scheme post-attempt failed: %s", exc)
             # ret为True代表发现了可能会有用的子目标 不代表证明成功
             # lemma 被quick filtering了
             # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
@@ -3638,6 +3860,44 @@ def _prove_run_body(
 
     # 所有策略和尝试都失败了
     logging.error(f"🚫 {base_name} 所有策略均失败")
+    # InductionScheme frontier backup: only prove, no nest/LLM.
+    if induction_scheme_enabled():
+        try:
+            from induction_scheme.mate_glue import try_frontier_backup_at_node_end
+            from induction_scheme.ledger import latest_scheme_attempt
+
+            def _had_success_child() -> bool:
+                data = load_failed_lemmas(base_path, base_name)
+                att = latest_scheme_attempt(data, goal_name=base_name)
+                if att is not None and any(
+                    o.status == "proved" for o in att.obligations
+                ):
+                    return True
+                tree = data.get("obligation") or {}
+                return _obligation_tree_has_proved_child(tree)
+
+            solver_content = solver_smt_content(
+                goal_smt_file.read_text(encoding="utf-8"),
+                base_path,
+                add_patterns=False,
+            )
+            if try_frontier_backup_at_node_end(
+                load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, base_name, d),
+                smt_content=solver_content,
+                goal_name=base_name,
+                work_dir=Path(base_path),
+                had_success_child=_had_success_child(),
+                set_outcome=lambda **kw: _set_node_outcome(
+                    base_path, base_name, **kw
+                ),
+                base_path=base_path,
+                depth=depth,
+            ):
+                return _done(True, "scheme_frontier")
+            # Library may have grown from scheme harvest; try root finish next.
+        except Exception as exc:
+            logging.warning("scheme frontier backup failed: %s", exc)
     # Optional root finish: longer re-prove (library inject if on).
     if maybe_root_finish_prove(base_path, base_name, depth=depth):
         return _done(True, "root_finish_prove")
@@ -3646,6 +3906,22 @@ def _prove_run_body(
     ):
         return _done(False, "llm_invalid")
     return _done(False, "attempts_exhausted")
+
+
+def _obligation_tree_has_proved_child(node) -> bool:
+    if not isinstance(node, dict):
+        return False
+    children = node.get("children") or node.get("nodes") or []
+    if not isinstance(children, list):
+        children = []
+    for ch in children:
+        if not isinstance(ch, dict):
+            continue
+        if str(ch.get("status") or "") == "proved":
+            return True
+        if _obligation_tree_has_proved_child(ch):
+            return True
+    return False
 
 
 # def _retry_original_after_llm_exhausted(base_path: str, goal_name: str) -> bool:

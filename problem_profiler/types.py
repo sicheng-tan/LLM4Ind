@@ -148,8 +148,4 @@ class GatedProfileFacts:
     formula_snippets: List[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (
-            self.recursion
-            or self.observers
-            or self.induction_attempts
-        )
+        return not (self.recursion or self.observers)

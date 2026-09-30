@@ -1,0 +1,17 @@
+; Int even / len (Peano-style Int induction candidate)
+(set-logic UFDTLIA)
+(declare-datatypes ((Lst 0)) (((cons (head Int) (tail Lst)) (nil))))
+(declare-fun even (Int) Bool)
+(declare-fun append (Lst Lst) Lst)
+(declare-fun len (Lst) Int)
+(assert (= (even 0) true))
+(assert (forall ((n Int)) (=> (>= n 0) (= (even (+ 1 n)) (not (even n))))))
+(assert (forall ((x Lst)) (= (append nil x) x)))
+(assert (forall ((x Int) (y Lst) (z Lst))
+  (= (append (cons x y) z) (cons x (append y z)))))
+(assert (= (len nil) 0))
+(assert (forall ((x Int) (y Lst)) (= (len (cons x y)) (+ 1 (len y)))))
+; proof goal — induct on list structure (xs), not Int element
+(assert (not (forall ((xs Lst)) (= (len (append xs nil)) (len xs)))))
+; proof goal end
+(check-sat)

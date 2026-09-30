@@ -176,6 +176,83 @@ def should_inject_problem_profiler(failed_data: Optional[dict] = None) -> bool:
     return str(last.get("kind") or "") == "useless"
 
 
+def induction_scheme_enabled() -> bool:
+    """Generate / short-prove structural (later measure) induction obligations.
+
+    Default **off**. Enable with ``INDUCTION_SCHEME=on``. Does not put scheme
+    formulas into usefulness C. Child nodes never call an LLM (v1).
+    """
+    return _flag_enabled("INDUCTION_SCHEME", default="off")
+
+
+def induction_scheme_mode() -> str:
+    """``structural`` | ``measure`` | ``both``. Unknown → structural.
+
+    ``both``: short-prove all viable axes and merge nest/harvest (not
+    winner-take-all by gate).
+    """
+    raw = (os.getenv("INDUCTION_SCHEME_MODE") or "structural").strip().lower()
+    if raw in ("measure", "wellfounded", "wf"):
+        return "measure"
+    if raw in ("both", "all", "structural+measure"):
+        return "both"
+    return "structural"
+
+
+def induction_scheme_trigger() -> str:
+    """``always`` | ``after_useless`` (default)."""
+    raw = (os.getenv("INDUCTION_SCHEME_TRIGGER") or "after_useless").strip().lower()
+    if raw in ("always", "on"):
+        return "always"
+    return "after_useless"
+
+
+def induction_scheme_goal_gate_enabled() -> bool:
+    """Optional ``axioms ∧ library ∧ base/step ⊢ G`` check before structural prove.
+
+    Default **on**. Hard fail (sat) drops that axis; timeout still allows
+    obligation short-prove / NEST. Bridge-primary measure soft-skips the gate.
+    ``INDUCTION_SCHEME_GOAL_GATE=off`` disables the check.
+    """
+    return _flag_enabled("INDUCTION_SCHEME_GOAL_GATE", default="on")
+
+
+def induction_scheme_prompt_enabled() -> bool:
+    """Inject the INDUCTION SCHEME ledger block into lemma prompts.
+
+    Default **on** whenever scheme may run. Set ``INDUCTION_SCHEME_PROMPT=off``
+    to keep generate/prove/NEST/harvest but omit the ledger from the LLM prompt
+    (profiler PROBLEM STRUCTURE is unaffected).
+    """
+    return _flag_enabled("INDUCTION_SCHEME_PROMPT", default="on")
+
+
+def should_run_induction_scheme(
+    failed_data: Optional[dict] = None,
+    *,
+    scheme_only: bool = False,
+) -> bool:
+    """Whether this node/attempt should start a scheme generate+prove round.
+
+    ``scheme_only`` nodes (NEST children) always run when the flag is on.
+    Otherwise follows ``INDUCTION_SCHEME_TRIGGER`` against ``exp_attempts``.
+    """
+    if not induction_scheme_enabled():
+        return False
+    if scheme_only:
+        return True
+    data = failed_data if isinstance(failed_data, dict) else {}
+    attempts = data.get("exp_attempts") or []
+    if not isinstance(attempts, list):
+        attempts = []
+    if induction_scheme_trigger() == "always":
+        return True
+    if not attempts:
+        return False
+    last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+    return str(last.get("kind") or "") == "useless"
+
+
 def prompt_retarget_enabled() -> bool:
     """Pick / switch generation templates from hint families and consecutive no-help."""
     return _flag_enabled("PROMPT_RETARGET")

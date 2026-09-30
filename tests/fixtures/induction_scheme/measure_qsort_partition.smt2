@@ -1,0 +1,32 @@
+; Quicksort-style: qsort recurses on filter results (not tail selector).
+; No other structural fun on the goal binder → structural may skip or be weak;
+; measure via Int size is the intended axis.
+(set-logic ALL)
+(declare-datatypes ((Lst 0)) (((nil) (cons (head Int) (tail Lst)))))
+(declare-fun filterlt (Int Lst) Lst)
+(declare-fun filterge (Int Lst) Lst)
+(declare-fun append (Lst Lst) Lst)
+(declare-fun qsort (Lst) Lst)
+(declare-fun size (Lst) Int)
+(assert (forall ((ys Lst)) (= (append nil ys) ys)))
+(assert (forall ((x Int) (xs Lst) (ys Lst))
+  (= (append (cons x xs) ys) (cons x (append xs ys)))))
+(assert (forall ((p Int)) (= (filterlt p nil) nil)))
+(assert (forall ((p Int) (x Int) (xs Lst))
+  (= (filterlt p (cons x xs))
+    (ite (< x p) (cons x (filterlt p xs)) (filterlt p xs)))))
+(assert (forall ((p Int)) (= (filterge p nil) nil)))
+(assert (forall ((p Int) (x Int) (xs Lst))
+  (= (filterge p (cons x xs))
+    (ite (>= x p) (cons x (filterge p xs)) (filterge p xs)))))
+(assert (= (qsort nil) nil))
+(assert (forall ((x Int) (xs Lst))
+  (= (qsort (cons x xs))
+    (append (qsort (filterlt x xs))
+      (cons x (qsort (filterge x xs)))))))
+(assert (= (size nil) 0))
+(assert (forall ((x Int) (xs Lst)) (= (size (cons x xs)) (+ 1 (size xs)))))
+; proof goal — sortedness proxy: size preserved
+(assert (not (forall ((xs Lst)) (= (size (qsort xs)) (size xs)))))
+; proof goal end
+(check-sat)

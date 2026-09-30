@@ -189,6 +189,26 @@ def _vars_used_as_args(expr: str, fun: str, candidates: Set[str]) -> Set[str]:
     return hit
 
 
+def _arg_positions_of_var(expr: str, fun: str, var: str) -> Set[int]:
+    """0-based argument indices where ``fun`` is applied directly to ``var``."""
+    hit: Set[int] = set()
+
+    def walk(text: str) -> None:
+        text = (text or "").strip()
+        if not text.startswith("("):
+            return
+        head, args = sexpr_head_args(text)
+        if head == fun:
+            for i, a in enumerate(args):
+                if (a or "").strip() == var:
+                    hit.add(i)
+        for a in args:
+            walk(a)
+
+    walk(expr)
+    return hit
+
+
 def _analyze_int_binder(
     binders: Sequence[Tuple[str, str]],
     matrix: str,

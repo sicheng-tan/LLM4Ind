@@ -1,0 +1,22 @@
+; Tree flatten2 without accumulator generalization
+(set-logic UFDT)
+(declare-datatypes ((Nat 0) (list 0) (Tree 0))
+  (((Z) (S (proj1-S Nat)))
+   ((nil) (cons (head Nat) (tail list)))
+   ((Leaf) (Node (proj1-Node Tree) (proj2-Node Nat) (proj3-Node Tree)))))
+(declare-fun flatten0 (Tree) list)
+(declare-fun flatten2 (Tree list) list)
+(declare-fun ++ (list list) list)
+(assert (forall ((y list)) (= (++ nil y) y)))
+(assert (forall ((z Nat) (xs list) (y list))
+  (= (++ (cons z xs) y) (cons z (++ xs y)))))
+(assert (= (flatten0 Leaf) nil))
+(assert (forall ((p Tree) (y Nat) (q Tree))
+  (= (flatten0 (Node p y q)) (++ (flatten0 p) (cons y (flatten0 q))))))
+(assert (forall ((y list)) (= (flatten2 Leaf y) y)))
+(assert (forall ((z Tree) (x2 Nat) (x3 Tree) (y list))
+  (= (flatten2 (Node z x2 x3) y) (flatten2 z (cons x2 (flatten2 x3 y))))))
+; proof goal
+(assert (not (forall ((p Tree)) (= (flatten2 p nil) (flatten0 p)))))
+; proof goal end
+(check-sat)

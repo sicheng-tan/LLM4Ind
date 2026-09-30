@@ -202,10 +202,11 @@ def test_incremental_cache_and_library_induction() -> None:
 
     gated = gate_profile_for_prompt(p3, current_goal=GOAL)
     block = format_profile_prompt_block(gated)
-    assert "Known induction attempts" in block
-    assert "base@`nil`" in block
-    assert "step@`cons`" in block
+    assert "Known induction attempts" not in block
+    assert "base@`nil`" not in block
     assert "attempt=none" not in block
+    # Recursion / observers may still appear; analysis keeps known hits on profile.
+    assert p3.induction_attempts and "nil" in p3.induction_attempts[0].base_ctors
 
     before_incr = profiler_cache_stats()["lib_incr"]
     lib2 = lib + [{"id": "lib_3", "formula": "(forall ((xs Lst)) (= xs xs))"}]
@@ -220,7 +221,7 @@ def test_incremental_cache_and_library_induction() -> None:
 
 
 def test_nested_induction_progressive_list() -> None:
-    """Outer known base; inner with no match → only outer is injected."""
+    """Outer known base is detected on profile; not injected into the prompt."""
     clear_profiler_caches()
     smt = """(set-logic ALL)
 (declare-datatypes ((Lst 0)) (((nil) (cons (head Nat) (tail Lst)))))
@@ -258,10 +259,11 @@ def test_nested_induction_progressive_list() -> None:
     assert outer.induct_var == "xs"
 
     gated = gate_profile_for_prompt(p, current_goal=goal)
+    assert gated.induction_attempts == []
     block = format_profile_prompt_block(gated)
-    assert "- var=`xs`:`Lst`; base@`nil`" in block
+    assert "Known induction attempts" not in block
+    assert "base@`nil`" not in block
     assert "attempt=none" not in block
-    assert "var=`ys`" not in block
 
 
 def test_create_prompt_respects_after_useless_trigger() -> None:
@@ -359,8 +361,8 @@ def test_create_prompt_injects_when_flag_on() -> None:
                 current_formula=GOAL,
             )
         assert "PROBLEM STRUCTURE" in failed
-        assert "Known induction attempts" in failed
-        assert "base@`nil`" in failed
+        assert "Known induction attempts" not in failed
+        assert "base@`nil`" not in failed
         assert "PROBLEM STRUCTURE" in messages[1]["content"]
     with patch.dict(os.environ, {"PROBLEM_PROFILER": "off", "ANCESTOR_PROMPT": "off"}):
         with tempfile.TemporaryDirectory() as tmp:

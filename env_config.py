@@ -82,6 +82,11 @@ def setup_environment():
     problem_profiler = os.getenv('PROBLEM_PROFILER', 'off')
     problem_profiler_min_attempt = os.getenv('PROBLEM_PROFILER_MIN_ATTEMPT', '1')
     problem_profiler_trigger = os.getenv('PROBLEM_PROFILER_TRIGGER', 'always')
+    induction_scheme = os.getenv('INDUCTION_SCHEME', 'off')
+    induction_scheme_mode = os.getenv('INDUCTION_SCHEME_MODE', 'structural')
+    induction_scheme_trigger = os.getenv('INDUCTION_SCHEME_TRIGGER', 'after_useless')
+    induction_scheme_goal_gate = os.getenv('INDUCTION_SCHEME_GOAL_GATE', 'on')
+    induction_scheme_prompt = os.getenv('INDUCTION_SCHEME_PROMPT', 'on')
     prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
@@ -162,6 +167,11 @@ def setup_environment():
         'PROBLEM_PROFILER': problem_profiler,
         'PROBLEM_PROFILER_MIN_ATTEMPT': problem_profiler_min_attempt,
         'PROBLEM_PROFILER_TRIGGER': problem_profiler_trigger,
+        'INDUCTION_SCHEME': induction_scheme,
+        'INDUCTION_SCHEME_MODE': induction_scheme_mode,
+        'INDUCTION_SCHEME_TRIGGER': induction_scheme_trigger,
+        'INDUCTION_SCHEME_GOAL_GATE': induction_scheme_goal_gate,
+        'INDUCTION_SCHEME_PROMPT': induction_scheme_prompt,
         'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,

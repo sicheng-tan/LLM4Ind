@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Optional, Set
 
 from .types import GatedProfileFacts, ProblemProfile
@@ -19,8 +18,8 @@ def gate_profile_for_prompt(
       function appears in the goal.
     - Observer only if it has defining equations (structural) and appears in goal.
     - Signature-only / heuristic observers are never injected.
-    - Goal relations and function links are not injected (v2; reduce noise).
-    - Induction: only *known* base@/step@ hits (no constant attempt=none rows).
+    - Goal relations, function links, and Known induction α-matches are not
+      injected (v2; reduce noise). Scheme ledger is separate when enabled.
     """
     goal_syms = _symbols_from_goal(profile, current_goal)
     gated = GatedProfileFacts()
@@ -55,21 +54,7 @@ def gate_profile_for_prompt(
         gated.observers.append(obs)
         gated.related_formula_ids.extend(obs.source_formula_ids)
 
-    # relations / function_links intentionally omitted from injection.
-
-    known = []
-    for att in profile.induction_attempts:
-        if att.induct_var and att.induct_var not in goal_syms:
-            continue
-        if not (att.base_ctors or att.step_ctors):
-            continue
-        if att.evidence_level not in ("explicit", "structural"):
-            continue
-        known.append(att)
-        gated.related_formula_ids.extend(att.source_formula_ids)
-    # Re-number nest among injected rows only (skip silent attempt=none parents).
-    for i, att in enumerate(known):
-        gated.induction_attempts.append(replace(att, nest_level=i))
+    # relations / function_links / known induction intentionally omitted.
 
     gated.related_formula_ids = sorted({fid for fid in gated.related_formula_ids if fid})
     gated.formula_snippets = []
