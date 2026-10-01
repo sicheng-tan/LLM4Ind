@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-# Same 4 schedules as usefulness / node-goal prove (single source of truth).
+# Same Vampire schedule as usefulness / node-goal prove (paper default).
 from solver_routing import VAMPIRE_RACE_PROFILES as VAMPIRE_PROVE_PROFILES
 
 # Short prove budget per obligation (seconds).
@@ -11,9 +11,7 @@ PROVE_TIMEOUT_S = 10
 # Same budget for optional axioms∧base∧step ⊢ G gate.
 GOAL_GATE_TIMEOUT_S = 10
 
-# Scheme short-prove / frontier / goal-gate profile races (~4-way).
-# cross_sort nest already cuts same-sort children, freeing CPU for this race.
-#
+# Scheme short-prove / frontier / goal-gate profiles.
 # CVC: classic usefulness 4-arm portfolio.
 PROVE_PROFILES = (
     "cvc5_inductive",
@@ -22,7 +20,7 @@ PROVE_PROFILES = (
     "cvc4_default",
 )
 
-# Vampire: ``VAMPIRE_PROVE_PROFILES`` == ``vampire_runner.VAMPIRE_RACE_PROFILES``.
+# Vampire: ``VAMPIRE_PROVE_PROFILES`` == single ``induction_portfolio``.
 
 # At most one induct variable per node (sequential nesting picks another
 # binder on the child goal — not simultaneous multi-var induction).

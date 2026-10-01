@@ -64,7 +64,7 @@ def test_cvc5_routed_fallback() -> None:
     assert set(result.portfolio_results) == {"adt_structural", "cvc5_simple"}
 
 
-def test_vampire_routed_fixed_race() -> None:
+def test_vampire_routed_paper_schedule_only() -> None:
     calls = []
 
     def fake_parallel(path, timeout, names, *, collect_stats, collect_ucore, show_induction=False):
@@ -72,9 +72,9 @@ def test_vampire_routed_fixed_race() -> None:
         return VampireResult(
             proved=True,
             status="unsat",
-            strategy="struct_induction",
+            strategy="induction_portfolio",
             elapsed=0.01,
-            portfolio_results={n: {"status": "timeout"} for n in names},
+            portfolio_results={n: {"status": "unsat"} for n in names},
         )
 
     state = GoalSearchState(
@@ -91,10 +91,11 @@ def test_vampire_routed_fixed_race() -> None:
         result = run_vampire_routed("unused.smt2", timeout=10, state=state)
 
     assert result.proved
-    assert result.strategy == "struct_induction"
+    assert result.strategy == "induction_portfolio"
     assert len(calls) == 1
-    assert calls[0][1] == list(VAMPIRE_RACE_PROFILES)
-    assert set(result.portfolio_results) == set(VAMPIRE_RACE_PROFILES)
+    assert calls[0][1] == ["induction_portfolio"]
+    assert list(VAMPIRE_RACE_PROFILES) == ["induction_portfolio"]
+    assert set(result.portfolio_results) == {"induction_portfolio"}
 
 
 def test_cvc_portfolio_jobs_four_vs_six() -> None:
@@ -218,7 +219,7 @@ def test_routing_off_uses_paper_runner() -> None:
 
 def main() -> int:
     test_cvc5_routed_fallback()
-    test_vampire_routed_fixed_race()
+    test_vampire_routed_paper_schedule_only()
     test_cvc_portfolio_jobs_four_vs_six()
     test_pattern_smt2_forwarded()
     test_routing_off_forwards_pattern_smt2()

@@ -121,7 +121,7 @@ class VampireResult:
 # Named theory profiles. The paper default is induction_portfolio.
 # alasca_arith approximates ALASCA-style arithmetic superposition on this
 # Vampire binary (UWA + theory instantiation + arithmetic generalization).
-# Prove race arms: ``VAMPIRE_RACE_PROFILES`` (imported from solver_routing).
+# Prove arms: ``VAMPIRE_RACE_PROFILES`` (paper ``induction_portfolio`` only).
 VAMPIRE_PROFILES: Dict[str, dict] = {
     "induction_portfolio": {
         "kind": "portfolio",
@@ -391,11 +391,11 @@ def run_vampire_routed(
     collect_ucore: bool = False,
     show_induction: bool = False,
 ) -> VampireResult:
-    """Prove with the fixed 4-schedule race (same arms as scheme short-prove).
+    """Prove with the paper Vampire schedule (``induction_portfolio`` only).
 
-    ``state`` is kept for API compatibility / Mate telemetry, but candidate
-    top-k and paper-fallback waves are not used: usefulness, node-goal prove,
-    and scheme short-prove all race ``VAMPIRE_RACE_PROFILES``.
+    ``state`` is kept for API compatibility / Mate telemetry. Usefulness,
+    node-goal prove, and scheme short-prove all use ``VAMPIRE_RACE_PROFILES``
+    (a single mixed induction portfolio — original LLM4Ind).
     """
     del state  # routing picks prompts/diagnostics; prove arms are fixed
     return run_vampire_race(

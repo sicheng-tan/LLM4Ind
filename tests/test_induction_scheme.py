@@ -232,6 +232,45 @@ def test_profiler_replaces_known_induction() -> None:
         assert att.induct_var in diag
 
 
+def test_scheme_prompt_includes_measure_prelude_smt() -> None:
+    """When μ uses __scheme_*, the prompt shows the solver-side prelude SMT."""
+    from induction_scheme.types import SchemeAttempt, SchemeObligation
+
+    prelude = (
+        "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
+        "(assert (= (__scheme_nat_to_int Z) 0))\n"
+    )
+    formula = (
+        "(forall ((x Lst)) (= (__scheme_nat_to_int (len (append x nil))) "
+        "(__scheme_nat_to_int (len x))))"
+    )
+    att = SchemeAttempt(
+        goal_name="nat_len",
+        induct_var="xs",
+        induct_sort="Lst",
+        measure_fun="len",
+        measure_prelude=prelude,
+        bridge_primary=True,
+        validated=True,
+        obligations=[
+            SchemeObligation(
+                obl_id="mu_hom",
+                kind="measure",
+                ctor="mu_hom_base",
+                formula=formula,
+                induct_var="xs",
+                induct_sort="Lst",
+                status="proved",
+            ),
+        ],
+    )
+    data = save_scheme_attempt({}, att)
+    block = format_scheme_prompt_block(data, goal_name="nat_len")
+    assert "Scheme measure prelude (definition in SMT axioms):" in block
+    assert "(declare-fun __scheme_nat_to_int (Nat) Int)" in block
+    assert formula in block
+
+
 def test_scheme_prompt_flag_off_suppresses_block() -> None:
     from induction_scheme.mate_glue import scheme_prompt_suffix
 
@@ -572,6 +611,59 @@ def test_synthesize_list_len_on_real_qsort() -> None:
     assert any("filter" in o.ctor for o in att.obligations)
 
 
+def test_synthesize_adt_size_binary_tree_not_list_len() -> None:
+    """Trees must not be misread as lists; size sums both recursive children."""
+    from induction_scheme.bridges import _list_nil_cons, pick_or_synthesize_measure
+    from problem_profiler import build_problem_profile
+
+    smt = """
+(set-logic UFDT)
+(declare-datatypes ((T 0)) (((leaf) (node (l T) (r T)))))
+(declare-fun mirror (T) T)
+(assert (forall ((x T)) (= (mirror (mirror x)) x)))
+(assert (not (forall ((x T)) (= (mirror (mirror x)) x))))
+(check-sat)
+"""
+    prof = build_problem_profile(smt, problem_id="tree")
+    assert _list_nil_cons(prof, "T") is None
+    mu, ret, prelude = pick_or_synthesize_measure(prof, "T")
+    assert mu == "__scheme_adt_size"
+    assert ret == "Int"
+    assert "(__scheme_adt_size __a0)" in prelude and "(__scheme_adt_size __a1)" in prelude
+    assert "(+ 1 (__scheme_adt_size __a0)" in prelude
+
+
+def test_synthesize_list_len_snoc_recursive_first() -> None:
+    """Snoc with recursive first arg is still a single-spine list."""
+    from induction_scheme.bridges import _list_nil_cons, pick_or_synthesize_measure
+    from problem_profiler import build_problem_profile
+
+    smt = """
+(set-logic UFDT)
+(declare-datatypes ((MySeq 0)) (((empty) (snoc (front MySeq) (x Int)))))
+(assert (not (forall ((s MySeq)) (= s s))))
+(check-sat)
+"""
+    prof = build_problem_profile(smt, problem_id="snoc")
+    pair = _list_nil_cons(prof, "MySeq")
+    assert pair is not None
+    assert pair[0] == "empty" and pair[1] == "snoc"
+    mu, _, prelude = pick_or_synthesize_measure(prof, "MySeq")
+    assert mu == "__scheme_list_len"
+    assert "(+ 1 (__scheme_list_len __a0))" in prelude
+
+
+def test_descent_name_covers_remove_prefix() -> None:
+    from induction_scheme.bridges import _is_descent_name
+
+    assert _is_descent_name("filter")
+    assert _is_descent_name("filter_gt")
+    assert _is_descent_name("remove1")
+    assert _is_descent_name("butlast")
+    assert not _is_descent_name("append")
+    assert not _is_descent_name("qsort")
+
+
 def test_qsort_emits_descent_not_isort_templates() -> None:
     path = Path("benchmarks/preprocessed/autoproof/standard/sort_QSortIsSort/template.smt2")
     if not path.exists():
@@ -769,6 +861,76 @@ def test_library_prompt_filters_current_scheme_only() -> None:
     # filtering is by scheme prompt formulas only.
 
 
+def test_harvest_scheme_proved_stores_measure_prelude() -> None:
+    """Scheme pins that use __scheme_* must carry measure_prelude into the library."""
+    from induction_scheme.ledger import harvest_scheme_proved_to_library
+    from obligation_tree import inject_library_axioms, load_lemma_library
+
+    prelude = (
+        "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
+        "(assert (= (__scheme_nat_to_int zero) 0))\n"
+    )
+    formula = "(forall ((x Lst)) (>= (__scheme_nat_to_int (len x)) 0))"
+    plain = "(forall ((n Nat)) (= n n))"
+    att = SchemeAttempt(
+        goal_name="template",
+        induct_var="xs",
+        induct_sort="Lst",
+        validated=True,
+        measure_prelude=prelude,
+        obligations=[
+            SchemeObligation(
+                obl_id="measure_nonneg",
+                kind="measure",
+                ctor="nonneg",
+                formula=formula,
+                induct_var="xs",
+                induct_sort="Lst",
+                status="proved",
+            ),
+            SchemeObligation(
+                obl_id="base_nil",
+                kind="base",
+                ctor="nil",
+                formula=plain,
+                induct_var="xs",
+                induct_sort="Lst",
+                status="proved",
+            ),
+            SchemeObligation(
+                obl_id="wf",
+                kind="measure",
+                ctor="wf",
+                formula="(=> true true)",
+                induct_var="xs",
+                induct_sort="Lst",
+                status="proved",
+            ),
+        ],
+    )
+    smt = """(set-logic ALL)
+(declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
+; proof goal
+(assert (not true))
+; proof goal end
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"LEMMA_LIBRARY": "on"}):
+            n = harvest_scheme_proved_to_library(att, tmp, depth=1)
+            assert n == 2  # nonneg + base; wf skipped
+            items = load_lemma_library(tmp)
+            by_f = {i["formula"]: i for i in items}
+            assert formula in by_f
+            assert by_f[formula].get("prelude", "").strip().startswith(
+                "(declare-fun __scheme_nat_to_int"
+            )
+            assert plain in by_f
+            assert not str(by_f[plain].get("prelude") or "").strip()
+            out = inject_library_axioms(smt, items)
+            assert "(declare-fun __scheme_nat_to_int (Nat) Int)" in out
+            assert formula in out or "(__scheme_nat_to_int (len x))" in out
+
+
 def test_scheme_sat_marks_invalid_and_harvests() -> None:
     """Short-prove sat ⇒ obligation invalid ⇒ written to invalid_lemmas."""
     from induction_scheme.ledger import harvest_scheme_refuted_to_invalid
@@ -849,6 +1011,7 @@ def main() -> int:
         test_scheme_not_in_usefulness_c,
         test_profiler_replaces_known_induction,
         test_scheme_prompt_flag_off_suppresses_block,
+        test_scheme_prompt_includes_measure_prelude_smt,
         test_dispatch_close_after_attempt_not_midway,
         test_nest_vs_frontier_and_backup,
         test_nest_dispatch_when_budget_allows,
@@ -863,12 +1026,16 @@ def main() -> int:
         test_both_rc_orders_measure_first,
         test_measure_rejects_ssort_minimum_name,
         test_synthesize_list_len_on_real_qsort,
+        test_synthesize_adt_size_binary_tree_not_list_len,
+        test_synthesize_list_len_snoc_recursive_first,
+        test_descent_name_covers_remove_prefix,
         test_qsort_emits_descent_not_isort_templates,
         test_heap_r1_r2_bridges_goal10_12_13,
         test_measure_obligations_do_not_nest,
         test_cross_sort_blocks_same_sort_nest,
         test_cross_sort_allows_queue_to_lst,
         test_library_prompt_filters_current_scheme_only,
+        test_harvest_scheme_proved_stores_measure_prelude,
         test_scheme_sat_marks_invalid_and_harvests,
     ]
     failed = 0

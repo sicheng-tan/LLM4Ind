@@ -36,12 +36,8 @@ GUIDANCE_HINT_KINDS = (
 )
 
 HARVEST_CVC_PROFILES = ("cvc5_inductive", "cvc4_default")
-# Vampire schedules specialize by theory; race the same arms as usefulness /
-# node prove / scheme short-prove (see solver_routing.VAMPIRE_RACE_PROFILES).
+# Same single schedule as usefulness / node prove / scheme short-prove.
 HARVEST_VAMPIRE_PROFILES = (
-    "struct_induction",
-    "struct_induction_tip",
-    "integer_induction",
     "induction_portfolio",
 )
 HARVEST_DISPATCH_KEY = "harvest_dispatch"
@@ -216,8 +212,13 @@ def add_proved_lemma(
     attempt: int = 0,
     depth: int = 0,
     role: str = "pin",
+    prelude: str = "",
 ) -> Optional[str]:
     """Record a discharged lemma. ``role`` is pin (useful split) or local (timeout harvest).
+
+    ``prelude`` is optional SMT (declare-fun / defining asserts) required by
+    the formula — e.g. InductionScheme ``measure_prelude`` for
+    ``__scheme_nat_to_int``. Injected before library asserts.
 
     Returns its library id, or None if empty / local harvest is off. Duplicate
     formulas (whitespace or α-equivalent) keep the existing id; a later pin
@@ -231,6 +232,7 @@ def add_proved_lemma(
     formula = normalize_lemma_formula(formula)
     if not formula:
         return None
+    prelude = str(prelude or "").strip()
     from exp_stats import log_exp
     from lemma_gates import purge_unproved_equivalent
 
@@ -249,21 +251,28 @@ def add_proved_lemma(
                 continue
             lib_id = str(item.get("id") or "")
             existing_role = lemma_library_role(item)
+            changed = False
             if existing_role == "local" and want == "pin":
                 item["role"] = "pin"
                 item["origin"] = origin or item.get("origin") or ""
                 item["attempt"] = attempt
                 item["depth"] = depth
-                save_lemma_library(base_path, lemmas)
+                changed = True
                 log_exp("library_promote", id=lib_id, role="pin")
                 logging.info("lemma library promote %s local→pin", lib_id)
+            if prelude and not str(item.get("prelude") or "").strip():
+                item["prelude"] = prelude
+                changed = True
+                log_exp("library_prelude_attach", id=lib_id)
+            if changed:
+                save_lemma_library(base_path, lemmas)
             elif normalize_lemma_formula(stored) != formula:
                 log_exp("library_alpha_dup", id=lib_id, role=existing_role)
                 logging.info("lemma library skip α-dup %s", lib_id)
             return lib_id or None
 
         lib_id = _next_library_id(lemmas)
-        lemmas.append({
+        entry = {
             "id": lib_id,
             "formula": formula,
             "status": "proved",
@@ -271,13 +280,54 @@ def add_proved_lemma(
             "origin": origin,
             "attempt": attempt,
             "depth": depth,
-        })
+        }
+        if prelude:
+            entry["prelude"] = prelude
+        lemmas.append(entry)
         save_lemma_library(base_path, lemmas)
         logging.info(
-            "lemma library +%s role=%s origin=%s attempt=%s depth=%s",
-            lib_id, want, origin, attempt, depth,
+            "lemma library +%s role=%s origin=%s attempt=%s depth=%s prelude=%s",
+            lib_id, want, origin, attempt, depth, bool(prelude),
         )
         return lib_id
+
+
+_SCHEME_HELPER_RE = re.compile(r"\b(__scheme_[A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def scheme_helpers_in_text(text: str) -> List[str]:
+    """Unique ``__scheme_*`` identifiers referenced in SMT / formulas."""
+    seen = set()
+    out: List[str] = []
+    for name in _SCHEME_HELPER_RE.findall(text or ""):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _prelude_declares(prelude: str, name: str) -> bool:
+    if not prelude or not name:
+        return False
+    return bool(
+        re.search(
+            rf"\(declare-fun\s+{re.escape(name)}\b",
+            prelude,
+        )
+    )
+
+
+def collect_library_preludes(lemmas: Sequence[dict]) -> str:
+    """Deduped measure / synth preludes stored on library rows."""
+    chunks: List[str] = []
+    seen = set()
+    for item in lemmas or []:
+        prelude = str((item or {}).get("prelude") or "").strip()
+        if not prelude or prelude in seen:
+            continue
+        seen.add(prelude)
+        chunks.append(prelude)
+    return "\n".join(chunks).strip()
 
 
 def inject_library_axioms(
@@ -288,10 +338,15 @@ def inject_library_axioms(
 ) -> str:
     """Insert proved lemmas as axioms just before the proof-goal block.
 
+    Emits any stored ``prelude`` (scheme measure helpers) once before asserts.
+    Lemmas that reference undeclared ``__scheme_*`` helpers are skipped so a
+    polluted library cannot break parse-only wellformed checks for other lemmas.
+
     When ``add_patterns`` is set, directed equalities get a ``:pattern`` on
     the LHS for E-matching. Subgoal SMT stays bare.
     """
     from smt_patterns import format_assert_line
+    from exp_stats import log_exp
 
     stripped = re.sub(
         rf"{re.escape(LIBRARY_BEGIN)}.*?{re.escape(LIBRARY_END)}\n?",
@@ -301,14 +356,45 @@ def inject_library_axioms(
     )
     if not lemmas:
         return stripped
+
+    prelude_block = collect_library_preludes(lemmas)
+    declared = {
+        name
+        for name in scheme_helpers_in_text(prelude_block + "\n" + stripped)
+        if _prelude_declares(prelude_block, name)
+        or re.search(rf"\(declare-fun\s+{re.escape(name)}\b", stripped)
+    }
+
     lines = [LIBRARY_BEGIN]
+    if prelude_block:
+        lines.append("; scheme measure prelude (from library pins)")
+        lines.append(prelude_block)
+
+    n_skip = 0
     for item in lemmas:
         lib_id = str(item.get("id") or "lib")
         formula = normalize_lemma_formula(str(item.get("formula") or ""))
         if not formula:
             continue
+        needed = scheme_helpers_in_text(formula)
+        missing = [n for n in needed if n not in declared]
+        row_prelude = str(item.get("prelude") or "").strip()
+        if missing and row_prelude:
+            for n in list(missing):
+                if _prelude_declares(row_prelude, n):
+                    missing.remove(n)
+                    declared.add(n)
+        if missing:
+            n_skip += 1
+            logging.warning(
+                "lemma library skip %s: missing scheme prelude for %s",
+                lib_id, ", ".join(missing),
+            )
+            continue
         lines.append(f"; {lib_id}")
         lines.append(format_assert_line(formula, add_pattern=add_patterns))
+    if n_skip:
+        log_exp("library_skip_missing_prelude", n=n_skip)
     lines.append(LIBRARY_END)
     block = "\n".join(lines) + "\n"
     marker = "; proof goal"
@@ -587,6 +673,11 @@ def format_obligation_prompt(
     else:
         parts.extend(tree_legend)
     if shown_library:
+        prelude_block = collect_library_preludes(shown_library)
+        if prelude_block:
+            parts.append("Scheme measure prelude (definition in SMT axioms):")
+            for pl in prelude_block.splitlines():
+                parts.append(f"  {pl}" if pl.strip() else "  ")
         parts.append("Library (already proved, in axioms):")
         for item in shown_library:
             lib_id = item.get("id") or "lib"

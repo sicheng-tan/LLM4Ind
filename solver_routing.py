@@ -23,12 +23,10 @@ from theory_features import TheoryFeatures
 
 
 VAMPIRE_FALLBACK_PROFILE = "induction_portfolio"
-# Fixed 4-way schedule race for usefulness, node-goal prove, and scheme
-# short-prove. Prefer portfolio schedules; omit smtcomp (dilutes the race).
+# Paper-default Vampire prove: a single mixed induction portfolio schedule
+# (``--mode portfolio --schedule induction``). Used for usefulness, node-goal
+# prove, and scheme short-prove — matching original LLM4Ind (not a multi-schedule race).
 VAMPIRE_RACE_PROFILES = (
-    "struct_induction",
-    "struct_induction_tip",
-    "integer_induction",
     "induction_portfolio",
 )
 CVC5_FALLBACK_PROFILES = [
@@ -213,57 +211,13 @@ def recommend_vampire_profiles(
     *,
     parent_profile: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
-    """Order ``VAMPIRE_RACE_PROFILES`` for telemetry / prompt guidance.
+    """Return the paper-default Vampire schedule for telemetry / prompt guidance.
 
-    Usefulness and node-goal prove always race the full fixed set; this ranking
-    only affects active_profile / prompt hints, not which arms run.
+    Usefulness, node-goal prove, and scheme short-prove all run only
+    ``induction_portfolio``; ranking here does not change which arms execute.
     """
-    reasons: List[str] = []
-    kinds = set(hint_kinds(hints))
-    if features.mixed_adt_lia:
-        ranked = [
-            "induction_portfolio",
-            "struct_induction",
-            "integer_induction",
-            "struct_induction_tip",
-        ]
-        reasons.append("static:mixed_adt_lia")
-    elif features.has_int and not features.has_adt:
-        ranked = [
-            "integer_induction",
-            "induction_portfolio",
-            "struct_induction",
-            "struct_induction_tip",
-        ]
-        reasons.append("static:integer")
-    elif features.has_adt:
-        ranked = [
-            "struct_induction",
-            "struct_induction_tip",
-            "induction_portfolio",
-            "integer_induction",
-        ]
-        reasons.append("static:adt")
-    else:
-        ranked = list(VAMPIRE_RACE_PROFILES)
-        reasons.append("static:default")
-
-    if "need_arithmetic_lemma" in kinds:
-        _boost(ranked, ["integer_induction", "induction_portfolio"])
-        reasons.append("hint:need_arithmetic_lemma")
-    if kinds & _REWRITE_HINTS:
-        _boost(ranked, ["struct_induction", "induction_portfolio"])
-        reasons.append("hint:need_rewrite_or_induction_stuck")
-
-    if parent_profile and parent_profile in VAMPIRE_RACE_PROFILES:
-        _boost(ranked, [parent_profile])
-        reasons.append(f"inherit:{parent_profile}")
-
-    ranked = _dedup_keep([p for p in ranked if p in VAMPIRE_RACE_PROFILES])
-    for name in VAMPIRE_RACE_PROFILES:
-        if name not in ranked:
-            ranked.append(name)
-    return ranked, reasons
+    del features, hints, parent_profile
+    return list(VAMPIRE_RACE_PROFILES), ["static:paper_induction_portfolio"]
 
 
 def recommend_cvc5_profiles(
@@ -419,7 +373,7 @@ def apply_progress_routing(
         ),
     ):
         if backend == "vampire":
-            _boost(out, ["struct_induction", "struct_induction_tip"])
+            _boost(out, ["induction_portfolio"])
         else:
             _boost(out, ["controlled_conjecture", "cvc5_inductive_no_ematching"])
         reasons.append("progress:search_explosion")
@@ -428,7 +382,7 @@ def apply_progress_routing(
     if strong_keep:
         if _has_prefix(kinds, ("more_datatype_inference",)):
             if backend == "vampire":
-                _boost(out, ["struct_induction"])
+                _boost(out, ["induction_portfolio"])
             else:
                 _boost(out, ["adt_structural"])
             reasons.append("progress:more_datatype")
@@ -971,7 +925,7 @@ def build_search_state(
         backend, features, hints, parent_profile=parent_profile
     )
     if backend == "vampire":
-        # Full fixed race (same arms as scheme short-prove); ranking is display-only.
+        # Paper schedule only (same as usefulness / scheme short-prove).
         top = select_top_profiles(ranked, utilities, k=len(VAMPIRE_RACE_PROFILES))
         for name in VAMPIRE_RACE_PROFILES:
             if name not in top:

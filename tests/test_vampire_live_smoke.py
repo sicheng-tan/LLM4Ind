@@ -66,7 +66,7 @@ def test_live_vampire_trivial_unsat_under_2s() -> None:
 
 
 def test_live_vampire_race_profiles_unsat() -> None:
-    """4-schedule race used by usefulness / node prove / scheme short-prove."""
+    """Paper schedule race arm(s) used by usefulness / node prove / scheme."""
     _require_vampire()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "false.smt2"
@@ -78,12 +78,12 @@ def test_live_vampire_race_profiles_unsat() -> None:
             collect_stats=False,
         )
     assert result.proved and result.status == "unsat", result
-    assert result.strategy in VAMPIRE_RACE_PROFILES
-    assert set(result.portfolio_results or {}) <= set(VAMPIRE_RACE_PROFILES)
+    assert result.strategy == "induction_portfolio"
+    assert list(VAMPIRE_RACE_PROFILES) == ["induction_portfolio"]
 
 
 def test_live_vampire_routed_matches_race() -> None:
-    """``run_vampire_routed`` must hit the same fixed race (not a single paper default)."""
+    """``run_vampire_routed`` must use the same paper schedule set."""
     _require_vampire()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "false.smt2"
@@ -96,4 +96,4 @@ def test_live_vampire_routed_matches_race() -> None:
                 show_induction=False,
             )
     assert result.proved and result.status == "unsat", result
-    assert result.strategy in VAMPIRE_RACE_PROFILES
+    assert result.strategy == "induction_portfolio"

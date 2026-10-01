@@ -311,8 +311,88 @@ def _fill_measure_attempt(
     return attempt
 
 
+def _measure_defn_score(profile: ProblemProfile, name: str, sort: str) -> int:
+    """Score how much ``name`` looks like a size via defining equations.
+
+    Only equations whose LHS head is ``name`` count. Prefers a zero/Z/zero base
+    and a step whose RHS mentions ``name`` again under succ/+1/plus.
+    """
+    if not name:
+        return 0
+    base_hit = False
+    step_hit = False
+    n_defns = 0
+    step_self_apps = 0
+
+    def _strip_forall(body: str) -> str:
+        cur = (body or "").strip()
+        while cur.startswith("(forall"):
+            _h, args = sexpr_head_args(cur)
+            if len(args) < 2:
+                break
+            cur = args[-1]
+        return cur
+
+    for rec in profile.formulas:
+        if rec.role == "goal":
+            continue
+        raw = (rec.raw or "").strip()
+        if not raw:
+            continue
+        body = _strip_forall(raw)
+        if not body.startswith("(="):
+            continue
+        _eq, args = sexpr_head_args(body)
+        if len(args) < 2:
+            continue
+        lhs, rhs = args[0], args[1]
+        if not lhs.startswith("("):
+            continue
+        head, lhs_args = sexpr_head_args(lhs)
+        if head != name:
+            continue
+        n_defns += 1
+        rhs_has_self = f"({name} " in rhs or rhs == f"({name})"
+        # Nullary / leaf base: (= (name c) 0|Z|zero)
+        if len(lhs_args) == 1 and not str(lhs_args[0]).startswith("("):
+            if rhs in ("0", "Z", "zero") or rhs.lower() == "zero":
+                base_hit = True
+        # Step: ctor on LHS, self on RHS, arithmetic successor-ish.
+        if lhs_args and str(lhs_args[0]).startswith("(") and rhs_has_self:
+            if any(
+                tok in rhs
+                for tok in (f"(succ ", f"(S ", f"(+ 1 ", f"(+1 ", f"(plus ")
+            ):
+                step_hit = True
+                step_self_apps = max(step_self_apps, rhs.count(f"({name} "))
+
+    score = 0
+    if base_hit:
+        score += 28
+    if step_hit:
+        score += 28
+        # Prefer measures that fold all recursive children (hsize) over spines (height).
+        score += min(12, step_self_apps * 5)
+    if base_hit and step_hit:
+        score += 12
+    elif n_defns:
+        score += min(4, n_defns)
+    # Soft boost when the measure domain sort appears in defns (same ADT).
+    if sort and score and any(
+        sort in (rec.raw or "")
+        for rec in profile.formulas
+        if name in (rec.symbols or [])
+    ):
+        score += 2
+    return score
+
+
 def select_measure_fun(profile: ProblemProfile, sort: str) -> Optional[str]:
-    """Pick μ : ``sort`` → Int/Nat (prefer length/size-like; reject min/max)."""
+    """Pick μ : ``sort`` → Int/Nat.
+
+    Prefers symbols whose *definitions* look like size (base 0 + 1+/S step);
+    name tokens (len/size/height/…) are a soft tie-break only. Rejects min/max.
+    """
     if not sort:
         return None
     fun_sorts = dict(profile.signature.get("fun_sorts") or {})
@@ -329,25 +409,27 @@ def select_measure_fun(profile: ProblemProfile, sort: str) -> Optional[str]:
         low = name.lower()
         if any(b in low for b in _MEASURE_NAME_BLOCK_SUBSTR):
             return
-        # Prefer unary size-like; require a name bonus hit OR unary observer.
-        score = 0
+        defn = _measure_defn_score(profile, name, sort)
+        score = defn
         bonus = False
         for i, token in enumerate(_MEASURE_NAME_BONUS):
             if token in low:
-                score += 30 - i
+                score += max(1, 10 - i)
                 bonus = True
                 break
-        if not bonus and len(inputs) != 1:
-            return
-        if not bonus:
-            score += 1  # weak unary fallback
+        if not bonus and defn == 0:
+            if len(inputs) != 1:
+                return
+            score += 1
         if len(inputs) == 1:
-            score += 5
+            score += 4
         if ret == "Int":
-            score += 4  # prefer native Int over Nat→Int
+            score += 3
         for obs in profile.observer_candidates:
             if obs.function == name:
                 score += 3
+                if obs.evidence_level == "structural":
+                    score += 4
                 break
         candidates.append((score, name))
 
@@ -370,8 +452,8 @@ def select_induct_var_for_measure(
     """Return ``(var, sort, measure_fun)`` for an *existing* size-like symbol.
 
     Prefer the structural induct var when it admits a measure; else any ADT
-    binder with a measure. Callers may synthesize ``__scheme_list_len`` when
-    this returns None (see ``_fill_measure_attempt``).
+    binder with a measure. Callers may synthesize ``__scheme_list_len`` /
+    ``__scheme_adt_size`` when this returns None (see ``_fill_measure_attempt``).
     """
     datatypes: Set[str] = set(profile.signature.get("datatypes") or [])
     struct_choice = select_induct_var(profile, binders, matrix)

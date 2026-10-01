@@ -36,7 +36,7 @@ def default_cvc_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
 
 
 def default_vampire_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
-    """Race Vampire scheme profiles (same backend as usefulness on Vampire Mate)."""
+    """Race Vampire scheme profiles (same schedule as usefulness on Vampire Mate)."""
     from vampire_runner import VAMPIRE_PROFILES, run_vampire_race
 
     names = [p for p in (profiles or ()) if p in VAMPIRE_PROFILES]

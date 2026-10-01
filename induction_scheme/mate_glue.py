@@ -37,11 +37,10 @@ ProveFn = Callable[[Path, int, Sequence[str]], object]
 
 
 def scheme_prove_kwargs_for_backend(backend: str) -> dict:
-    """Prove fn + ~4 profiles for scheme short-prove / gate / frontier.
+    """Prove fn + profiles for scheme short-prove / gate / frontier.
 
     Backend must match usefulness (cvc5 Mate → CVC portfolio; Vampire Mate →
-    Vampire race). cross_sort nest already limits same-sort children, so a
-    4-way profile race is the intended short-prove budget.
+    paper ``induction_portfolio`` schedule only).
     """
     name = (backend or "cvc5").strip().lower()
     if name in ("vampire", "vamp"):

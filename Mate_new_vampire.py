@@ -2452,7 +2452,7 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
 
 
 def _harvest_direct_prove(smt_path: Path, base_path: str):
-    """Direct-prove A⊢cᵢ with the same 4-schedule race as usefulness / node prove."""
+    """Direct-prove A⊢cᵢ with the same paper schedule as usefulness / node prove."""
     result = run_vampire_race(
         smt_path,
         config["DEFAULT_CVC_TIMEOUT"],

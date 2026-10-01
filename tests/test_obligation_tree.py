@@ -28,6 +28,7 @@ from obligation_tree import (
     lemma_library_role,
     load_lemma_library,
     local_lemma_harvest_enabled,
+    scheme_helpers_in_text,
     make_child_node,
     make_goal_tree,
     materialize_smt_with_library,
@@ -210,6 +211,101 @@ def test_inject_library_axioms_before_proof_goal() -> None:
     assert out.index("; proved lemma library") < out.index("; proof goal")
     again = inject_library_axioms(out, [{"id": "lib_1", "formula": "(forall ((x Nat)) (= (plus x zero) x))"}])
     assert again.count("; proved lemma library end") == 1
+
+
+def test_inject_scheme_prelude_and_skip_undeclared_helpers() -> None:
+    """Measure pins must inject declare-fun; polluted rows without prelude are skipped."""
+    smt = """(set-logic ALL)
+(declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
+(declare-fun len (Lst) Nat)
+; proof goal
+(assert (not true))
+; proof goal end
+"""
+    prelude = (
+        "; induction scheme Nat→Int for measure comparisons\n"
+        "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
+        "(assert (= (__scheme_nat_to_int zero) 0))\n"
+        "(assert (forall ((__n Nat)) "
+        "(= (__scheme_nat_to_int (succ __n)) (+ 1 (__scheme_nat_to_int __n)))))\n"
+    )
+    formula = "(forall ((x Lst)) (>= (__scheme_nat_to_int (len x)) 0))"
+    good = {
+        "id": "lib_1",
+        "formula": formula,
+        "prelude": prelude,
+    }
+    polluted = {
+        "id": "lib_2",
+        "formula": "(forall ((y Lst)) (= (__scheme_nat_to_int (len y)) "
+                   "(__scheme_nat_to_int (len y))))",
+        # no prelude — old bug shape
+    }
+    unrelated = {
+        "id": "lib_3",
+        "formula": "(forall ((n Nat)) (= n n))",
+    }
+    # Only polluted: must skip so wellformed SMT stays clean.
+    polluted_only = inject_library_axioms(smt, [polluted, unrelated])
+    assert "(declare-fun __scheme_nat_to_int" not in polluted_only
+    assert "; lib_2" not in polluted_only
+    assert "; lib_3" in polluted_only
+    assert "(forall ((n Nat)) (= n n))" in polluted_only
+
+    # With a prelude-bearing pin, helpers are declared once; siblings may reuse.
+    out = inject_library_axioms(smt, [good, polluted, unrelated])
+    assert "(declare-fun __scheme_nat_to_int (Nat) Int)" in out
+    assert out.count("(declare-fun __scheme_nat_to_int") == 1
+    assert "; lib_1" in out
+    assert "; lib_2" in out  # declared via shared prelude from lib_1
+    assert "; lib_3" in out
+    assert scheme_helpers_in_text("(forall ((n Nat)) (= n n))") == []
+
+
+def test_add_proved_lemma_stores_prelude() -> None:
+    prelude = "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
+    formula = "(forall ((x Nat)) (>= (__scheme_nat_to_int x) 0))"
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"LEMMA_LIBRARY": "on"}):
+            lib_id = add_proved_lemma(
+                tmp, formula, origin="scheme:g:nonneg", role="pin", prelude=prelude,
+            )
+            assert lib_id == "lib_1"
+            items = load_lemma_library(tmp)
+            assert items[0]["prelude"].strip().startswith("(declare-fun __scheme_nat_to_int")
+            # α-dup without prelude attaches stored prelude.
+            lib_id2 = add_proved_lemma(
+                tmp, formula, origin="scheme:g:again", role="pin", prelude="",
+            )
+            assert lib_id2 == "lib_1"
+            # Promote path: pin with prelude fills empty.
+            items[0]["prelude"] = ""
+            from obligation_tree import save_lemma_library
+            save_lemma_library(tmp, items)
+            add_proved_lemma(
+                tmp, formula, origin="scheme:g:fix", role="pin", prelude=prelude,
+            )
+            assert load_lemma_library(tmp)[0]["prelude"].strip().startswith(
+                "(declare-fun __scheme_nat_to_int"
+            )
+
+
+def test_obligation_prompt_shows_library_prelude() -> None:
+    library = [
+        {
+            "id": "lib_1",
+            "formula": "(forall ((x Nat)) (>= (__scheme_nat_to_int x) 0))",
+            "prelude": (
+                "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
+                "(assert (= (__scheme_nat_to_int zero) 0))\n"
+            ),
+        },
+    ]
+    with _patch_flags("on", "off"):
+        text = format_obligation_prompt(library, None)
+    assert "Scheme measure prelude (definition in SMT axioms):" in text
+    assert "(declare-fun __scheme_nat_to_int (Nat) Int)" in text
+    assert "lib_1:" in text
 
 
 def test_compressed_prompt_matches_expected_shape() -> None:
@@ -655,6 +751,9 @@ def main() -> int:
     test_last_normal_tree_skips_empty_invalid_useless()
     test_classify_failed_attempt()
     test_inject_library_axioms_before_proof_goal()
+    test_inject_scheme_prelude_and_skip_undeclared_helpers()
+    test_add_proved_lemma_stores_prelude()
+    test_obligation_prompt_shows_library_prelude()
     test_compressed_prompt_matches_expected_shape()
     test_first_invalid_reason_walks_nested()
     test_invalid_node_shows_reason_not_atp_hints()

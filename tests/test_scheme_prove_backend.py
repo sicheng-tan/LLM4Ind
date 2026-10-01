@@ -13,21 +13,15 @@ from vampire_runner import VAMPIRE_PROFILES
 
 def test_scheme_prove_profile_sets_are_four_way() -> None:
     assert len(PROVE_PROFILES) == 4
-    assert len(VAMPIRE_PROVE_PROFILES) == 4
-    assert set(VAMPIRE_PROVE_PROFILES) <= set(VAMPIRE_PROFILES)
-    # Same arms as usefulness / node-goal prove (VAMPIRE_RACE_PROFILES).
+    # Vampire: paper single schedule (not a multi-arm race).
     from solver_routing import VAMPIRE_RACE_PROFILES
 
     assert tuple(VAMPIRE_PROVE_PROFILES) == tuple(VAMPIRE_RACE_PROFILES)
-    assert VAMPIRE_PROVE_PROFILES == (
-        "struct_induction",
-        "struct_induction_tip",
-        "integer_induction",
-        "induction_portfolio",
-    )
+    assert VAMPIRE_PROVE_PROFILES == ("induction_portfolio",)
+    assert set(VAMPIRE_PROVE_PROFILES) <= set(VAMPIRE_PROFILES)
     for name in VAMPIRE_PROVE_PROFILES:
         assert VAMPIRE_PROFILES[name]["kind"] == "portfolio"
-    assert "smtcomp" not in VAMPIRE_PROVE_PROFILES
+        assert VAMPIRE_PROFILES[name]["schedule"] == "induction"
 
 
 def test_scheme_prove_kwargs_select_backend() -> None:

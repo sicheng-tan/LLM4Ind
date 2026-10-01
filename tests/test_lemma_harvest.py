@@ -326,7 +326,7 @@ def test_vampire_exhausted_harvest_sets_skip_initial_diag() -> None:
         assert diag.get("status") == "timeout"
         assert diag.get("proved") is False
         assert diag.get("induction_focus") == ["(P x)"]
-        # Harvest races the fixed schedule set.
+        # Harvest uses the same paper schedule as usefulness / node prove.
         assert harvest.call_count >= 1
         raced = harvest.call_args[0][2]
         assert list(raced) == list(HARVEST_VAMPIRE_PROFILES)

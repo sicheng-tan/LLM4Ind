@@ -6,7 +6,7 @@ R1/R2 are driven by μ's domain sort, goal/peer helpers, and constructors.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from smt_patterns import normalize_lemma_formula
 
@@ -21,6 +21,31 @@ _R1_SKIP_FUNS = frozenset({
     "and", "or", "not", "=>", "=", "<", ">", "<=", ">=",
 })
 
+# Descent helpers: name prefixes / exact tokens (keep existing TIP coverage).
+_DESCENT_NAME_PREFIXES = (
+    "filter", "delete", "remove", "take", "drop", "ztake", "zdrop",
+    "butlast", "evens", "odds",
+)
+_DESCENT_NAME_EXACT = frozenset({
+    "bubble", "take", "drop", "ztake", "zdrop", "delete",
+})
+# Never treat these as μ-nonincreasing from name alone (signature ambiguous).
+_DESCENT_NAME_BLOCK = frozenset({
+    "append", "concat", "union", "inter", "reverse", "rev", "snoc",
+    "cons", "zcons", "++", "insort", "insert", "sinsert", "qsort",
+    "isort", "msort", "ssort", "tsort", "bsort", "hsort", "nmsort",
+    "sort", "merge", "zip", "map", "interleave", "rotate",
+})
+
+
+def _is_descent_name(name: str) -> bool:
+    low = name.lower()
+    if low in _DESCENT_NAME_BLOCK:
+        return False
+    if low in _DESCENT_NAME_EXACT:
+        return True
+    return any(low.startswith(p) for p in _DESCENT_NAME_PREFIXES)
+
 
 def generate_bridge_obligations(
     profile: ProblemProfile,
@@ -33,7 +58,11 @@ def generate_bridge_obligations(
     measure_ret_sort: str,
     use_nat_to_int: bool,
 ) -> List[SchemeObligation]:
-    """Concrete descent + domain bridges (no abstract WF)."""
+    """Concrete descent + domain bridges (no abstract WF).
+
+    Descent peers are taken first from goal-related recursive-call analysis;
+    TIP-style name heuristics are only a fallback when that set is empty.
+    """
     out: List[SchemeObligation] = []
     seen: Set[str] = set()
     goal_norm = normalize_lemma_formula(
@@ -50,23 +79,25 @@ def generate_bridge_obligations(
         seen.add(key)
         out.append(obl)
 
-    for obl in _descent_from_recursive_calls(
+    rc_descents = _descent_from_recursive_calls(
         profile,
         induct_var=induct_var,
         induct_sort=induct_sort,
         measure_fun=measure_fun,
         use_nat_to_int=use_nat_to_int,
-    ):
+    )
+    for obl in rc_descents:
         _add(obl)
-
-    for obl in _descent_known_shapes(
-        profile,
-        induct_var=induct_var,
-        induct_sort=induct_sort,
-        measure_fun=measure_fun,
-        use_nat_to_int=use_nat_to_int,
-    ):
-        _add(obl)
+    # Name-table fallback when RC peers produced no descent obligations.
+    if not rc_descents:
+        for obl in _descent_known_shapes(
+            profile,
+            induct_var=induct_var,
+            induct_sort=induct_sort,
+            measure_fun=measure_fun,
+            use_nat_to_int=use_nat_to_int,
+        ):
+            _add(obl)
 
     # μ domain for R1/R2: prefer the measure's input sort over induct_sort
     # (they usually match; heap measures are on Heap even if binders differ).
@@ -100,9 +131,9 @@ def pick_or_synthesize_measure(
 ) -> Tuple[Optional[str], str, str]:
     """Return ``(measure_fun, ret_sort, prelude)``.
 
-    Prefers an existing size-like symbol. If ``sort`` is a list-like ADT with
-    nil/cons but no measure, synthesizes ``__scheme_list_len`` in a *prelude*
-    (working copy only — does not rewrite the benchmark file).
+    Prefers an existing size-like symbol. If none, synthesizes a working-copy
+    measure over recursive constructors (``__scheme_list_len`` for single-spine
+    list shapes; ``__scheme_adt_size`` for trees / multi-arm spines).
     """
     from .generate import select_measure_fun, _nat_to_int_prelude
 
@@ -117,7 +148,7 @@ def pick_or_synthesize_measure(
                 return None, "", ""
         return mu, ret, prelude
 
-    synth = _synthesize_list_len(profile, sort)
+    synth = _synthesize_adt_size(profile, sort)
     if synth is None:
         return None, "", ""
     fun, prelude = synth
@@ -159,30 +190,57 @@ def _obl(
     )
 
 
-def _list_nil_cons(
+def _ctor_tables(
     profile: ProblemProfile, sort: str,
-) -> Optional[Tuple[str, str, str]]:
-    """``(nil, cons, elem_sort)`` for a list-like datatype."""
+) -> Tuple[List[str], Dict[str, List[str]]]:
     dt = {
         str(k): [str(x) for x in (v or [])]
         for k, v in (profile.signature.get("datatype_constructors") or {}).items()
     }
     ar = {
-        str(k): list(v or [])
+        str(k): [str(x) for x in (v or [])]
         for k, v in (profile.signature.get("constructor_arities") or {}).items()
     }
-    ctors = list(dt.get(sort) or [])
+    return list(dt.get(sort) or []), ar
+
+
+def _rec_positions(arg_sorts: Sequence[str], sort: str) -> List[int]:
+    return [i for i, s in enumerate(arg_sorts) if s == sort]
+
+
+def _list_nil_cons(
+    profile: ProblemProfile, sort: str,
+) -> Optional[Tuple[str, str, str]]:
+    """``(nil, cons, elem_sort)`` for a *single-spine* list-like datatype.
+
+    Requires exactly one nullary/non-recursive ctor and one ctor with
+    **exactly one** recursive argument of ``sort`` (any index). Binary trees
+    ``(node T T)`` are excluded (two recursive args).
+    """
+    ctors, ar = _ctor_tables(profile, sort)
     if len(ctors) < 2:
         return None
-    nils = [c for c in ctors if not ar.get(c)]
-    conses = [c for c in ctors if len(ar.get(c) or []) == 2 and (ar.get(c) or [])[1] == sort]
-    if len(nils) == 1 and len(conses) == 1:
-        elem = (ar.get(conses[0]) or ["Int"])[0]
-        return nils[0], conses[0], str(elem)
-    for nil_n, cons_n in (("nil", "cons"), ("Nil", "Cons")):
+    nils = [c for c in ctors if not _rec_positions(ar.get(c) or [], sort)]
+    spines = [
+        c for c in ctors
+        if len(_rec_positions(ar.get(c) or [], sort)) == 1
+    ]
+    if len(nils) == 1 and len(spines) == 1 and set(nils) | set(spines) == set(ctors):
+        cons = spines[0]
+        args = ar.get(cons) or []
+        rec = _rec_positions(args, sort)[0]
+        elem_args = [args[i] for i in range(len(args)) if i != rec]
+        elem = str(elem_args[0]) if elem_args else "Int"
+        return nils[0], cons, elem
+    for nil_n, cons_n in (("nil", "cons"), ("Nil", "Cons"), ("znil", "zcons")):
         if nil_n in ctors and cons_n in ctors:
             args = ar.get(cons_n) or []
-            elem = str(args[0]) if args else "Int"
+            recs = _rec_positions(args, sort)
+            if len(recs) != 1:
+                continue
+            rec = recs[0]
+            elem_args = [args[i] for i in range(len(args)) if i != rec]
+            elem = str(elem_args[0]) if elem_args else "Int"
             return nil_n, cons_n, elem
     return None
 
@@ -190,19 +248,72 @@ def _list_nil_cons(
 def _synthesize_list_len(
     profile: ProblemProfile, sort: str,
 ) -> Optional[Tuple[str, str]]:
-    pair = _list_nil_cons(profile, sort)
-    if pair is None:
+    """Backward-compatible alias: single-spine list measure only."""
+    if _list_nil_cons(profile, sort) is None:
         return None
-    nil, cons, elem = pair
-    fun = "__scheme_list_len"
-    prelude = (
-        f"; induction scheme synthesized list length (working copy only)\n"
-        f"(declare-fun {fun} ({sort}) Int)\n"
-        f"(assert (= ({fun} {nil}) 0))\n"
-        f"(assert (forall ((__h {elem}) (__t {sort})) "
-        f"(= ({fun} ({cons} __h __t)) (+ 1 ({fun} __t)))))\n"
-    )
-    return fun, prelude
+    return _synthesize_adt_size(profile, sort)
+
+
+def _smt_sum(terms: Sequence[str]) -> str:
+    terms = [t for t in terms if t]
+    if not terms:
+        return "0"
+    if len(terms) == 1:
+        return terms[0]
+    out = terms[0]
+    for t in terms[1:]:
+        out = f"(+ {out} {t})"
+    return out
+
+
+def _synthesize_adt_size(
+    profile: ProblemProfile, sort: str,
+) -> Optional[Tuple[str, str]]:
+    """Synthesize a WF size over recursive constructors (working copy only).
+
+    * Single-spine list shape → ``__scheme_list_len``
+    * Otherwise (trees, Bin, …) → ``__scheme_adt_size`` with
+      ``1 + Σ size(rec_i)`` on each recursive constructor.
+    """
+    ctors, ar = _ctor_tables(profile, sort)
+    if len(ctors) < 2:
+        return None
+    bases = [c for c in ctors if not _rec_positions(ar.get(c) or [], sort)]
+    rec_ctors = [c for c in ctors if _rec_positions(ar.get(c) or [], sort)]
+    if not bases or not rec_ctors:
+        return None
+
+    list_pair = _list_nil_cons(profile, sort)
+    if list_pair is not None:
+        fun = "__scheme_list_len"
+        tag = "list length"
+    else:
+        fun = "__scheme_adt_size"
+        tag = "ADT size"
+
+    lines = [
+        f"; induction scheme synthesized {tag} (working copy only)",
+        f"(declare-fun {fun} ({sort}) Int)",
+    ]
+    ordered = list(bases) + [c for c in ctors if c not in bases]
+    for ctor in ordered:
+        args = list(ar.get(ctor) or [])
+        recs = _rec_positions(args, sort)
+        binders = [f"(__a{i} {args[i]})" for i in range(len(args))]
+        app_args = " ".join(f"__a{i}" for i in range(len(args)))
+        app = f"({ctor})" if not args else f"({ctor} {app_args})"
+        if not recs:
+            eqn = f"(= ({fun} {app}) 0)"
+        else:
+            parts = ["1"] + [f"({fun} __a{i})" for i in recs]
+            eqn = f"(= ({fun} {app}) {_smt_sum(parts)})"
+        if binders:
+            lines.append(
+                f"(assert (forall ({' '.join(binders)}) {eqn}))"
+            )
+        else:
+            lines.append(f"(assert {eqn})")
+    return fun, "\n".join(lines) + "\n"
 
 
 def _descent_from_recursive_calls(
@@ -254,25 +365,98 @@ def _descent_known_shapes(
     measure_fun: str,
     use_nat_to_int: bool,
 ) -> List[SchemeObligation]:
-    """Emit filter*/bubble descents even when RC classification missed them."""
+    """TIP-style name fallback when recursive-call peers yielded no descent."""
     fun_sorts = dict(profile.signature.get("fun_sorts") or {})
     functions = set(profile.signature.get("functions") or []) | set(fun_sorts)
     out: List[SchemeObligation] = []
     for name in sorted(functions):
-        low = name.lower()
-        if low.startswith("filter") or low in ("bubble", "take", "drop", "ztake", "zdrop", "delete"):
-            out.extend(
-                _descent_for_peer(
-                    profile,
-                    peer=name,
-                    induct_var=induct_var,
-                    induct_sort=induct_sort,
-                    measure_fun=measure_fun,
-                    use_nat_to_int=use_nat_to_int,
-                    fun_sorts=fun_sorts,
-                )
+        if not _is_descent_name(name):
+            continue
+        out.extend(
+            _descent_for_peer(
+                profile,
+                peer=name,
+                induct_var=induct_var,
+                induct_sort=induct_sort,
+                measure_fun=measure_fun,
+                use_nat_to_int=use_nat_to_int,
+                fun_sorts=fun_sorts,
             )
+        )
     return out
+
+
+def _selectors_to_sort(
+    profile: ProblemProfile,
+    product_sort: str,
+    elem_sort: str,
+) -> List[str]:
+    """Selectors / unary funs ``product_sort → elem_sort`` (e.g. Pair→list)."""
+    fun_sorts = dict(profile.signature.get("fun_sorts") or {})
+    sel_to_ctor = {
+        str(k): str(v)
+        for k, v in (profile.signature.get("selector_to_ctor") or {}).items()
+    }
+    arities = {
+        str(k): [str(x) for x in (v or [])]
+        for k, v in (profile.signature.get("constructor_arities") or {}).items()
+    }
+    dt = {
+        str(k): [str(x) for x in (v or [])]
+        for k, v in (profile.signature.get("datatype_constructors") or {}).items()
+    }
+    ctor_domain = {
+        ctor: sort
+        for sort, ctors in dt.items()
+        for ctor in (ctors or [])
+    }
+    selector_order = [str(s) for s in (profile.signature.get("selectors") or [])]
+
+    out: List[str] = []
+    # From declare-datatypes selectors (may lack fun_sorts entries).
+    for sel, ctor in sel_to_ctor.items():
+        domain = ctor_domain.get(ctor)
+        if domain != product_sort:
+            continue
+        args = arities.get(ctor) or []
+        siblings = [s for s in selector_order if sel_to_ctor.get(s) == ctor]
+        if sel not in siblings:
+            siblings = sorted(s for s, c in sel_to_ctor.items() if c == ctor)
+        try:
+            idx = siblings.index(sel)
+        except ValueError:
+            continue
+        if idx < len(args) and args[idx] == elem_sort:
+            out.append(sel)
+
+    # Also unary functions with explicit sorts.
+    names = set(profile.signature.get("selectors") or []) | set(fun_sorts)
+    for name in names:
+        meta = fun_sorts.get(name) or {}
+        inputs = [str(s) for s in (meta.get("input_sorts") or [])]
+        ret = str(meta.get("return_sort") or "")
+        if len(inputs) == 1 and inputs[0] == product_sort and ret == elem_sort:
+            out.append(name)
+
+    prefer = ("second", "snd", "proj1", "proj2", "fst", "tail")
+    def _key(n: str) -> Tuple[int, str]:
+        low = n.lower()
+        for i, p in enumerate(prefer):
+            if low == p or low.endswith(p):
+                return (i, n)
+        return (len(prefer), n)
+    return sorted(set(out), key=_key)
+
+
+def _descent_name_blocked(name: str) -> bool:
+    low = name.lower()
+    if low in _DESCENT_NAME_BLOCK:
+        return True
+    # Prefix growers (e.g. append2) — keep narrow to avoid killing filter*.
+    for blocked in ("append", "concat", "merge", "qsort", "isort", "msort"):
+        if low == blocked or low.startswith(blocked + "_"):
+            return True
+    return False
 
 
 def _descent_for_peer(
@@ -290,10 +474,14 @@ def _descent_for_peer(
     peer_in = [str(s) for s in (peer_meta.get("input_sorts") or [])]
     peer_out = str(peer_meta.get("return_sort") or "")
     out: List[SchemeObligation] = []
-    selectors = set(profile.signature.get("selectors") or [])
+    blocked = _descent_name_blocked(peer)
 
-    # filter-like: (filter p xs) → same list sort
-    if peer_out == induct_sort and induct_sort in peer_in:
+    # Same-sort transformers: μ(f(…,x,…)) ≤ μ(x) (filter / take / delete / …).
+    if (
+        not blocked
+        and peer_out == induct_sort
+        and induct_sort in peer_in
+    ):
         if len(peer_in) == 2 and peer_in[-1] == induct_sort:
             p_sort = peer_in[0]
             filt = f"({peer} p xs)"
@@ -323,56 +511,29 @@ def _descent_for_peer(
                 induct_sort=induct_sort,
             ))
 
-    # bubble-like: returns Pair; μ(second (bubble xs)) ≤ μ(xs)
-    if peer == "bubble" or (
-        peer_out not in (induct_sort, "") and "Pair" in peer_out
+    # Product unwrap: f : τ → σ with selector s : σ → τ (bubble/Pair generalized).
+    if (
+        peer_out
+        and peer_out != induct_sort
+        and induct_sort in peer_in
+        and len(peer_in) == 1
+        and peer_in[0] == induct_sort
     ):
-        if "second" in selectors or "second" in fun_sorts:
+        for sel in _selectors_to_sort(profile, peer_out, induct_sort):
             body = (
                 f"(forall ((xs {induct_sort})) "
-                f"(<= {_mu_term(mu, f'(second ({peer} xs))', use_nat_to_int=use_nat_to_int)} "
+                f"(<= {_mu_term(mu, f'({sel} ({peer} xs))', use_nat_to_int=use_nat_to_int)} "
                 f"{_mu_term(mu, 'xs', use_nat_to_int=use_nat_to_int)}))"
             )
             out.append(_obl(
-                obl_id=f"descent_{peer}_second_le",
-                ctor=f"descent_{peer}_second",
+                obl_id=f"descent_{peer}_{sel}_le",
+                ctor=f"descent_{peer}_{sel}",
                 formula=body,
                 induct_var=induct_var,
                 induct_sort=induct_sort,
             ))
+            break  # one selector is enough (prefer second/…)
 
-    # take/drop
-    if peer in ("take", "drop", "ztake", "zdrop") and induct_sort in peer_in:
-        if len(peer_in) >= 2 and peer_in[1] == induct_sort:
-            n_sort = peer_in[0]
-            body = (
-                f"(forall ((n {n_sort}) (xs {induct_sort})) "
-                f"(<= {_mu_term(mu, f'({peer} n xs)', use_nat_to_int=use_nat_to_int)} "
-                f"{_mu_term(mu, 'xs', use_nat_to_int=use_nat_to_int)}))"
-            )
-            out.append(_obl(
-                obl_id=f"descent_{peer}_le",
-                ctor=f"descent_{peer}",
-                formula=body,
-                induct_var=induct_var,
-                induct_sort=induct_sort,
-            ))
-
-    if peer == "delete" and induct_sort in peer_in:
-        if len(peer_in) == 2 and peer_in[1] == induct_sort:
-            e_sort = peer_in[0]
-            body = (
-                f"(forall ((e {e_sort}) (xs {induct_sort})) "
-                f"(<= {_mu_term(mu, f'({peer} e xs)', use_nat_to_int=use_nat_to_int)} "
-                f"{_mu_term(mu, 'xs', use_nat_to_int=use_nat_to_int)}))"
-            )
-            out.append(_obl(
-                obl_id=f"descent_{peer}_le",
-                ctor=f"descent_{peer}",
-                formula=body,
-                induct_var=induct_var,
-                induct_sort=induct_sort,
-            ))
     return out
 
 

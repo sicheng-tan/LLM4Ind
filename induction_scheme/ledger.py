@@ -102,15 +102,24 @@ def harvest_scheme_proved_to_library(
     depth: int = 0,
     attempt_n: int = 0,
 ) -> int:
-    """Pin scheme-proved obligations into the lemma library (skip abstract WF)."""
+    """Pin scheme-proved obligations into the lemma library (skip abstract WF).
+
+    Measure / synth obligations that mention ``__scheme_*`` helpers also store
+    ``attempt.measure_prelude`` so library inject can declare those helpers.
+    """
     if not base_path or not attempt or attempt.skipped:
         return 0
     try:
-        from obligation_tree import add_proved_lemma, lemma_library_enabled
+        from obligation_tree import (
+            add_proved_lemma,
+            lemma_library_enabled,
+            scheme_helpers_in_text,
+        )
     except Exception:
         return 0
     if not lemma_library_enabled():
         return 0
+    prelude = (attempt.measure_prelude or "").strip()
     n = 0
     for obl in attempt.obligations:
         if obl.status != "proved" or not (obl.formula or "").strip():
@@ -118,13 +127,16 @@ def harvest_scheme_proved_to_library(
         # Abstract WF is an induction principle shell, not a reusable lemma.
         if obl.ctor == "wf":
             continue
+        formula = obl.formula
+        need_prelude = bool(prelude and scheme_helpers_in_text(formula))
         lib_id = add_proved_lemma(
             base_path,
-            obl.formula,
+            formula,
             origin=f"scheme:{attempt.goal_name}:{obl.obl_id}",
             attempt=attempt_n,
             depth=depth,
             role="pin",
+            prelude=prelude if need_prelude else "",
         )
         if lib_id:
             n += 1
@@ -227,6 +239,11 @@ def format_scheme_prompt_block(
         "\nINDUCTION SCHEME (proved short-prove facts for CURRENT goal only):",
         f"  - " + " ".join(header_bits),
     ]
+    prelude = (att.measure_prelude or "").strip()
+    if prelude:
+        lines.append("  Scheme measure prelude (definition in SMT axioms):")
+        for pl in prelude.splitlines():
+            lines.append(f"  {pl}" if pl.strip() else "  ")
     if struct_proved:
         lines.append(
             "  Proved structural cases "
