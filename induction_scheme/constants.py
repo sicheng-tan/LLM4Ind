@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+# Same 4 schedules as usefulness / node-goal prove (single source of truth).
+from solver_routing import VAMPIRE_RACE_PROFILES as VAMPIRE_PROVE_PROFILES
+
 # Short prove budget per obligation (seconds).
 PROVE_TIMEOUT_S = 10
 
 # Same budget for optional axioms∧base∧step ⊢ G gate.
 GOAL_GATE_TIMEOUT_S = 10
 
-# CVC profiles for scheme short prove / frontier re-prove / goal gate.
-# Single profile: both-axes prove already doubles work; cvc4 overlap was low.
-PROVE_PROFILES = ("cvc5_inductive",)
+# Scheme short-prove / frontier / goal-gate profile races (~4-way).
+# cross_sort nest already cuts same-sort children, freeing CPU for this race.
+#
+# CVC: classic usefulness 4-arm portfolio.
+PROVE_PROFILES = (
+    "cvc5_inductive",
+    "cvc5_simple",
+    "cvc5_inductive_no_ematching",
+    "cvc4_default",
+)
+
+# Vampire: ``VAMPIRE_PROVE_PROFILES`` == ``vampire_runner.VAMPIRE_RACE_PROFILES``.
 
 # At most one induct variable per node (sequential nesting picks another
 # binder on the child goal — not simultaneous multi-var induction).
@@ -33,6 +45,7 @@ SCHEME_PROVE_MAX_OBLS = 8
 # Child nodes never call an LLM in the lightweight plan.
 CHILD_LLM = False
 
+# Ledger key under failed_lemmas.json.
 SCHEME_ATTEMPTS_KEY = "scheme_attempts"
 SCHEME_PENDING_KEY = "scheme_pending_close"
 SCHEME_DISPATCH_KEY = "scheme_dispatch"

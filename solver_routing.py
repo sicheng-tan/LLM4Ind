@@ -23,6 +23,14 @@ from theory_features import TheoryFeatures
 
 
 VAMPIRE_FALLBACK_PROFILE = "induction_portfolio"
+# Fixed 4-way schedule race for usefulness, node-goal prove, and scheme
+# short-prove. Prefer portfolio schedules; omit smtcomp (dilutes the race).
+VAMPIRE_RACE_PROFILES = (
+    "struct_induction",
+    "struct_induction_tip",
+    "integer_induction",
+    "induction_portfolio",
+)
 CVC5_FALLBACK_PROFILES = [
     "cvc5_simple",
     "cvc5_inductive",
@@ -205,38 +213,56 @@ def recommend_vampire_profiles(
     *,
     parent_profile: Optional[str] = None,
 ) -> Tuple[List[str], List[str]]:
-    """Return (ordered candidate profiles, reasons). Paper default is always last fallback."""
-    reasons: List[str] = []
-    ranked: List[str] = []
+    """Order ``VAMPIRE_RACE_PROFILES`` for telemetry / prompt guidance.
 
+    Usefulness and node-goal prove always race the full fixed set; this ranking
+    only affects active_profile / prompt hints, not which arms run.
+    """
+    reasons: List[str] = []
     kinds = set(hint_kinds(hints))
     if features.mixed_adt_lia:
-        ranked = ["induction_portfolio", "smtcomp", "alasca_arith", "struct_induction"]
+        ranked = [
+            "induction_portfolio",
+            "struct_induction",
+            "integer_induction",
+            "struct_induction_tip",
+        ]
         reasons.append("static:mixed_adt_lia")
     elif features.has_int and not features.has_adt:
-        ranked = ["integer_induction", "alasca_arith", "smtcomp", "induction_portfolio"]
+        ranked = [
+            "integer_induction",
+            "induction_portfolio",
+            "struct_induction",
+            "struct_induction_tip",
+        ]
         reasons.append("static:integer")
     elif features.has_adt:
-        ranked = ["struct_induction", "induction_portfolio", "struct_induction_tip"]
+        ranked = [
+            "struct_induction",
+            "struct_induction_tip",
+            "induction_portfolio",
+            "integer_induction",
+        ]
         reasons.append("static:adt")
     else:
-        ranked = ["induction_portfolio", "smtcomp"]
+        ranked = list(VAMPIRE_RACE_PROFILES)
         reasons.append("static:default")
 
     if "need_arithmetic_lemma" in kinds:
-        _boost(ranked, ["alasca_arith", "integer_induction", "smtcomp"])
+        _boost(ranked, ["integer_induction", "induction_portfolio"])
         reasons.append("hint:need_arithmetic_lemma")
     if kinds & _REWRITE_HINTS:
         _boost(ranked, ["struct_induction", "induction_portfolio"])
         reasons.append("hint:need_rewrite_or_induction_stuck")
 
-    if parent_profile:
+    if parent_profile and parent_profile in VAMPIRE_RACE_PROFILES:
         _boost(ranked, [parent_profile])
         reasons.append(f"inherit:{parent_profile}")
 
-    ranked = _dedup_keep(ranked)
-    if VAMPIRE_FALLBACK_PROFILE not in ranked:
-        ranked.append(VAMPIRE_FALLBACK_PROFILE)
+    ranked = _dedup_keep([p for p in ranked if p in VAMPIRE_RACE_PROFILES])
+    for name in VAMPIRE_RACE_PROFILES:
+        if name not in ranked:
+            ranked.append(name)
     return ranked, reasons
 
 
@@ -393,7 +419,7 @@ def apply_progress_routing(
         ),
     ):
         if backend == "vampire":
-            _boost(out, ["struct_induction", "struct_single"])
+            _boost(out, ["struct_induction", "struct_induction_tip"])
         else:
             _boost(out, ["controlled_conjecture", "cvc5_inductive_no_ematching"])
         reasons.append("progress:search_explosion")
@@ -944,9 +970,17 @@ def build_search_state(
     ranked, reasons = recommend_profiles(
         backend, features, hints, parent_profile=parent_profile
     )
-    top = select_top_profiles(ranked, utilities)
+    if backend == "vampire":
+        # Full fixed race (same arms as scheme short-prove); ranking is display-only.
+        top = select_top_profiles(ranked, utilities, k=len(VAMPIRE_RACE_PROFILES))
+        for name in VAMPIRE_RACE_PROFILES:
+            if name not in top:
+                top.append(name)
+        fallback: List[str] = []
+    else:
+        top = select_top_profiles(ranked, utilities)
+        fallback = fallback_profiles_for(backend)
     active = top[0] if top else None
-    fallback = fallback_profiles_for(backend)
     return GoalSearchState(
         backend=backend,
         theory_features=features.to_dict(),

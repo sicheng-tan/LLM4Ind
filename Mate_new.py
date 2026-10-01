@@ -2873,8 +2873,12 @@ def quick_run(
     scheme_session = None
     if induction_scheme_enabled():
         try:
-            from induction_scheme.mate_glue import maybe_start_scheme_session
+            from induction_scheme.mate_glue import (
+                maybe_start_scheme_session,
+                scheme_prove_kwargs_for_backend,
+            )
 
+            _scheme_prove = scheme_prove_kwargs_for_backend("cvc5")
             scheme_session = maybe_start_scheme_session(
                 failed_data=failed_data,
                 smt_content=solver_content,
@@ -2885,6 +2889,7 @@ def quick_run(
                 current_goal=original_forall,
                 nest_budget=scheme_nest_budget,
                 scheme_only=False,
+                **_scheme_prove,
             )
         except Exception as exc:
             logging.warning("INDUCTION_SCHEME start failed: %s", exc)
@@ -3482,7 +3487,12 @@ def _prove_run_body(
         ):
             return _done(True, "direct_prove")
         try:
-            from induction_scheme.mate_glue import run_scheme_only_node
+            from induction_scheme.mate_glue import (
+                run_scheme_only_node,
+                scheme_prove_kwargs_for_backend,
+            )
+
+            _scheme_prove = scheme_prove_kwargs_for_backend("cvc5")
 
             solver_content = solver_smt_content(
                 goal_smt_file.read_text(encoding="utf-8"),
@@ -3522,6 +3532,7 @@ def _prove_run_body(
                     base_path, base_name, **kw
                 ),
                 child_prove_fn=_child_prove,
+                **_scheme_prove,
             )
             return _done(ok, "scheme" if ok else "scheme_fail")
         except Exception as exc:
@@ -3702,9 +3713,12 @@ def _prove_run_body(
             if induction_scheme_enabled():
                 try:
                     from induction_scheme.mate_glue import (
+                        scheme_prove_kwargs_for_backend,
                         try_scheme_close_after_attempt,
                         try_scheme_nest_after_attempt,
                     )
+
+                    _scheme_prove = scheme_prove_kwargs_for_backend("cvc5")
 
                     if try_scheme_close_after_attempt(
                         load_failed=lambda: load_failed_lemmas(base_path, base_name),
@@ -3757,6 +3771,7 @@ def _prove_run_body(
                             set_outcome=lambda **kw: _set_node_outcome(
                                 base_path, base_name, **kw
                             ),
+                            **_scheme_prove,
                         ):
                             return _done(True, "scheme_nest")
                 except Exception as exc:
@@ -3863,8 +3878,13 @@ def _prove_run_body(
     # InductionScheme frontier backup: only prove, no nest/LLM.
     if induction_scheme_enabled():
         try:
-            from induction_scheme.mate_glue import try_frontier_backup_at_node_end
+            from induction_scheme.mate_glue import (
+                scheme_prove_kwargs_for_backend,
+                try_frontier_backup_at_node_end,
+            )
             from induction_scheme.ledger import latest_scheme_attempt
+
+            _scheme_prove = scheme_prove_kwargs_for_backend("cvc5")
 
             def _had_success_child() -> bool:
                 data = load_failed_lemmas(base_path, base_name)
@@ -3893,6 +3913,7 @@ def _prove_run_body(
                 ),
                 base_path=base_path,
                 depth=depth,
+                **_scheme_prove,
             ):
                 return _done(True, "scheme_frontier")
             # Library may have grown from scheme harvest; try root finish next.

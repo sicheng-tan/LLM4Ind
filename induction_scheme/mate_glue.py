@@ -36,6 +36,31 @@ from .types import SchemeRoundResult
 ProveFn = Callable[[Path, int, Sequence[str]], object]
 
 
+def scheme_prove_kwargs_for_backend(backend: str) -> dict:
+    """Prove fn + ~4 profiles for scheme short-prove / gate / frontier.
+
+    Backend must match usefulness (cvc5 Mate → CVC portfolio; Vampire Mate →
+    Vampire race). cross_sort nest already limits same-sort children, so a
+    4-way profile race is the intended short-prove budget.
+    """
+    name = (backend or "cvc5").strip().lower()
+    if name in ("vampire", "vamp"):
+        from .constants import VAMPIRE_PROVE_PROFILES
+        from .prove import default_vampire_prove
+
+        return {
+            "prove_fn": default_vampire_prove,
+            "profiles": list(VAMPIRE_PROVE_PROFILES),
+        }
+    from .constants import PROVE_PROFILES
+    from .prove import default_cvc_prove
+
+    return {
+        "prove_fn": default_cvc_prove,
+        "profiles": list(PROVE_PROFILES),
+    }
+
+
 def maybe_start_scheme_session(
     *,
     failed_data: dict,
@@ -48,6 +73,7 @@ def maybe_start_scheme_session(
     nest_budget: int = NEST,
     scheme_only: bool = False,
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
 ) -> Optional[SchemeSession]:
     if not should_run_induction_scheme(failed_data, scheme_only=scheme_only):
         return None
@@ -62,6 +88,7 @@ def maybe_start_scheme_session(
         max_depth=max_depth,
         current_goal=current_goal,
         prove_fn=prove_fn,
+        profiles=profiles,
     )
 
 
@@ -160,6 +187,8 @@ def try_scheme_nest_after_attempt(
     max_depth: int,
     child_prove_fn: Callable[..., bool],
     set_outcome,
+    prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
 ) -> bool:
     """Run NEST scheme-only children if dispatch says so. Close parent on full success."""
     data = load_failed()
@@ -215,6 +244,8 @@ def try_scheme_nest_after_attempt(
                         smt_content=parent_smt_content,
                         work_dir=work_dir,
                         goal_name=parent_goal,
+                        prove_fn=prove_fn,
+                        profiles=profiles,
                         enabled=True,
                     )
             except Exception as exc:
@@ -253,6 +284,7 @@ def try_frontier_backup_at_node_end(
     had_success_child: bool,
     set_outcome,
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
     base_path: Optional[str] = None,
     depth: int = 0,
 ) -> bool:
@@ -269,6 +301,7 @@ def try_frontier_backup_at_node_end(
         goal_name=goal_name,
         had_success_child=had_success_child,
         prove_fn=prove_fn,
+        profiles=profiles,
     )
     bp = base_path or str(work_dir)
     harvest_scheme_proved_to_library(att, bp, depth=depth)
@@ -297,6 +330,7 @@ def run_scheme_only_node(
     set_outcome,
     child_prove_fn: Callable[..., bool],
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
 ) -> bool:
     """Scheme-only child: generate+prove, optional further nest, no LLM.
 
@@ -312,6 +346,7 @@ def run_scheme_only_node(
         max_depth=max_depth,
         current_goal=current_goal,
         prove_fn=prove_fn,
+        profiles=profiles,
         do_prove=True,
     )
     data = load_failed()
@@ -353,6 +388,8 @@ def run_scheme_only_node(
         max_depth=max_depth,
         child_prove_fn=child_prove_fn,
         set_outcome=set_outcome,
+        prove_fn=prove_fn,
+        profiles=profiles,
     ):
         return True
 

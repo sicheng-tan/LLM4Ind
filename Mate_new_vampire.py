@@ -15,9 +15,11 @@ from vampire_runner import (
     run_vampire,
     run_vampire_diagnostic,
     run_vampire_probe,
+    run_vampire_race,
     run_vampire_routed,
     compute_progress_score,
     derive_repair_hints,
+    extract_vampire_error_message,
     vampire_diagnostic_profile,
     VampireResult,
 )
@@ -71,7 +73,7 @@ from obligation_tree import (
     obligation_tree_enabled,
     root_finish_prove_timeout_s,
     solver_smt_content,
-    HARVEST_CVC_PROFILES,
+    HARVEST_VAMPIRE_PROFILES,
     HARVEST_DISPATCH_KEY,
     local_lemma_harvest_enabled,
     harvest_retry_timeout_s,
@@ -785,6 +787,7 @@ def _compact_vampire_diag(result: VampireResult) -> dict:
         "induction_formulas": list(result.induction_formulas or []),
         "induction_schemas": list(result.induction_schemas or []),
         "induction_obligations": list(result.induction_obligations or []),
+        "portfolio_results": dict(result.portfolio_results or {}),
     }
 
 
@@ -804,6 +807,7 @@ def _vampire_diag_from_compact(data: Optional[dict]) -> Optional[VampireResult]:
             if isinstance(item, dict)
         ],
         induction_obligations=list(data.get("induction_obligations") or []),
+        portfolio_results=dict(data.get("portfolio_results") or {}),
     )
 
 
@@ -817,6 +821,13 @@ def _store_cached_diag(base_path: str, goal_name: str, key: str, result: Vampire
     save_failed_lemmas(base_path, goal_name, failed_data)
 
 
+def _compact_harvest_diag(result: Any) -> Optional[dict]:
+    """JSON-safe harvest A⊢cᵢ dump for a skipped child initial prove."""
+    if not isinstance(result, VampireResult) or result.proved:
+        return None
+    return _compact_vampire_diag(result)
+
+
 def _record_failed_prove_diagnostics(
     base_path: str,
     goal_name: str,
@@ -824,11 +835,31 @@ def _record_failed_prove_diagnostics(
     *,
     context: str = "initial_goal",
 ) -> None:
-    """Cache first-prove stats/induction as baseline; do not overwrite later runs."""
-    if result.proved:
+    """Cache a failed goal-only prove as this node's progress/repair baseline."""
+    _set_goal_only_baseline(
+        base_path, goal_name, result, context=context, replace=False,
+    )
+
+
+def _set_goal_only_baseline(
+    base_path: str,
+    goal_name: str,
+    result: Optional[VampireResult],
+    *,
+    context: str,
+    replace: bool = False,
+) -> None:
+    """Store A ∪ Lib ⊢ G (no current C). Refresh when the library changed.
+
+    Do not use a usefulness mix as baseline: that run already contains candidate
+    lemmas, so progress signals would compare C_new against C_old.
+    """
+    if result is None or result.proved:
         return
-    if _load_cached_diag(base_path, goal_name, "baseline_diag") is None:
-        _store_cached_diag(base_path, goal_name, "baseline_diag", result)
+    existing = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    if existing is not None and not replace:
+        return
+    _store_cached_diag(base_path, goal_name, "baseline_diag", result)
     add_repair_hints(
         base_path, goal_name, derive_repair_hints(result, context=context),
     )
@@ -1607,17 +1638,38 @@ def perform_initial_verification(
         logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
         return True
 
-    if log_event == "initial_prove" and base_path and goal_name:
-        _record_failed_prove_diagnostics(base_path, goal_name, result)
-        logging.error(
-            "Vampire验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
-            result.status, result.elapsed, result.strategy,
-        )
-    else:
-        logging.info(
-            "再证当前目标未通过 (status=%s elapsed=%.2fs)",
-            result.status, result.elapsed,
-        )
+    if base_path and goal_name:
+        if log_event == "initial_prove":
+            _set_goal_only_baseline(
+                base_path, goal_name, result, context="initial_goal", replace=False,
+            )
+            logging.error(
+                "Vampire验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
+                result.status, result.elapsed, result.strategy,
+            )
+        elif log_event == "harvest_retry":
+            _set_goal_only_baseline(
+                base_path, goal_name, result,
+                context="harvest_retry", replace=True,
+            )
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                result.status, result.elapsed,
+            )
+        elif log_event == "root_finish_prove":
+            _set_goal_only_baseline(
+                base_path, goal_name, result,
+                context="root_finish_prove", replace=True,
+            )
+            logging.info(
+                "根节点收尾再证未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                result.status, result.elapsed,
+            )
+        else:
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)",
+                result.status, result.elapsed,
+            )
     return False
 
 
@@ -1700,7 +1752,7 @@ def seed_baseline_repair_hints(
         history = []
         reference_name = next(
             (
-                name for name in ("induction_portfolio", "smtcomp", "struct_induction")
+                name for name in ("induction_portfolio", "struct_induction", "struct_induction_tip")
                 if name in probes
             ),
             next(iter(probes), None),
@@ -2328,12 +2380,16 @@ def validate_lemmas_parallel(
                             f"contradicts axioms (vampire={result.status})",
                         )
                 elif result.status == "error":
-                    logging.error(f"引理检查出错: {valid_path.name}: {result.error}")
+                    err = (result.error or "").strip() or extract_vampire_error_message(
+                        getattr(result, "stdout", "") or "",
+                        getattr(result, "stderr", "") or "",
+                    ) or "unknown"
+                    logging.error(f"引理检查出错: {valid_path.name}: {err}")
                     bad.add(valid_path)
                     if lemma_content:
                         add_soft_rejected_lemma(
                             base_path, goal_name, lemma_content,
-                            f"vampire error: {result.error}",
+                            f"vampire error: {err}",
                             gate="solver_error",
                         )
                 else:
@@ -2396,7 +2452,15 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
 
 
 def _harvest_direct_prove(smt_path: Path, base_path: str):
-    result = run_vampire(smt_path, config["DEFAULT_CVC_TIMEOUT"], collect_stats=True)
+    """Direct-prove A⊢cᵢ with the same 4-schedule race as usefulness / node prove."""
+    result = run_vampire_race(
+        smt_path,
+        config["DEFAULT_CVC_TIMEOUT"],
+        list(HARVEST_VAMPIRE_PROFILES),
+        collect_stats=True,
+        collect_ucore=False,
+        show_induction=True,
+    )
     add_solver_time(base_path, result.elapsed)
     log_exp(
         "direct_prove",
@@ -2451,6 +2515,7 @@ def _finish_usefulness_unsat(
     )
     slot_by_index = {slot.index: slot for slot in slots}
     skip_initial: List[str] = []
+    skip_initial_diag: Dict[str, dict] = {}
     pre_proved: Dict[str, dict] = {}
     recurse: List[str] = []
     order: List[str] = []
@@ -2469,12 +2534,16 @@ def _finish_usefulness_unsat(
         elif kind == "exhausted":
             recurse.append(name)
             skip_initial.append(name)
+            compact = _compact_harvest_diag(getattr(slot, "result", None) if slot else None)
+            if compact:
+                skip_initial_diag[name] = compact
         else:
             recurse.append(name)
     _store_harvest_dispatch(base_path, goal_smt_name, {
         "order": order,
         "pre_proved": pre_proved,
         "skip_initial": skip_initial,
+        "skip_initial_diag": skip_initial_diag,
     })
     logging.info(
         "lemmas有用，保留 %d/%d 条用于子目标生成 (direct_proved=%d recurse=%d)",
@@ -2578,12 +2647,16 @@ def quick_run(
         save_routing_state(base_path, goal_smt_name, state)
 
     # InductionScheme: overlap short prove with this attempt's LLM/usefulness.
-    # Short-prove still uses CVC profiles (cvc5_inductive + cvc4_default).
+    # Short-prove races the same Vampire schedules as usefulness / node prove.
     scheme_session = None
     if induction_scheme_enabled():
         try:
-            from induction_scheme.mate_glue import maybe_start_scheme_session
+            from induction_scheme.mate_glue import (
+                maybe_start_scheme_session,
+                scheme_prove_kwargs_for_backend,
+            )
 
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
             scheme_session = maybe_start_scheme_session(
                 failed_data=failed_data,
                 smt_content=solver_content,
@@ -2594,6 +2667,7 @@ def quick_run(
                 current_goal=original_forall,
                 nest_budget=scheme_nest_budget,
                 scheme_only=False,
+                **_scheme_prove,
             )
         except Exception as exc:
             logging.warning("INDUCTION_SCHEME start failed: %s", exc)
@@ -2814,7 +2888,7 @@ def quick_run(
         goal=goal_smt_name,
         delay_s=usefulness_harvest_delay_s(),
         enabled=harvest_on,
-        profiles=("induction_portfolio",),
+        profiles=HARVEST_VAMPIRE_PROFILES,
     )
     if useful:
         _scheme_fin(True)
@@ -2860,6 +2934,7 @@ def prove_subgoals_parallel(
     parent_goal_name: str = None,
     attempt: int = 0,
     skip_initial_for: Optional[Set[str]] = None,
+    skip_initial_diag: Optional[Dict[str, dict]] = None,
     *,
     ancestor_stack: AncestorStack = (),
     parent_formula: Optional[str] = None,
@@ -2871,6 +2946,7 @@ def prove_subgoals_parallel(
     logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
     parent_lemmas = parent_lemmas or []
     skip_initial_for = skip_initial_for or set()
+    skip_initial_diag = skip_initial_diag or {}
     snapshots: Dict[str, dict] = {}
     formula = parent_formula
     if formula is None and parent_goal_name:
@@ -2941,6 +3017,7 @@ def prove_subgoals_parallel(
                 baseline_only,
                 parent_goal_name,
                 skip_initial=subgoal in skip_initial_for,
+                skip_initial_diag=skip_initial_diag.get(subgoal),
                 ancestor_stack=child_stack,
             ): subgoal
             for subgoal in subgoals
@@ -3063,6 +3140,7 @@ def prove_run(
     skip_initial: bool = False,
     ancestor_stack: AncestorStack = (),
     *,
+    skip_initial_diag: Optional[dict] = None,
     scheme_only: bool = False,
     scheme_nest_budget: int = 1,
 ) -> bool:
@@ -3079,6 +3157,7 @@ def prove_run(
             base_path, base_name, depth, strategy_mode, baseline_only,
             parent_goal_name, skip_initial, _done,
             ancestor_stack=ancestor_stack or empty_ancestor_stack(),
+            skip_initial_diag=skip_initial_diag,
             scheme_only=scheme_only,
             scheme_nest_budget=scheme_nest_budget,
         )
@@ -3108,6 +3187,7 @@ def _prove_run_body(
     _done,
     *,
     ancestor_stack: AncestorStack = (),
+    skip_initial_diag: Optional[dict] = None,
     scheme_only: bool = False,
     scheme_nest_budget: int = 1,
 ) -> bool:
@@ -3157,7 +3237,7 @@ def _prove_run_body(
             base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
         )
 
-    # Scheme-only NEST children: no LLM. Short-prove uses CVC profiles.
+    # Scheme-only NEST children: no LLM. Short-prove uses Vampire profiles.
     if scheme_only and induction_scheme_enabled():
         if skip_initial:
             log_exp("skip_initial_prove", goal=base_name, because="scheme_nest")
@@ -3166,12 +3246,16 @@ def _prove_run_body(
         ):
             return _done(True, "direct_prove")
         try:
-            from induction_scheme.mate_glue import run_scheme_only_node
+            from induction_scheme.mate_glue import (
+                run_scheme_only_node,
+                scheme_prove_kwargs_for_backend,
+            )
 
             solver_content = solver_smt_content(
                 goal_smt_file.read_text(encoding="utf-8"),
                 base_path,
             )
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
 
             def _child_prove(
                 child_name, *, depth, nest_budget, skip_initial, scheme_only, mode,
@@ -3204,6 +3288,7 @@ def _prove_run_body(
                     base_path, base_name, **kw
                 ),
                 child_prove_fn=_child_prove,
+                **_scheme_prove,
             )
             return _done(ok, "scheme" if ok else "scheme_fail")
         except Exception as exc:
@@ -3213,6 +3298,13 @@ def _prove_run_body(
     # 执行初始验证检查
     if skip_initial:
         log_exp("skip_initial_prove", goal=base_name, because="harvest_exhausted")
+        harvested = skip_initial_diag
+        if not isinstance(harvested, VampireResult):
+            harvested = _vampire_diag_from_compact(harvested)
+        _set_goal_only_baseline(
+            base_path, base_name, harvested,
+            context="harvest_exhausted", replace=False,
+        )
     elif perform_initial_verification(
         goal_smt_file, base_path=base_path, goal_name=base_name
     ):
@@ -3377,10 +3469,12 @@ def _prove_run_body(
             if induction_scheme_enabled():
                 try:
                     from induction_scheme.mate_glue import (
+                        scheme_prove_kwargs_for_backend,
                         try_scheme_close_after_attempt,
                         try_scheme_nest_after_attempt,
                     )
 
+                    _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
                     if try_scheme_close_after_attempt(
                         load_failed=lambda: load_failed_lemmas(base_path, base_name),
                         save_failed=lambda d: save_failed_lemmas(
@@ -3430,6 +3524,7 @@ def _prove_run_body(
                             set_outcome=lambda **kw: _set_node_outcome(
                                 base_path, base_name, **kw
                             ),
+                            **_scheme_prove,
                         ):
                             return _done(True, "scheme_nest")
                 except Exception as exc:
@@ -3444,6 +3539,7 @@ def _prove_run_body(
                 pre_proved = dispatch.get("pre_proved") or {}
                 order = list(dispatch.get("order") or new_subgoals)
                 skip_for = set(dispatch.get("skip_initial") or [])
+                skip_diag = dispatch.get("skip_initial_diag") or {}
 
                 # 成功证明的情况，没有subgoal了
                 if not new_subgoals:
@@ -3463,6 +3559,7 @@ def _prove_run_body(
                     base_path, new_subgoals, depth, strategy_mode, baseline_only,
                     current_lemmas, base_name, attempt=attempt + 1,
                     skip_initial_for=skip_for,
+                    skip_initial_diag=skip_diag,
                     ancestor_stack=ancestor_stack,
                     parent_formula=current_formula,
                 )
@@ -3530,7 +3627,10 @@ def _prove_run_body(
     # InductionScheme frontier backup: only prove, no nest/LLM.
     if induction_scheme_enabled():
         try:
-            from induction_scheme.mate_glue import try_frontier_backup_at_node_end
+            from induction_scheme.mate_glue import (
+                scheme_prove_kwargs_for_backend,
+                try_frontier_backup_at_node_end,
+            )
             from induction_scheme.ledger import latest_scheme_attempt
 
             def _had_success_child() -> bool:
@@ -3547,6 +3647,7 @@ def _prove_run_body(
                 goal_smt_file.read_text(encoding="utf-8"),
                 base_path,
             )
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
             if try_frontier_backup_at_node_end(
                 load_failed=lambda: load_failed_lemmas(base_path, base_name),
                 save_failed=lambda d: save_failed_lemmas(base_path, base_name, d),
@@ -3559,6 +3660,7 @@ def _prove_run_body(
                 ),
                 base_path=base_path,
                 depth=depth,
+                **_scheme_prove,
             ):
                 return _done(True, "scheme_frontier")
         except Exception as exc:

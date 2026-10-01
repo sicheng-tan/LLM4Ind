@@ -22,6 +22,7 @@ from .constants import (
     PROVE_TIMEOUT_S,
     SCHEME_ATTEMPTS_KEY,
     SCHEME_PROVE_MAX_OBLS,
+    VAMPIRE_PROVE_PROFILES,
 )
 from .dispatch import (
     SchemeSession,
@@ -54,7 +55,14 @@ from .ledger import (
     save_scheme_attempt,
     scheme_formulas_for_usefulness,
 )
-from .prove import prove_goal_gate, prove_obligations, write_goal_gate_smt
+from .prove import (
+    default_cvc_prove,
+    default_vampire_prove,
+    prove_goal_gate,
+    prove_obligations,
+    write_goal_gate_smt,
+)
+from .mate_glue import scheme_prove_kwargs_for_backend
 from .types import SchemeAttempt, SchemeObligation, SchemeRoundResult
 
 __all__ = [
@@ -67,12 +75,15 @@ __all__ = [
     "PROVE_TIMEOUT_S",
     "SCHEME_ATTEMPTS_KEY",
     "SCHEME_PROVE_MAX_OBLS",
+    "VAMPIRE_PROVE_PROFILES",
     "SchemeAttempt",
     "SchemeObligation",
     "SchemeRoundResult",
     "SchemeSession",
     "can_afford_nest",
     "consume_pending_scheme_close",
+    "default_cvc_prove",
+    "default_vampire_prove",
     "finalize_after_attempt",
     "format_scheme_prompt_block",
     "filter_library_excluding_current_scheme",
@@ -96,6 +107,7 @@ __all__ = [
     "save_scheme_attempt",
     "scheme_formulas_for_usefulness",
     "scheme_prompt_formulas",
+    "scheme_prove_kwargs_for_backend",
     "select_induct_var",
     "select_induct_var_for_measure",
     "select_measure_fun",

@@ -10,7 +10,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from lemma_harvest import write_negated_lemma_smt
 
-from .constants import GOAL_GATE_TIMEOUT_S, PROVE_PROFILES, PROVE_TIMEOUT_S, SCHEME_PROVE_MAX_OBLS
+from .constants import (
+    GOAL_GATE_TIMEOUT_S,
+    PROVE_PROFILES,
+    PROVE_TIMEOUT_S,
+    SCHEME_PROVE_MAX_OBLS,
+    VAMPIRE_PROVE_PROFILES,
+)
 from .types import SchemeAttempt, SchemeObligation
 
 ProveFn = Callable[[Path, int, Sequence[str]], object]
@@ -19,14 +25,31 @@ ProveFn = Callable[[Path, int, Sequence[str]], object]
 def default_cvc_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
     from cvc5_runner import run_cvc
 
+    names = list(profiles) if profiles else list(PROVE_PROFILES)
     return run_cvc(
         smt_path,
         timeout,
-        profiles=list(profiles),
+        profiles=names,
         collect_stats=False,
         collect_difficulty=False,
     )
 
+
+def default_vampire_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
+    """Race Vampire scheme profiles (same backend as usefulness on Vampire Mate)."""
+    from vampire_runner import VAMPIRE_PROFILES, run_vampire_race
+
+    names = [p for p in (profiles or ()) if p in VAMPIRE_PROFILES]
+    if not names:
+        names = list(VAMPIRE_PROVE_PROFILES)
+    return run_vampire_race(
+        smt_path,
+        timeout,
+        names,
+        collect_stats=False,
+        collect_ucore=False,
+        show_induction=False,
+    )
 
 def _smt_with_measure_prelude(smt_content: str, attempt: SchemeAttempt) -> str:
     prelude = (attempt.measure_prelude or "").strip()

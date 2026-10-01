@@ -36,6 +36,14 @@ GUIDANCE_HINT_KINDS = (
 )
 
 HARVEST_CVC_PROFILES = ("cvc5_inductive", "cvc4_default")
+# Vampire schedules specialize by theory; race the same arms as usefulness /
+# node prove / scheme short-prove (see solver_routing.VAMPIRE_RACE_PROFILES).
+HARVEST_VAMPIRE_PROFILES = (
+    "struct_induction",
+    "struct_induction_tip",
+    "integer_induction",
+    "induction_portfolio",
+)
 HARVEST_DISPATCH_KEY = "harvest_dispatch"
 MAX_FORMULA_CHARS = 200
 MAX_FOCUS_CHARS = 80

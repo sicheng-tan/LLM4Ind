@@ -5,21 +5,12 @@ import os
 import re
 import signal
 import tempfile
-import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
-from solver_routing import (
-    VAMPIRE_FALLBACK_PROFILE,
-    GoalSearchState,
-    fallback_enabled,
-    fallback_fraction,
-    fallback_min_timeout,
-    profile_utility_from_stats,
-    routing_enabled,
-)
+from solver_routing import GoalSearchState, VAMPIRE_RACE_PROFILES
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
     INDUCTION_SHARE_MAX,
@@ -130,6 +121,7 @@ class VampireResult:
 # Named theory profiles. The paper default is induction_portfolio.
 # alasca_arith approximates ALASCA-style arithmetic superposition on this
 # Vampire binary (UWA + theory instantiation + arithmetic generalization).
+# Prove race arms: ``VAMPIRE_RACE_PROFILES`` (imported from solver_routing).
 VAMPIRE_PROFILES: Dict[str, dict] = {
     "induction_portfolio": {
         "kind": "portfolio",
@@ -171,6 +163,18 @@ VAMPIRE_PROFILES: Dict[str, dict] = {
         ],
         "diag": "struct_single",
         "label": "single-strategy structural induction",
+    },
+    "struct_nui": {
+        "kind": "vampire",
+        "extra": [
+            "--induction", "struct",
+            "--induction_gen", "on",
+            "--induction_on_complex_terms", "on",
+            "--non_unit_induction", "on",
+            "--avatar", "off",
+        ],
+        "diag": "struct_single",
+        "label": "structural induction with non-unit clauses",
     },
     "int_single": {
         "kind": "vampire",
@@ -283,6 +287,34 @@ def run_vampire(
                 pass
 
 
+def run_vampire_race(
+    smt2_path,
+    timeout: int,
+    profiles: List[str],
+    *,
+    collect_stats: bool = False,
+    collect_ucore: bool = False,
+    show_induction: bool = False,
+) -> VampireResult:
+    """Race several Vampire profiles (first unsat wins).
+
+    Used by scheme short-prove and by usefulness / node-goal prove (via
+    ``run_vampire_routed``). Empty / unknown names fall back to
+    ``VAMPIRE_RACE_PROFILES``.
+    """
+    names = [p for p in profiles if p in VAMPIRE_PROFILES]
+    if not names:
+        names = list(VAMPIRE_RACE_PROFILES)
+    return _run_vampire_parallel(
+        smt2_path,
+        timeout,
+        names,
+        collect_stats=collect_stats,
+        collect_ucore=collect_ucore,
+        show_induction=show_induction,
+    )
+
+
 def vampire_diagnostic_profile(profile: Optional[str]) -> str:
     """Single-strategy name used for 3s sidecar (portfolio names map via spec['diag'])."""
     spec = VAMPIRE_PROFILES.get(profile or "struct_single", VAMPIRE_PROFILES["struct_single"])
@@ -359,66 +391,21 @@ def run_vampire_routed(
     collect_ucore: bool = False,
     show_induction: bool = False,
 ) -> VampireResult:
+    """Prove with the fixed 4-schedule race (same arms as scheme short-prove).
+
+    ``state`` is kept for API compatibility / Mate telemetry, but candidate
+    top-k and paper-fallback waves are not used: usefulness, node-goal prove,
+    and scheme short-prove all race ``VAMPIRE_RACE_PROFILES``.
     """
-    Prove with recommended profiles first, then the paper induction portfolio.
-
-    When routing is disabled, this is identical to run_vampire(...).
-    """
-    if not routing_enabled() or state is None or not state.candidate_profiles:
-        return run_vampire(
-            smt2_path,
-            timeout,
-            collect_stats=collect_stats,
-            collect_ucore=collect_ucore,
-            show_induction=show_induction,
-        )
-
-    summaries: Dict[str, dict] = {}
-    start = time.time()
-
-    primary = [p for p in state.candidate_profiles if p in VAMPIRE_PROFILES]
-    fallback = [
-        p for p in (state.fallback_profiles or [VAMPIRE_FALLBACK_PROFILE])
-        if p in VAMPIRE_PROFILES and p not in primary
-    ]
-    reserve = 0
-    if fallback_enabled() and fallback:
-        reserve = max(fallback_min_timeout(), int(timeout * fallback_fraction()))
-        reserve = min(reserve, max(0, timeout - 1))
-    primary_timeout = max(1, timeout - reserve)
-    result = _run_vampire_parallel(
+    del state  # routing picks prompts/diagnostics; prove arms are fixed
+    return run_vampire_race(
         smt2_path,
-        primary_timeout,
-        primary,
+        timeout,
+        list(VAMPIRE_RACE_PROFILES),
         collect_stats=collect_stats,
         collect_ucore=collect_ucore,
         show_induction=show_induction,
     )
-    summaries.update(result.portfolio_results)
-    if result.proved:
-        result.portfolio_results = summaries
-        return result
-
-    remaining = timeout - (time.time() - start)
-    if fallback_enabled() and fallback and remaining >= 0.5:
-        fb = _run_vampire_parallel(
-            smt2_path,
-            max(1, min(timeout, math.ceil(remaining))),
-            fallback,
-            collect_stats=collect_stats,
-            collect_ucore=collect_ucore,
-            show_induction=show_induction,
-        )
-        summaries.update(fb.portfolio_results)
-        if fb.proved:
-            fb.portfolio_results = summaries
-            return fb
-        result = fb
-        result.portfolio_results = summaries
-        return result
-
-    result.portfolio_results = summaries
-    return result
 
 
 def _vampire_command(
@@ -499,6 +486,8 @@ def _vampire_result_from_output(
         result.stdout, result.stderr, returncode, timed_out
     )
     result.proved = result.status == "unsat"
+    if result.status == "error" and not result.error:
+        result.error = extract_vampire_error_message(result.stdout, result.stderr)
     result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
     _apply_induction_trace(
         result, parse_induction_trace_rich(result.stdout + "\n" + result.stderr)
@@ -1060,6 +1049,28 @@ def classify_status(stdout: str, stderr: str, returncode: int, timed_out: bool) 
     return "unknown"
 
 
+def extract_vampire_error_message(stdout: str, stderr: str) -> Optional[str]:
+    """Human-readable Vampire failure text for soft-reject / telemetry reasons.
+
+    Prefer ``User error:`` blocks (parse/type); fall back to ``Error:`` / SZS.
+    Not used for sat/unsat classification — that is ``classify_status``.
+    """
+    text = (stdout or "") + "\n" + (stderr or "")
+    m = re.search(
+        r"(?is)User error:\s*(.*?)(?=\nUser error:|\n% |\Z)",
+        text,
+    )
+    if m:
+        body = re.sub(r"\s+", " ", m.group(0)).strip()
+        return body[:500] if body else None
+    m = re.search(r"(?im)^Error:\s*.+$", text)
+    if m:
+        return m.group(0).strip()[:500]
+    if re.search(r"(?i)szs status error", text):
+        return "SZS status Error"
+    return None
+
+
 def _vampire_stat_rate(
     stats: Dict[str, int],
     elapsed: float,
@@ -1503,6 +1514,8 @@ def _execute_vampire(
             result.stdout, result.stderr, proc.returncode if proc.returncode is not None else -1, timed_out
         )
         result.proved = result.status == "unsat"
+        if result.status == "error" and not result.error:
+            result.error = extract_vampire_error_message(result.stdout, result.stderr)
         result.stats = parse_vampire_stats(result.stdout + "\n" + result.stderr)
         _apply_induction_trace(
             result, parse_induction_trace_rich(result.stdout + "\n" + result.stderr)

@@ -74,6 +74,7 @@ def run_scheme_round(
     max_depth: int = 3,
     current_goal: Optional[str] = None,
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
     do_prove: bool = True,
 ) -> SchemeRoundResult:
     """Generate + validate + optional short prove. Does not nest or close parent.
@@ -89,6 +90,9 @@ def run_scheme_round(
 
     mode_l = (mode or "structural").strip().lower()
     work_dir = Path(work_dir)
+    prove_profiles: Sequence[str] = (
+        list(profiles) if profiles is not None else list(PROVE_PROFILES)
+    )
 
     if mode_l == "both":
         candidates = generate_scheme_candidates(
@@ -155,7 +159,7 @@ def run_scheme_round(
                 goal_name=goal_name,
                 prove_fn=prove_fn,
                 timeout_s=GOAL_GATE_TIMEOUT_S,
-                profiles=PROVE_PROFILES,
+                profiles=prove_profiles,
                 enabled=True,
             )
             log_exp(
@@ -194,7 +198,7 @@ def run_scheme_round(
             goal_name=goal_name,
             prove_fn=prove_fn,
             timeout_s=PROVE_TIMEOUT_S,
-            profiles=PROVE_PROFILES,
+            profiles=prove_profiles,
         )
         viable.append(attempt)
         log_exp(
@@ -378,6 +382,7 @@ def start_scheme_session(
     max_depth: int = 3,
     current_goal: Optional[str] = None,
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
 ) -> SchemeSession:
     session = SchemeSession()
 
@@ -392,6 +397,7 @@ def start_scheme_session(
             max_depth=max_depth,
             current_goal=current_goal,
             prove_fn=prove_fn,
+            profiles=profiles,
             do_prove=True,
         )
 
@@ -507,6 +513,7 @@ def frontier_backup_prove(
     goal_name: str,
     had_success_child: bool,
     prove_fn: Optional[ProveFn] = None,
+    profiles: Optional[Sequence[str]] = None,
 ) -> bool:
     """Node-end: if ≥1 success child, short-reprove open frontier once.
 
@@ -531,6 +538,9 @@ def frontier_backup_prove(
     for o in frontier:
         if o.status not in ("proved", "invalid"):
             o.status = "open"
+    prove_profiles: Sequence[str] = (
+        list(profiles) if profiles is not None else list(PROVE_PROFILES)
+    )
     prove_obligations(
         attempt,
         smt_content=smt_content,
@@ -538,6 +548,7 @@ def frontier_backup_prove(
         goal_name=goal_name,
         prove_fn=prove_fn,
         only=ids,
+        profiles=prove_profiles,
     )
     if all(o.status == "proved" for o in attempt.obligations if o.obl_id in ids):
         for o in attempt.obligations:
@@ -553,6 +564,7 @@ def frontier_backup_prove(
                         work_dir=Path(work_dir),
                         goal_name=goal_name,
                         prove_fn=prove_fn,
+                        profiles=prove_profiles,
                         enabled=True,
                     )
             except Exception as exc:

@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from solver_routing import (
     GoalSearchState,
+    VAMPIRE_RACE_PROFILES,
     apply_progress_routing,
     build_search_state,
     collect_feedback_signal_kinds,
@@ -68,18 +69,20 @@ def test_vampire_static_routing() -> None:
     adt = analyze_smt("(set-logic UFDT)\n(declare-datatypes ((nat 0)) (((zero) (s (s0 nat)))))")
     ranked, reasons = recommend_vampire_profiles(adt)
     _ok(ranked[0] == "struct_induction", f"ADT first profile: {ranked}")
-    _ok("induction_portfolio" in ranked, "paper fallback must remain")
+    _ok(set(ranked) == set(VAMPIRE_RACE_PROFILES), f"race set only: {ranked}")
     _ok(any("static:adt" in r for r in reasons), reasons)
 
     mixed = analyze_smt("(set-logic UFDTLIA)\n(declare-datatypes ((Lst 0)) (((nil))))\n(declare-fun f (Int) Int)")
     ranked_m, _ = recommend_vampire_profiles(mixed)
-    _ok(ranked_m[0] in ("induction_portfolio", "smtcomp", "alasca_arith"), ranked_m)
+    _ok(ranked_m[0] == "induction_portfolio", ranked_m)
+    _ok(set(ranked_m) == set(VAMPIRE_RACE_PROFILES), ranked_m)
 
     ranked_h, reasons_h = recommend_vampire_profiles(
         mixed, [{"kind": "need_arithmetic_lemma"}]
     )
-    _ok(ranked_h[0] in ("alasca_arith", "integer_induction", "smtcomp"), ranked_h)
+    _ok(ranked_h[0] in ("integer_induction", "induction_portfolio"), ranked_h)
     _ok(any("need_arithmetic" in r for r in reasons_h), reasons_h)
+    _ok("smtcomp" not in ranked_h and "alasca_arith" not in ranked_h, ranked_h)
 
 
 def test_cvc5_static_and_hint_routing() -> None:
