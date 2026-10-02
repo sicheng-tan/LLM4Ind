@@ -15,7 +15,7 @@ import re
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 LIBRARY_FILENAME = "lemma_library.json"
@@ -391,6 +391,55 @@ def scheme_helpers_in_text(text: str) -> List[str]:
     return out
 
 
+_DECLARE_SCHEME_FUN_RE = re.compile(
+    r"\(declare-fun\s+(__scheme_[A-Za-z_][A-Za-z0-9_]*)\b"
+)
+
+
+def declared_scheme_helpers(smt: str) -> Set[str]:
+    """``__scheme_*`` names with an explicit ``declare-fun`` in *smt*."""
+    return set(_DECLARE_SCHEME_FUN_RE.findall(smt or ""))
+
+
+def undeclared_scheme_helpers(formula: str, smt: str) -> List[str]:
+    """Helpers used in *formula* that are not ``declare-fun``'d in *smt*."""
+    declared = declared_scheme_helpers(smt)
+    return [n for n in scheme_helpers_in_text(formula) if n not in declared]
+
+
+def merge_scheme_prelude_into_smt(smt_content: str, prelude: str) -> str:
+    """Insert scheme measure prelude before ``; proof goal`` when not already present.
+
+    Idempotent: if every ``declare-fun __scheme_*`` from *prelude* is already in
+    *smt_content*, returns *smt_content* unchanged. Upgrades ``set-logic`` when
+    the prelude introduces Int/Real (same as library inject).
+    """
+    prelude = str(prelude or "").strip()
+    if not prelude:
+        return smt_content
+    from_prelude = set(_DECLARE_SCHEME_FUN_RE.findall(prelude))
+    if from_prelude and from_prelude <= declared_scheme_helpers(smt_content):
+        return smt_content
+    # Old synth preludes used ``(nil)``; cvc5 needs bare ``nil``.
+    from smt_nullary_normalize import (
+        normalize_nullary_ctor_apps,
+        nullary_constructors_in_smt,
+    )
+    nullaries = nullary_constructors_in_smt(f"{smt_content}\n{prelude}")
+    prelude, _ = normalize_nullary_ctor_apps(prelude, nullaries)
+    base = upgrade_smt_logic_for_text(smt_content, prelude)
+    block = "; scheme measure prelude (active attempt)\n" + prelude
+    if re.search(r";\s*proof goal\b", base, flags=re.IGNORECASE):
+        return re.sub(
+            r";\s*proof goal\b",
+            block + "\n; proof goal",
+            base,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return block + "\n" + base
+
+
 def _prelude_declares(prelude: str, name: str) -> bool:
     if not prelude or not name:
         return False
@@ -447,6 +496,13 @@ def inject_library_axioms(
         return stripped
 
     prelude_block = collect_library_preludes(lemmas)
+    if prelude_block:
+        from smt_nullary_normalize import (
+            normalize_nullary_ctor_apps,
+            nullary_constructors_in_smt,
+        )
+        nullaries = nullary_constructors_in_smt(f"{stripped}\n{prelude_block}")
+        prelude_block, _ = normalize_nullary_ctor_apps(prelude_block, nullaries)
     declared = {
         name
         for name in scheme_helpers_in_text(prelude_block + "\n" + stripped)

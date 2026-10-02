@@ -68,6 +68,7 @@ from obligation_tree import (
     make_child_node,
     make_goal_tree,
     materialize_smt_with_library,
+    merge_scheme_prelude_into_smt,
     normalize_lemma_formula,
     obligation_tree_enabled,
     root_finish_prove_timeout_s,
@@ -2895,6 +2896,19 @@ def quick_run(
         except Exception as exc:
             logging.warning("INDUCTION_SCHEME start failed: %s", exc)
             scheme_session = None
+
+    # Attach last scheme μ prelude so LLM lemmas using __scheme_* parse under
+    # the same background as the scheme prompt (and validity / usefulness).
+    try:
+        from induction_scheme.ledger import latest_scheme_attempt
+
+        _att = latest_scheme_attempt(failed_data, goal_name=goal_smt_name)
+        if _att and (_att.measure_prelude or "").strip():
+            solver_content = merge_scheme_prelude_into_smt(
+                solver_content, _att.measure_prelude,
+            )
+    except Exception as exc:
+        logging.debug("scheme prelude merge skipped: %s", exc)
 
     def _scheme_fin(usefulness_ok: bool):
         if scheme_session is None:

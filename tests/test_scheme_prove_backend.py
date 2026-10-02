@@ -33,16 +33,10 @@ def test_scheme_prove_kwargs_select_backend() -> None:
 
 
 def test_default_vampire_prove_races_vampire_profiles() -> None:
-    fake = MagicMock(proved=True, status="unsat", elapsed=0.01)
-    with patch(
-        "vampire_runner.run_vampire_race", return_value=fake
-    ) as race:
-        out = default_vampire_prove(Path("/tmp/x.smt2"), 10, ["cvc5_inductive"])
-    assert out is fake
-    # CVC names ignored → fall back to VAMPIRE_PROVE_PROFILES
-    args, kwargs = race.call_args
-    assert args[2] == list(VAMPIRE_PROVE_PROFILES)
+    import os
 
+    fake = MagicMock(proved=True, status="unsat", elapsed=0.01)
+    # Explicit multi-profile list still races (not serial dual).
     with patch(
         "vampire_runner.run_vampire_race", return_value=fake
     ) as race2:
@@ -51,3 +45,19 @@ def test_default_vampire_prove_races_vampire_profiles() -> None:
             ["struct_induction", "integer_induction"],
         )
     assert race2.call_args[0][2] == ["struct_induction", "integer_induction"]
+
+    # Default paper list → serial dual when enabled.
+    with patch.dict(os.environ, {"VAMPIRE_SERIAL_DUAL": "on"}), patch(
+        "vampire_runner.run_vampire_serial", return_value=fake
+    ) as serial, patch("vampire_runner.run_vampire_race") as race:
+        out = default_vampire_prove(Path("/tmp/x.smt2"), 10, [])
+    assert out is fake
+    serial.assert_called_once()
+    assert serial.call_args.kwargs.get("kind") == "scheme"
+    race.assert_not_called()
+
+    with patch.dict(os.environ, {"VAMPIRE_SERIAL_DUAL": "off"}), patch(
+        "vampire_runner.run_vampire_race", return_value=fake
+    ) as race_off:
+        default_vampire_prove(Path("/tmp/x.smt2"), 10, ["cvc5_inductive"])
+    assert race_off.call_args[0][2] == list(VAMPIRE_PROVE_PROFILES)

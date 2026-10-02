@@ -320,7 +320,7 @@ def _run_quick_vampire(tmp: str, *, delay: str, usefulness, harvest, retry=None)
             side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
         ),
         patch("Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness),
-        patch("Mate_new_vampire.run_vampire_race", side_effect=harvest),
+        patch("Mate_new_vampire.run_vampire_routed", side_effect=harvest),
     ]
     if retry is not None:
         patches.append(
@@ -361,8 +361,9 @@ def test_vampire_exhausted_harvest_sets_skip_initial_diag() -> None:
         assert diag.get("induction_focus") == ["(P x)"]
         # Harvest uses the same paper schedule as usefulness / node prove.
         assert harvest.call_count >= 1
-        raced = harvest.call_args[0][2]
-        assert list(raced) == list(HARVEST_VAMPIRE_PROFILES)
+        # Harvest now goes through run_vampire_routed (serial dual / paper portfolio).
+        assert harvest.call_args[0][0]  # smt path
+        assert int(harvest.call_args[0][1]) > 0  # timeout
 
 
 def test_vampire_skip_initial_seeds_baseline() -> None:

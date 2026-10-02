@@ -65,6 +65,7 @@ def test_cvc5_routed_fallback() -> None:
 
 
 def test_vampire_routed_paper_schedule_only() -> None:
+    """With serial dual off, routed uses the singleton paper portfolio race."""
     calls = []
 
     def fake_parallel(path, timeout, names, *, collect_stats, collect_ucore, show_induction=False):
@@ -85,7 +86,11 @@ def test_vampire_routed_paper_schedule_only() -> None:
     )
     with patch.dict(
         os.environ,
-        {"SOLVER_ROUTING": "on", "SOLVER_ROUTING_FALLBACK": "on"},
+        {
+            "SOLVER_ROUTING": "on",
+            "SOLVER_ROUTING_FALLBACK": "on",
+            "VAMPIRE_SERIAL_DUAL": "off",
+        },
         clear=False,
     ), patch("vampire_runner._run_vampire_parallel", side_effect=fake_parallel):
         result = run_vampire_routed("unused.smt2", timeout=10, state=state)
@@ -197,7 +202,11 @@ def test_routing_off_uses_paper_runner() -> None:
     )
 
     vampire_result = VampireResult(status="timeout", strategy="induction_portfolio")
-    with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}, clear=False), patch(
+    with patch.dict(
+        os.environ,
+        {"SOLVER_ROUTING": "off", "VAMPIRE_SERIAL_DUAL": "off"},
+        clear=False,
+    ), patch(
         "vampire_runner.run_vampire_race", return_value=vampire_result
     ) as vampire_race:
         assert run_vampire_routed(

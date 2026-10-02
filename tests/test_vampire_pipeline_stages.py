@@ -344,7 +344,7 @@ def test_vampire_fast_unsat_does_not_start_harvest() -> None:
         ), patch(
             "Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness
         ), patch(
-            "Mate_new_vampire.run_vampire_race", harvest
+            "Mate_new_vampire.run_vampire_routed", harvest
         ):
             proved, subgoals, lemmas = mate.quick_run(
                 tmp, "template", "p", "./prompts_ours"

@@ -83,12 +83,16 @@ def test_live_vampire_race_profiles_unsat() -> None:
 
 
 def test_live_vampire_routed_matches_race() -> None:
-    """``run_vampire_routed`` must use the same paper schedule set."""
+    """``run_vampire_routed`` proves trivial unsat (serial dual or single portfolio)."""
     _require_vampire()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "false.smt2"
         path.write_text(_TRIVIAL_UNSAT, encoding="utf-8")
-        with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}, clear=False):
+        with patch.dict(
+            os.environ,
+            {"SOLVER_ROUTING": "off", "VAMPIRE_SERIAL_DUAL": "on"},
+            clear=False,
+        ):
             result = run_vampire_routed(
                 path,
                 timeout=3,
@@ -96,4 +100,8 @@ def test_live_vampire_routed_matches_race() -> None:
                 show_induction=False,
             )
     assert result.proved and result.status == "unsat", result
-    assert result.strategy == "induction_portfolio"
+    assert result.strategy in (
+        "struct_induction_tip",
+        "induction_portfolio",
+        "integer_induction",
+    )

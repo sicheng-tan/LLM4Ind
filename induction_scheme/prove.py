@@ -36,12 +36,27 @@ def default_cvc_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
 
 
 def default_vampire_prove(smt_path: Path, timeout: int, profiles: Sequence[str]):
-    """Race Vampire scheme profiles (same schedule as usefulness on Vampire Mate)."""
-    from vampire_runner import VAMPIRE_PROFILES, run_vampire_race
+    """Vampire scheme short-prove: serial tip→portfolio (same family as usefulness)."""
+    from vampire_runner import (
+        VAMPIRE_PROFILES,
+        run_vampire_race,
+        run_vampire_serial,
+        vampire_serial_dual_enabled,
+    )
 
     names = [p for p in (profiles or ()) if p in VAMPIRE_PROFILES]
     if not names:
         names = list(VAMPIRE_PROVE_PROFILES)
+    # Default paper list → serial dual; explicit multi-profile lists keep race.
+    if vampire_serial_dual_enabled() and names == list(VAMPIRE_PROVE_PROFILES):
+        return run_vampire_serial(
+            smt_path,
+            timeout,
+            kind="scheme",
+            collect_stats=False,
+            collect_ucore=False,
+            show_induction=False,
+        )
     return run_vampire_race(
         smt_path,
         timeout,

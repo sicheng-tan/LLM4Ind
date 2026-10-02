@@ -40,7 +40,9 @@ def scheme_prove_kwargs_for_backend(backend: str) -> dict:
     """Prove fn + profiles for scheme short-prove / gate / frontier.
 
     Backend must match usefulness (cvc5 Mate → CVC portfolio; Vampire Mate →
-    paper ``induction_portfolio`` schedule only).
+    serial tip→portfolio[+Int reserve] when ``VAMPIRE_SERIAL_DUAL=on``, else
+    single ``induction_portfolio``). Scheme Vampire wall adds
+    ``VAMPIRE_SERIAL_SCHEME_EXTRA_S`` (default +5).
     """
     name = (backend or "cvc5").strip().lower()
     if name in ("vampire", "vamp"):

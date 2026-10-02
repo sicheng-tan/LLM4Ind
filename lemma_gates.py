@@ -911,6 +911,8 @@ def infer_soft_reject_gate(reason: str, *, gate: str = "") -> str:
         return "same_as_goal"
     if text.startswith("undefined_symbol"):
         return "undefined_symbol"
+    if text.startswith("undeclared_scheme_helper"):
+        return "undeclared_scheme_helper"
     if "cvc error" in text or "vampire error" in text:
         return "solver_error"
     if "验证异常" in str(reason or "") or (
@@ -1172,6 +1174,7 @@ BENIGN_SCREEN_GATES = frozenset({
 SOFT_SCREEN_GATES = frozenset({
     "same_as_goal",
     "undefined_symbol",
+    "undeclared_scheme_helper",
     "known_soft_rejected",
     "solver_error",
     "verify_exception",
@@ -1257,13 +1260,13 @@ def apply_static_lemma_screen(
     ``(lemma, reason, gate)``.     ``gate`` is ``known_invalid``,
     ``known_soft_rejected``, ``same_as_goal``, ``same_as_ancestor``,
     ``same_as_library``, ``duplicate_in_group``, ``undefined_symbol``,
-    ``parse_error``, or ``type_error``.
+    ``undeclared_scheme_helper``, ``parse_error``, or ``type_error``.
     Known-invalid, known soft-rejected, library duplicates, in-group α-dups,
     and ancestor cycles are not re-recorded by the caller (ancestor hits are
     path cycles, often still theorems). Soft hits (same_as_goal /
-    undefined_symbol) go to ``soft_rejected_lemmas``. Parse/type failures are
-    ``illformed_lemmas``, not mathematical invalid. Library and in-group
-    duplicates always drop only that member.
+    undefined_symbol / undeclared_scheme_helper) go to ``soft_rejected_lemmas``.
+    Parse/type failures are ``illformed_lemmas``, not mathematical invalid.
+    Library and in-group duplicates always drop only that member.
     """
     from ancestor_stack import lemma_matches_ancestor
     from exp_flags import ancestor_cycle_filter_enabled
@@ -1351,6 +1354,19 @@ def apply_static_lemma_screen(
         if not _stage("undefined_symbol", _undef_reason):
             return [], dropped
 
+    # Scheme helpers must be declare-fun'd in the background (library / prelude).
+    # Catches LLM-invented __scheme_* before cvc5 --parse-only (form B).
+    from obligation_tree import undeclared_scheme_helpers
+
+    def _scheme_helper_reason(lemma: str) -> Optional[str]:
+        missing = undeclared_scheme_helpers(lemma, smt)
+        if not missing:
+            return None
+        return "undeclared_scheme_helper:" + ",".join(missing)
+
+    if not _stage("undeclared_scheme_helper", _scheme_helper_reason):
+        return [], dropped
+
     # Parse / type gate: reserved binders always; cvc5 --parse-only when enabled.
     wf_kept, wf_dropped = screen_lemmas_wellformed(current, smt)
     dropped.extend(wf_dropped)
@@ -1376,6 +1392,11 @@ _SCREEN_GATE_LABEL = {
     "duplicate_in_group": "same as earlier lemma in this group",
     "same_as_ancestor": "same as a STRICT ANCESTOR on the proof path",
     "same_as_goal": "same as the CURRENT goal",
+    "undefined_symbol": "declared but not axiomatized symbol",
+    "undeclared_scheme_helper": (
+        "uses __scheme_* without declare-fun in axioms "
+        "(do not invent scheme helpers; reuse library / proved scheme facts only)"
+    ),
     "known_soft_rejected": "already suppressed at this node",
     "parse_error": "parse_error (fix syntax / names / reserved binders)",
     "type_error": "type_error (argument or return sort mismatch)",

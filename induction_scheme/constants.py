@@ -6,9 +6,11 @@ from __future__ import annotations
 from solver_routing import VAMPIRE_RACE_PROFILES as VAMPIRE_PROVE_PROFILES
 
 # Short prove budget per obligation (seconds).
+# Vampire serial scheme adds ``VAMPIRE_SERIAL_SCHEME_EXTRA_S`` (default +5 → 15).
 PROVE_TIMEOUT_S = 10
 
 # Same budget for optional axioms∧base∧step ⊢ G gate.
+# Vampire goal_gate uses the same serial extra when prove_fn is Vampire.
 GOAL_GATE_TIMEOUT_S = 10
 
 # Scheme short-prove / frontier / goal-gate profiles.
@@ -20,7 +22,9 @@ PROVE_PROFILES = (
     "cvc4_default",
 )
 
-# Vampire: ``VAMPIRE_PROVE_PROFILES`` == single ``induction_portfolio``.
+# Vampire: imported paper list is single ``induction_portfolio``. With
+# ``VAMPIRE_SERIAL_DUAL=on``, ``default_vampire_prove`` runs serial tip→portfolio
+# instead of racing that singleton list.
 
 # At most one induct variable per node (sequential nesting picks another
 # binder on the child goal — not simultaneous multi-var induction).

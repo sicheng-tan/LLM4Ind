@@ -111,6 +111,184 @@ def test_A_inject_skips_polluted_pin_keeps_unrelated_clean() -> None:
     assert "(forall ((n Nat)) (= n n))" in out
 
 
+def test_A_dirty_lib_wellformed_false_positive_and_fix() -> None:
+    """CVC scheme_p20 form A (goal74 / rotate / heap): clean lemma vs dirty __lib.
+
+    Candidate lemma has no __scheme_*; raw template parses; lib with bare
+    ``(assert … __scheme_nat_to_int …)`` and no declare-fun poisons screening.
+    Inject skip + proper prelude restore wellformed.
+    """
+    from cvc5_runner import check_lemma_wellformed
+    from obligation_tree import merge_scheme_prelude_into_smt
+
+    smt = _load_fix("measure_nat_len.smt2")
+    # Experimental shape (isa/goal74, rotate-goal4): nonneg without declare.
+    dirty_assert = (
+        "(assert (forall ((xs Lst)) (>= (__scheme_nat_to_int (len xs)) 0)))"
+    )
+    dirty_lib = smt.replace(
+        "; proof goal",
+        "; proved lemma library\n"
+        + dirty_assert
+        + "\n; proved lemma library end\n; proof goal",
+    )
+    clean = "(forall ((xs Lst)) (= (len (append xs nil)) (len xs)))"
+    # Form A reproduction: clean lemma dies on polluted background.
+    bad = check_lemma_wellformed(clean, dirty_lib)
+    assert not bad.ok, bad
+    assert "__scheme_nat_to_int" in (bad.message or "")
+
+    assert check_lemma_wellformed(clean, smt).ok
+
+    # Current inject must not emit undeclared usage.
+    polluted = {
+        "id": "lib_bad",
+        "formula": "(forall ((xs Lst)) (>= (__scheme_nat_to_int (len xs)) 0))",
+    }
+    unrelated = {"id": "lib_ok", "formula": clean}
+    injected = inject_library_axioms(smt, [polluted, unrelated])
+    assert "(declare-fun __scheme_nat_to_int" not in injected
+    assert check_lemma_wellformed(clean, injected).ok
+
+    # With real measure prelude (harvest shape), clean + scheme lemma both parse.
+    att = generate_scheme(smt, goal_name="nat_len", mode="measure")
+    assert "__scheme_nat_to_int" in (att.measure_prelude or "")
+    fixed = merge_scheme_prelude_into_smt(smt, att.measure_prelude)
+    assert check_lemma_wellformed(clean, fixed).ok
+    scheme_lem = (
+        "(forall ((xs Lst)) (>= (__scheme_nat_to_int (len xs)) 0))"
+    )
+    assert check_lemma_wellformed(scheme_lem, fixed).ok
+
+
+def test_A_list_len_dirty_lib_wellformed_false_positive_and_fix() -> None:
+    """CVC scheme_p20 form A (sort_SSortIsSort): __scheme_list_len without declare."""
+    from cvc5_runner import check_lemma_wellformed
+    from induction_scheme.bridges import pick_or_synthesize_measure
+    from obligation_tree import merge_scheme_prelude_into_smt
+    from problem_profiler import build_problem_profile
+
+    smt = """(set-logic UFDTLIA)
+(declare-datatypes ((list 0)) (((nil) (cons (head Int) (tail list)))))
+(declare-fun ssort (list) list)
+(declare-fun insert2 (Int list) list)
+; proof goal
+(assert (not (forall ((xs list)) (= (ssort xs) xs))))
+; proof goal end
+(check-sat)
+"""
+    dirty = smt.replace(
+        "; proof goal",
+        "; proved lemma library\n"
+        "(assert (forall ((t list)) (>= (__scheme_list_len t) 0)))\n"
+        "; proved lemma library end\n; proof goal",
+    )
+    # Short stand-in for the long SSort insert2 lemma (same screening shape).
+    clean = "(forall ((xs list)) (= (ssort (ssort xs)) (ssort xs)))"
+    bad = check_lemma_wellformed(clean, dirty)
+    assert not bad.ok, bad
+    assert "__scheme_list_len" in (bad.message or "")
+    assert check_lemma_wellformed(clean, smt).ok
+
+    polluted = {
+        "id": "lib_bad",
+        "formula": "(forall ((t list)) (>= (__scheme_list_len t) 0))",
+    }
+    injected = inject_library_axioms(smt, [polluted, {"id": "lib_ok", "formula": clean}])
+    assert check_lemma_wellformed(clean, injected).ok
+
+    prof = build_problem_profile(smt, problem_id="ssort")
+    mu, _, prelude = pick_or_synthesize_measure(prof, "list")
+    assert mu == "__scheme_list_len" and prelude
+    fixed = merge_scheme_prelude_into_smt(smt, prelude)
+    assert "(declare-fun __scheme_list_len" in fixed
+    assert check_lemma_wellformed(clean, fixed).ok
+    assert check_lemma_wellformed(
+        "(forall ((t list)) (>= (__scheme_list_len t) 0))", fixed,
+    ).ok
+
+
+def test_B_lemma_mentions_scheme_helper_needs_prelude() -> None:
+    """CVC scheme_p20 form B: lemma itself uses __scheme_*; fail without prelude."""
+    from cvc5_runner import check_lemma_wellformed
+    from lemma_gates import apply_static_lemma_screen, screen_lemmas_wellformed
+    from obligation_tree import merge_scheme_prelude_into_smt
+
+    smt = _load_fix("measure_nat_len.smt2")
+    # goal74-style take/append lemma using nat→int (shortened).
+    lemma_b2 = (
+        "(forall ((xs Lst) (k Nat)) "
+        "(=> (<= (__scheme_nat_to_int k) (__scheme_nat_to_int (len xs))) "
+        "(= (len (append xs nil)) (len xs))))"
+    )
+    assert not check_lemma_wellformed(lemma_b2, smt).ok
+
+    att = generate_scheme(smt, goal_name="nat_len", mode="measure")
+    fixed = merge_scheme_prelude_into_smt(smt, att.measure_prelude)
+    assert check_lemma_wellformed(lemma_b2, fixed).ok
+
+    # Soft screen gate before parse-only when background lacks declare-fun.
+    kept, dropped = apply_static_lemma_screen(
+        [lemma_b2],
+        original_forall="(forall ((xs Lst)) (= (len (append xs nil)) (len xs)))",
+        smt=smt,
+        invalid_records=[],
+        same_as_goal=lambda a, b: False,
+    )
+    assert kept == []
+    assert any(g == "undeclared_scheme_helper" for _l, _r, g in dropped), dropped
+
+    kept2, dropped2 = apply_static_lemma_screen(
+        [lemma_b2],
+        original_forall="(forall ((xs Lst)) (= (len (append xs nil)) (len xs)))",
+        smt=fixed,
+        invalid_records=[],
+        same_as_goal=lambda a, b: False,
+    )
+    assert lemma_b2 in kept2 or any(
+        "__scheme_nat_to_int" in k for k in kept2
+    ), (kept2, dropped2)
+
+
+def test_B_list_len_lemma_screen_soft_then_ok_with_prelude() -> None:
+    """Form B1 (MSortBUIsSort shape): lemma uses __scheme_list_len."""
+    from induction_scheme.bridges import pick_or_synthesize_measure
+    from lemma_gates import apply_static_lemma_screen
+    from obligation_tree import merge_scheme_prelude_into_smt
+    from problem_profiler import build_problem_profile
+
+    smt = """(set-logic UFDTLIA)
+(declare-datatypes ((list 0)) (((nil) (cons (head Int) (tail list)))))
+; proof goal
+(assert (not (forall ((xs list)) (= xs xs))))
+; proof goal end
+"""
+    lemma_b1 = "(forall ((t list)) (>= (__scheme_list_len t) 0))"
+    kept, dropped = apply_static_lemma_screen(
+        [lemma_b1],
+        original_forall="(forall ((xs list)) (= xs xs))",
+        smt=smt,
+        invalid_records=[],
+        same_as_goal=lambda a, b: False,
+    )
+    assert kept == [], dropped
+    assert any(g == "undeclared_scheme_helper" for _l, _r, g in dropped), dropped
+
+    prof = build_problem_profile(smt, problem_id="msort")
+    mu, _, prelude = pick_or_synthesize_measure(prof, "list")
+    assert mu == "__scheme_list_len"
+    fixed = merge_scheme_prelude_into_smt(smt, prelude)
+    kept2, dropped2 = apply_static_lemma_screen(
+        [lemma_b1],
+        original_forall="(forall ((xs list)) (= xs xs))",
+        smt=fixed,
+        invalid_records=[],
+        same_as_goal=lambda a, b: False,
+    )
+    assert kept2, dropped2
+    assert not any(g == "undeclared_scheme_helper" for _l, _r, g in dropped2)
+
+
 def test_A_heap_goal1_nat_hsize_prelude_roundtrip() -> None:
     path = _require_bench("vmcai15-dt", "leon", "heap-goal1")
     smt = path.read_text(encoding="utf-8")

@@ -301,7 +301,9 @@ def _synthesize_adt_size(
         recs = _rec_positions(args, sort)
         binders = [f"(__a{i} {args[i]})" for i in range(len(args))]
         app_args = " ".join(f"__a{i}" for i in range(len(args)))
-        app = f"({ctor})" if not args else f"({ctor} {app_args})"
+        # Nullary ctors must be bare ``nil`` (not ``(nil)``): cvc5 --parse-only
+        # rejects parenthesized nullaries; Vampire accepts both.
+        app = ctor if not args else f"({ctor} {app_args})"
         if not recs:
             eqn = f"(= ({fun} {app}) 0)"
         else:

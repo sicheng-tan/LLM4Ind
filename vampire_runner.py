@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 import logging
 import time
@@ -11,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
 from solver_routing import GoalSearchState, VAMPIRE_RACE_PROFILES
+from theory_features import analyze_smt
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
     INDUCTION_SHARE_MAX,
@@ -35,6 +38,303 @@ except ImportError:
 
 def _vampire_binary() -> str:
     return os.getenv("VAMPIRE_BINARY", "./vampire/vampire")
+
+
+# --- Serial dual schedule (tip → portfolio → optional integer); one process at a time ---
+VAMPIRE_SERIAL_TIP = "struct_induction_tip"
+VAMPIRE_SERIAL_PORTFOLIO = "induction_portfolio"
+VAMPIRE_SERIAL_INTEGER = "integer_induction"
+VAMPIRE_SERIAL_ARMS = (VAMPIRE_SERIAL_TIP, VAMPIRE_SERIAL_PORTFOLIO)
+
+_OFF = frozenset({"0", "off", "false", "no"})
+
+
+def _env_flag(name: str, default: str = "on") -> bool:
+    return os.getenv(name, default).strip().lower() not in _OFF
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def vampire_serial_dual_enabled() -> bool:
+    """Serial tip→portfolio (default on). ``VAMPIRE_SERIAL_DUAL=off`` → single portfolio."""
+    return _env_flag("VAMPIRE_SERIAL_DUAL", default="on")
+
+
+def vampire_serial_tip_s() -> int:
+    """Main-path tip arm cap (default 8s)."""
+    return max(1, _env_int("VAMPIRE_SERIAL_TIP_S", 8))
+
+
+def vampire_serial_scheme_tip_s() -> int:
+    """Scheme short-prove tip arm cap (default 5s)."""
+    return max(1, _env_int("VAMPIRE_SERIAL_SCHEME_TIP_S", 5))
+
+
+def vampire_integer_boost_enabled() -> bool:
+    """Conditional integer short boost after tip+portfolio fail (default on)."""
+    return _env_flag("VAMPIRE_INTEGER_BOOST", default="on")
+
+
+def vampire_integer_boost_on_scheme() -> bool:
+    """Allow integer boost on scheme short-prove (default on; scheme gets +extra s)."""
+    return _env_flag("VAMPIRE_INTEGER_BOOST_ON_SCHEME", default="on")
+
+
+def vampire_integer_boost_s() -> int:
+    """Main-path integer arm (default 8; covers v1 integer wins max≈5.5s)."""
+    return max(1, _env_int("VAMPIRE_INTEGER_BOOST_S", 8))
+
+
+def vampire_integer_boost_scheme_s() -> int:
+    """Scheme integer arm (default 5; fits tip5+port≈5+int5 in T=15)."""
+    return max(1, _env_int("VAMPIRE_INTEGER_BOOST_SCHEME_S", 5))
+
+
+def vampire_integer_boost_min_remain_s() -> int:
+    """Only used when we did *not* pre-reserve (legacy / boost off mid-run)."""
+    return max(0, _env_int("VAMPIRE_INTEGER_BOOST_MIN_REMAIN_S", 6))
+
+
+def vampire_serial_scheme_extra_s() -> int:
+    """Extra wall seconds on scheme serial prove (default +5 → 10+5=15)."""
+    return max(0, _env_int("VAMPIRE_SERIAL_SCHEME_EXTRA_S", 5))
+
+
+def should_integer_boost(smt_source) -> bool:
+    """Whether a failed tip+portfolio run may try a short integer_induction arm."""
+    if isinstance(smt_source, Path):
+        try:
+            text = smt_source.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+    else:
+        raw = str(smt_source or "")
+        path = Path(raw)
+        if "\n" not in raw and path.suffix == ".smt2" and path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                text = raw
+        else:
+            text = raw
+    feats = analyze_smt(text)
+    if feats.has_int or feats.has_linear_arithmetic or feats.mixed_adt_lia:
+        return True
+    if re.search(
+        r"\(declare-fun\s+__scheme_\w+\s*\([^)]*\)\s*Int\b",
+        text,
+    ):
+        return True
+    if "__scheme_" in text and re.search(r"\bInt\b", text):
+        return True
+    logic = (feats.logic or "").upper()
+    if any(tag in logic for tag in ("LIA", "NIA", "LRA", "NRA")):
+        return True
+    return False
+
+
+def _compact_arm(result: VampireResult) -> dict:
+    return {
+        "proved": bool(result.proved),
+        "status": result.status,
+        "elapsed": round(float(result.elapsed or 0.0), 3),
+        "strategy": result.strategy,
+    }
+
+
+# Prefer ≥2s per serial arm (tip / portfolio / integer) when dual is on.
+SERIAL_ARM_MIN_S = 2
+
+
+def _scale_serial_arm_caps(
+    total: int, tip_cap: int, int_cap: int, *, want_int: bool
+) -> Tuple[int, int]:
+    """Fit tip / optional integer caps into ``total`` (leave ≥arm_min for portfolio).
+
+    When ``total ≥ 6`` (Int) or ``≥ 4`` (no Int) and serial dual is on, **never**
+    shrink tip/integer below 2s — LLM wall policy is expected to keep usefulness
+    at least that large. Only if ``total`` itself is below those floors do arms
+    compress further.
+    """
+    tip_cap = max(1, int(tip_cap))
+    int_cap = max(1, int(int_cap))
+    total = max(1, int(total))
+    arm_min = SERIAL_ARM_MIN_S if vampire_serial_dual_enabled() else 1
+    port_floor = arm_min
+    if not want_int:
+        # Need tip≥arm_min and portfolio≥arm_min when total ≥ 2*arm_min.
+        tip_s = min(tip_cap, total)
+        if total >= 2 * arm_min and tip_s + port_floor > total:
+            tip_s = max(arm_min, total - port_floor)
+        elif tip_s + port_floor > total and total >= port_floor + 1:
+            tip_s = max(1, total - port_floor)
+        return tip_s, 0
+
+    floor_pack = 3 * arm_min  # tip + portfolio + integer
+    need = tip_cap + int_cap + port_floor
+    if need <= total:
+        return min(tip_cap, total), int_cap
+    # Enough wall for the three 2s floors: lock floors, do not scale below.
+    if total >= floor_pack:
+        tip_s = max(arm_min, min(tip_cap, total - port_floor - arm_min))
+        int_s = max(arm_min, min(int_cap, total - port_floor - tip_s))
+        # Re-clamp so tip+int+port_floor ≤ total while both ≥ arm_min.
+        if tip_s + int_s + port_floor > total:
+            tip_s = arm_min
+            int_s = arm_min
+        return tip_s, int_s
+    # total < 6: best-effort proportional (may go below 2s).
+    scale = float(total) / float(max(need, 1))
+    tip_s = max(1, int(tip_cap * scale))
+    int_s = max(1, int(int_cap * scale))
+    while tip_s + int_s + port_floor > total and tip_s > 1:
+        tip_s -= 1
+    while tip_s + int_s + port_floor > total and int_s > 1:
+        int_s -= 1
+    if tip_s + int_s + port_floor > total:
+        tip_s = min(tip_s, total)
+        int_s = max(0, min(int_s, total - tip_s))
+    return tip_s, int_s
+
+
+def _split_remain_port_int(remain: float, reserve: int, *, port_weight: int) -> Tuple[int, int]:
+    """Split post-tip remain into portfolio then integer budgets (seconds)."""
+    rem = max(0, int(remain))
+    arm_min = SERIAL_ARM_MIN_S if vampire_serial_dual_enabled() else 1
+    if rem < 1:
+        return 0, 0
+    if reserve <= 0:
+        return rem, 0
+    if rem >= reserve + arm_min:
+        return rem - reserve, min(reserve, rem)
+    # Tight remnant: scale portfolio : integer by ideal weights.
+    pw = max(1, int(port_weight))
+    iw = max(1, int(reserve))
+    if rem < 2 * arm_min:
+        if rem == 1:
+            return 0, 1
+        # Prefer giving both at least 1s when possible.
+        port_b = max(1, rem // 2)
+        return port_b, rem - port_b
+    port_b = max(arm_min, int(rem * pw / (pw + iw)))
+    if port_b > rem - arm_min:
+        port_b = rem - arm_min
+    int_b = rem - port_b
+    return port_b, max(arm_min, int_b)
+
+
+def run_vampire_serial(
+    smt2_path,
+    timeout: int,
+    *,
+    kind: str = "main",
+    collect_stats: bool = False,
+    collect_ucore: bool = False,
+    show_induction: bool = False,
+) -> VampireResult:
+    """Serial tip → portfolio → optional integer; at most one Vampire process.
+
+    ``kind="main"`` (T usually 60): tip ≤8s; on Int/LIA problems, **pre-reserve**
+    integer (8s) so portfolio gets ``remain - reserve``. Short ``T`` (last-round
+    task remnant) **scales** tip/integer caps so all arms still get a slice.
+
+    ``kind="scheme"``: wall = ``timeout + VAMPIRE_SERIAL_SCHEME_EXTRA_S`` (default
+    10+5=15); tip ≤5s; Int problems reserve scheme-int (5s) the same way.
+    """
+    is_scheme = str(kind).strip().lower() == "scheme"
+    base_timeout = max(1, int(timeout))
+    total = base_timeout + (vampire_serial_scheme_extra_s() if is_scheme else 0)
+    tip_cap_raw = vampire_serial_scheme_tip_s() if is_scheme else vampire_serial_tip_s()
+    int_cap_raw = (
+        vampire_integer_boost_scheme_s() if is_scheme else vampire_integer_boost_s()
+    )
+    t0 = time.time()
+    arms: Dict[str, dict] = {}
+    smt2_path = Path(smt2_path)
+
+    def _remain() -> float:
+        return max(0.0, float(total) - (time.time() - t0))
+
+    allow_int = vampire_integer_boost_enabled() and (
+        (not is_scheme) or vampire_integer_boost_on_scheme()
+    )
+    want_int = bool(allow_int and should_integer_boost(smt2_path))
+    tip_cap, reserve = _scale_serial_arm_caps(
+        total, tip_cap_raw, int_cap_raw, want_int=want_int
+    )
+    # Ideal portfolio weight at full T (for tight post-tip splits).
+    port_weight = max(1, total - tip_cap - reserve) if reserve else max(1, total - tip_cap)
+
+    tip_budget = max(1, min(int(tip_cap), total))
+    result = run_vampire(
+        smt2_path,
+        tip_budget,
+        collect_stats=collect_stats,
+        collect_ucore=collect_ucore,
+        show_induction=show_induction,
+        profile=VAMPIRE_SERIAL_TIP,
+    )
+    arms[VAMPIRE_SERIAL_TIP] = _compact_arm(result)
+    if result.proved:
+        result.portfolio_results = arms
+        result.elapsed = round(time.time() - t0, 3)
+        return result
+
+    remain = _remain()
+    if remain < 1.0:
+        result.portfolio_results = arms
+        result.elapsed = round(time.time() - t0, 3)
+        return result
+
+    port_budget, _int_planned = _split_remain_port_int(
+        remain, reserve, port_weight=port_weight
+    )
+
+    if port_budget >= 1:
+        result = run_vampire(
+            smt2_path,
+            port_budget,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            show_induction=show_induction,
+            profile=VAMPIRE_SERIAL_PORTFOLIO,
+        )
+        arms[VAMPIRE_SERIAL_PORTFOLIO] = _compact_arm(result)
+        if result.proved:
+            result.portfolio_results = arms
+            result.elapsed = round(time.time() - t0, 3)
+            return result
+        remain = _remain()
+
+    can_boost = want_int and (
+        reserve > 0
+        or remain + 1e-9 >= float(vampire_integer_boost_min_remain_s())
+    )
+    if can_boost and remain >= 1.0:
+        # Cap by live remain (portfolio may have returned early) and by reserve.
+        int_ceil = reserve if reserve > 0 else int_cap_raw
+        int_budget = max(1, min(int_ceil, int(remain)))
+        result = run_vampire(
+            smt2_path,
+            int_budget,
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            show_induction=show_induction,
+            profile=VAMPIRE_SERIAL_INTEGER,
+        )
+        arms[VAMPIRE_SERIAL_INTEGER] = _compact_arm(result)
+
+    result.portfolio_results = arms
+    result.elapsed = round(time.time() - t0, 3)
+    return result
 
 
 # Stats keys that signal rewrite / induction "progress" (CCLemma-inspired).
@@ -391,13 +691,23 @@ def run_vampire_routed(
     collect_ucore: bool = False,
     show_induction: bool = False,
 ) -> VampireResult:
-    """Prove with the paper Vampire schedule (``induction_portfolio`` only).
+    """Prove with serial tip→portfolio (default) or single paper portfolio.
 
-    ``state`` is kept for API compatibility / Mate telemetry. Usefulness,
-    node-goal prove, and scheme short-prove all use ``VAMPIRE_RACE_PROFILES``
-    (a single mixed induction portfolio — original LLM4Ind).
+    ``state`` is kept for API compatibility / Mate telemetry. When
+    ``VAMPIRE_SERIAL_DUAL=on`` (default), runs one Vampire at a time:
+    tip → portfolio, with Int/LIA problems **pre-reserving** an integer arm.
+    Set ``VAMPIRE_SERIAL_DUAL=off`` for the v2 single ``induction_portfolio``.
     """
-    del state  # routing picks prompts/diagnostics; prove arms are fixed
+    del state
+    if vampire_serial_dual_enabled():
+        return run_vampire_serial(
+            smt2_path,
+            timeout,
+            kind="main",
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            show_induction=show_induction,
+        )
     return run_vampire_race(
         smt2_path,
         timeout,

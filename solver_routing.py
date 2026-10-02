@@ -23,9 +23,10 @@ from theory_features import TheoryFeatures
 
 
 VAMPIRE_FALLBACK_PROFILE = "induction_portfolio"
-# Paper-default Vampire prove: a single mixed induction portfolio schedule
-# (``--mode portfolio --schedule induction``). Used for usefulness, node-goal
-# prove, and scheme short-prove — matching original LLM4Ind (not a multi-schedule race).
+# Paper-default Vampire prove when serial dual is off: single mixed induction
+# portfolio. With ``VAMPIRE_SERIAL_DUAL=on`` (default), usefulness / node prove /
+# harvest / scheme use serial tip→portfolio (+ optional integer) instead — see
+# ``vampire_runner.run_vampire_serial``.
 VAMPIRE_RACE_PROFILES = (
     "induction_portfolio",
 )

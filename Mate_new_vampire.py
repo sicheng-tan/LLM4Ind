@@ -15,7 +15,6 @@ from vampire_runner import (
     run_vampire,
     run_vampire_diagnostic,
     run_vampire_probe,
-    run_vampire_race,
     run_vampire_routed,
     compute_progress_score,
     derive_repair_hints,
@@ -69,6 +68,7 @@ from obligation_tree import (
     make_child_node,
     make_goal_tree,
     materialize_smt_with_library,
+    merge_scheme_prelude_into_smt,
     normalize_lemma_formula,
     obligation_tree_enabled,
     root_finish_prove_timeout_s,
@@ -169,6 +169,10 @@ from exp_stats import (
 # 配置彩色日志
 logger = setup_colored_logger()
 config = setup_environment()
+# Vampire-only: serial dual prove floors for LLM wall budget (CVC Mate untouched).
+from vampire_runner import vampire_serial_dual_enabled as _vampire_serial_dual_enabled
+
+config["LLM_SERIAL_PROVE_BUDGET"] = bool(_vampire_serial_dual_enabled())
 
 # 初始化模型
 llm = setup_model(config)
@@ -1482,7 +1486,10 @@ def verify_combined_lemmas(
     成功时保留全部引理（不做 ucore 剪枝）。
     失败后用这次满超时 prove 的统计写 mix hint；不二次满超时、不枚举子集。
     """
-    combined_timeout = usefulness_timeout_s(int(config['COMBINED_CVC_TIMEOUT']))
+    combined_timeout = usefulness_timeout_s(
+        int(config['COMBINED_CVC_TIMEOUT']),
+        serial_policy=bool(config.get("LLM_SERIAL_PROVE_BUDGET")),
+    )
     work_dir = output_path.parent
     gname = goal_name or output_path.stem
 
@@ -2456,12 +2463,11 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
 
 
 def _harvest_direct_prove(smt_path: Path, base_path: str):
-    """Direct-prove A⊢cᵢ with the same paper schedule as usefulness / node prove."""
+    """Direct-prove A⊢cᵢ with the same prove policy as usefulness / node prove."""
     want_artifacts = vampire_collect_feedback_artifacts()
-    result = run_vampire_race(
+    result = run_vampire_routed(
         smt_path,
         config["DEFAULT_CVC_TIMEOUT"],
-        list(HARVEST_VAMPIRE_PROFILES),
         collect_stats=want_artifacts,
         collect_ucore=False,
         show_induction=want_artifacts,
@@ -2656,7 +2662,7 @@ def quick_run(
         save_routing_state(base_path, goal_smt_name, state)
 
     # InductionScheme: overlap short prove with this attempt's LLM/usefulness.
-    # Short-prove races the same Vampire schedules as usefulness / node prove.
+    # Vampire short-prove uses serial tip→portfolio[+Int] (same family as usefulness).
     scheme_session = None
     if induction_scheme_enabled():
         try:
@@ -2681,6 +2687,19 @@ def quick_run(
         except Exception as exc:
             logging.warning("INDUCTION_SCHEME start failed: %s", exc)
             scheme_session = None
+
+    # Attach last scheme μ prelude so LLM lemmas using __scheme_* parse under
+    # the same background as the scheme prompt (and validity / usefulness).
+    try:
+        from induction_scheme.ledger import latest_scheme_attempt
+
+        _att = latest_scheme_attempt(failed_data, goal_name=goal_smt_name)
+        if _att and (_att.measure_prelude or "").strip():
+            solver_content = merge_scheme_prelude_into_smt(
+                solver_content, _att.measure_prelude,
+            )
+    except Exception as exc:
+        logging.debug("scheme prelude merge skipped: %s", exc)
 
     def _scheme_fin(usefulness_ok: bool):
         if scheme_session is None:
