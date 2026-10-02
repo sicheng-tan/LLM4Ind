@@ -2797,10 +2797,17 @@ def check_lemma_wellformed(
     *,
     binary: Optional[str] = None,
 ) -> WellformedResult:
-    """Run cvc5 ``--parse-only`` on theory + asserted lemma (no prove profiles)."""
+    """Run cvc5 ``--parse-only`` on theory + asserted lemma (no prove profiles).
+
+    Normalizes nullary constructor apps (``(nil)``→``nil``) before parsing so
+    lemmas that Vampire accepts are not false-dropped by cvc5's stricter syntax.
+    """
+    from smt_nullary_normalize import normalize_lemma_nullary_ctors
+
     formula = (lemma or "").strip()
     if not formula:
         return WellformedResult(ok=False, kind="parse_error", message="empty lemma")
+    formula, _ = normalize_lemma_nullary_ctors(formula, smt_content)
     content = build_lemma_assert_smt(smt_content, formula)
     cvc5 = binary or _cvc5_binary()
     tmp_path: Optional[Path] = None

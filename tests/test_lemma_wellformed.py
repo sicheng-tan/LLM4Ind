@@ -79,6 +79,38 @@ def test_cvc5_wellformed_on_audit_cases() -> None:
     assert r.ok, r
 
 
+def test_nullary_ctor_paren_normalized_for_cvc_wellformed() -> None:
+    """cvc5 rejects (nil); screening must rewrite to bare nil (Vampire accepts both)."""
+    from smt_nullary_normalize import (
+        normalize_lemma_nullary_ctors,
+        nullary_constructors_in_smt,
+    )
+
+    flatten = (
+        ROOT / "benchmarks/preprocessed/autoproof/standard/tree_Flatten1/template.smt2"
+    ).read_text(encoding="utf-8")
+    nullaries = nullary_constructors_in_smt(flatten)
+    assert "nil" in nullaries and "nil2" in nullaries and "Nil" in nullaries
+
+    paren = "(forall ((xs list)) (= xs (nil)))"
+    bare = "(forall ((xs list)) (= xs nil))"
+    rewritten, n = normalize_lemma_nullary_ctors(paren, flatten)
+    assert n == 1 and rewritten == bare
+
+    # Direct wellformed + screen keep the normalized form.
+    assert check_lemma_wellformed(paren, flatten).ok
+    kept, dropped = screen_lemmas_wellformed([paren], flatten)
+    assert kept == [bare], kept
+    assert dropped == []
+
+    # Wrong constructor sort is still a real type/parse failure.
+    wrong = "(forall ((xs list2)) (= xs (nil)))"
+    fixed_wrong, n2 = normalize_lemma_nullary_ctors(wrong, flatten)
+    assert fixed_wrong == "(forall ((xs list2)) (= xs nil))" and n2 == 1
+    bad = check_lemma_wellformed(wrong, flatten)
+    assert not bad.ok, bad
+
+
 def test_screen_drops_illformed_not_as_invalid_gate() -> None:
     kept, dropped = screen_lemmas_wellformed(
         [PLUS_LEMMA, ARITH_LEMMA, OK_LEMMA], QSORT_SMT
@@ -116,6 +148,7 @@ def main() -> None:
     test_classify_type_vs_parse()
     test_reserved_binder()
     test_cvc5_wellformed_on_audit_cases()
+    test_nullary_ctor_paren_normalized_for_cvc_wellformed()
     test_screen_drops_illformed_not_as_invalid_gate()
     test_static_screen_includes_wellformed()
     test_illformed_not_written_as_invalid()

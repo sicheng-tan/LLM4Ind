@@ -262,6 +262,72 @@ def test_inject_scheme_prelude_and_skip_undeclared_helpers() -> None:
     assert scheme_helpers_in_text("(forall ((n Nat)) (= n n))") == []
 
 
+def test_inject_upgrades_ufdt_when_int_measure_prelude() -> None:
+    """UFDT + __scheme_list_len→Int must become UFDTLIA so CVC parse-only works."""
+    smt = """(set-logic UFDT)
+(declare-datatypes ((nat 0)) (((zero) (succ (pred nat)))))
+(declare-datatypes ((list 0)) (((nil) (cons (head nat) (tail list)))))
+(declare-fun append (list list) list)
+; proof goal
+(assert (not (forall ((ys list)) (= (append ys nil) ys))))
+; proof goal end
+"""
+    prelude = (
+        "(declare-fun __scheme_list_len (list) Int)\n"
+        "(assert (= (__scheme_list_len nil) 0))\n"
+        "(assert (forall ((__x nat) (__xs list)) "
+        "(= (__scheme_list_len (cons __x __xs)) (+ 1 (__scheme_list_len __xs)))))\n"
+    )
+    # Pin that carries Int prelude (scheme measure) plus an Int-free sibling lemma.
+    lemmas = [
+        {
+            "id": "lib_1",
+            "formula": "(forall ((xs list)) (>= (__scheme_list_len xs) 0))",
+            "prelude": prelude,
+        },
+        {
+            "id": "lib_2",
+            "formula": "(forall ((ys list)) (= (append ys nil) ys))",
+        },
+    ]
+    out = inject_library_axioms(smt, lemmas)
+    assert "(set-logic UFDTLIA)" in out
+    assert "(set-logic UFDT)" not in out
+    assert "(declare-fun __scheme_list_len (list) Int)" in out
+    # Innocent lemma still present for screening / prove.
+    assert "(forall ((ys list)) (= (append ys nil) ys))" in out
+
+    # Without upgrade this is the user-reported false parse_error.
+    from cvc5_runner import check_lemma_wellformed
+
+    innocent = "(forall ((ys list)) (= (append ys nil) ys))"
+    # Background without upgrade (raw UFDT + Int prelude) fails.
+    poisoned = smt.replace(
+        "; proof goal",
+        "; proved lemma library\n" + prelude + "; proved lemma library end\n; proof goal",
+    )
+    bad = check_lemma_wellformed(innocent, poisoned)
+    assert not bad.ok, bad
+    assert "Int" in (bad.message or "")
+
+    # Injected background (upgraded) must accept the same lemma.
+    good = check_lemma_wellformed(innocent, out)
+    assert good.ok, good
+
+
+def test_ensure_smt_logic_for_arith_noop_when_already_lia() -> None:
+    from obligation_tree import ensure_smt_logic_for_arith
+
+    smt = "(set-logic UFDTLIA)\n(assert true)\n"
+    assert ensure_smt_logic_for_arith(smt, need_int=True, need_real=False) == smt
+    assert ensure_smt_logic_for_arith(
+        "(set-logic ALL)\n", need_int=True, need_real=True,
+    ) == "(set-logic ALL)\n"
+    assert "(set-logic UFDTLIA)" in ensure_smt_logic_for_arith(
+        "(set-logic UFDT)\n", need_int=True, need_real=False,
+    )
+
+
 def test_add_proved_lemma_stores_prelude() -> None:
     prelude = "(declare-fun __scheme_nat_to_int (Nat) Int)\n"
     formula = "(forall ((x Nat)) (>= (__scheme_nat_to_int x) 0))"
@@ -752,6 +818,8 @@ def main() -> int:
     test_classify_failed_attempt()
     test_inject_library_axioms_before_proof_goal()
     test_inject_scheme_prelude_and_skip_undeclared_helpers()
+    test_inject_upgrades_ufdt_when_int_measure_prelude()
+    test_ensure_smt_logic_for_arith_noop_when_already_lia()
     test_add_proved_lemma_stores_prelude()
     test_obligation_prompt_shows_library_prelude()
     test_compressed_prompt_matches_expected_shape()

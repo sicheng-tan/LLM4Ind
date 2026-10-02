@@ -29,8 +29,11 @@ same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
 LLM_SCREEN_RETRIES extra generation after static screen kept=0 (default 1);
 not mixed with parse retries.
 ``LEMMA_WELLFORMED_CHECK`` (default on) runs cvc5 ``--parse-only`` on each
-candidate before validity/usefulness; failures are ``parse_error`` /
+candidate before validity/usefulness (both CVC Mate and Vampire Mate — Vampire
+has no dedicated parse-only mode). Failures are ``parse_error`` /
 ``type_error`` (not mathematical ``invalid``) and feed the screen-retry prompt.
+Nullary ctor apps ``(nil)`` are normalized to ``nil`` first so cvc5's stricter
+syntax does not false-drop lemmas Vampire would accept.
 """
 
 from __future__ import annotations
@@ -831,8 +834,11 @@ def screen_lemmas_wellformed(
     """Drop candidates that fail reserved-binder or cvc5 ``--parse-only`` checks.
 
     Gates are ``parse_error`` / ``type_error`` only (never mathematical invalid).
+    Nullary constructor apps are normalized (``(nil)``→``nil``) before the
+    cvc5 check; kept lemmas use the normalized form.
     """
     from cvc5_runner import check_lemma_wellformed
+    from smt_nullary_normalize import normalize_lemma_nullary_ctors
 
     current = list(lemmas)
     dropped: List[Tuple[str, str, str]] = []
@@ -846,12 +852,13 @@ def screen_lemmas_wellformed(
             gate, reason = static_hit
             dropped.append((lemma, reason, gate))
             continue
+        normalized, _n = normalize_lemma_nullary_ctors(lemma, smt)
         if not wellformed_check_enabled():
-            kept.append(lemma)
+            kept.append(normalized)
             continue
-        result = check_lemma_wellformed(lemma, smt)
+        result = check_lemma_wellformed(normalized, smt)
         if result.ok:
-            kept.append(lemma)
+            kept.append(normalized)
             continue
         gate = result.kind or "parse_error"
         reason = (result.message or gate).strip()

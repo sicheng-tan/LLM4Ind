@@ -15,7 +15,7 @@ import re
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 LIBRARY_FILENAME = "lemma_library.json"
@@ -293,6 +293,91 @@ def add_proved_lemma(
 
 
 _SCHEME_HELPER_RE = re.compile(r"\b(__scheme_[A-Za-z_][A-Za-z0-9_]*)\b")
+_SMT_LOGIC_RE = re.compile(r"\(set-logic\s+([A-Za-z0-9_+]+)\)")
+# Sort tokens that require arithmetic logics (scheme μ helpers return Int).
+_ARITH_SORT_RE = re.compile(r"(?<![A-Za-z0-9_])(Int|Real)(?![A-Za-z0-9_])")
+
+
+def _text_needs_arith_sorts(text: str) -> Tuple[bool, bool]:
+    """Return ``(need_int, need_real)`` if *text* mentions those SMT sorts."""
+    need_int = False
+    need_real = False
+    for m in _ARITH_SORT_RE.finditer(text or ""):
+        if m.group(1) == "Int":
+            need_int = True
+        else:
+            need_real = True
+    return need_int, need_real
+
+
+def _logic_allows_int(logic: str) -> bool:
+    u = (logic or "").upper()
+    if u in ("ALL", "QF_ALL"):
+        return True
+    return any(tag in u for tag in ("LIA", "LRA", "NIA", "NRA"))
+
+
+def _logic_allows_real(logic: str) -> bool:
+    u = (logic or "").upper()
+    if u in ("ALL", "QF_ALL"):
+        return True
+    return any(tag in u for tag in ("LRA", "NRA"))
+
+
+def _upgrade_logic_name(logic: str, *, need_int: bool, need_real: bool) -> Optional[str]:
+    """Map a logic that cannot host Int/Real helpers to one that can."""
+    if need_real and not _logic_allows_real(logic):
+        table = {
+            "UFDT": "UFDTLIRA",
+            "QF_UFDT": "QF_UFDTLIRA",
+            "UF": "UFLRA",
+            "QF_UF": "QF_UFLRA",
+            "UFDTLIA": "UFDTLIRA",
+            "QF_UFDTLIA": "QF_UFDTLIRA",
+            "UFLIA": "UFLRA",
+            "QF_UFLIA": "QF_UFLRA",
+        }
+        return table.get(logic, "ALL")
+    if need_int and not _logic_allows_int(logic):
+        table = {
+            "UFDT": "UFDTLIA",
+            "QF_UFDT": "QF_UFDTLIA",
+            "UF": "UFLIA",
+            "QF_UF": "QF_UFLIA",
+        }
+        return table.get(logic, "ALL")
+    return None
+
+
+def ensure_smt_logic_for_arith(smt_content: str, *, need_int: bool, need_real: bool) -> str:
+    """Rewrite ``(set-logic …)`` when library prelude introduces Int/Real.
+
+    Scheme measure helpers (``__scheme_list_len : list → Int`` etc.) are often
+    pinned into UFDT problems. Without upgrading to UFDTLIA/ALL, CVC
+    ``--parse-only`` wellformed screening rejects *every* lemma against the
+    injected background — including lemmas that never mention Int.
+    """
+    if not need_int and not need_real:
+        return smt_content
+    m = _SMT_LOGIC_RE.search(smt_content or "")
+    if not m:
+        return smt_content
+    new_logic = _upgrade_logic_name(m.group(1), need_int=need_int, need_real=need_real)
+    if not new_logic or new_logic == m.group(1):
+        return smt_content
+    logging.info(
+        "lemma library upgrade set-logic %s → %s (scheme arith prelude)",
+        m.group(1), new_logic,
+    )
+    return smt_content[: m.start(1)] + new_logic + smt_content[m.end(1) :]
+
+
+def upgrade_smt_logic_for_text(smt_content: str, extra_text: str = "") -> str:
+    """Upgrade ``set-logic`` if *extra_text* (prelude) introduces Int/Real sorts."""
+    need_int, need_real = _text_needs_arith_sorts(extra_text or "")
+    return ensure_smt_logic_for_arith(
+        smt_content, need_int=need_int, need_real=need_real,
+    )
 
 
 def scheme_helpers_in_text(text: str) -> List[str]:
@@ -342,6 +427,10 @@ def inject_library_axioms(
     Lemmas that reference undeclared ``__scheme_*`` helpers are skipped so a
     polluted library cannot break parse-only wellformed checks for other lemmas.
 
+    When a prelude (or injected formula) introduces ``Int``/``Real`` into a
+    non-arith logic such as ``UFDT``, rewrite ``set-logic`` to ``UFDTLIA`` /
+    ``ALL`` so CVC wellformed screening and prove runs stay consistent.
+
     When ``add_patterns`` is set, directed equalities get a ``:pattern`` on
     the LHS for E-matching. Subgoal SMT stays bare.
     """
@@ -371,6 +460,7 @@ def inject_library_axioms(
         lines.append(prelude_block)
 
     n_skip = 0
+    emitted_formulas: List[str] = []
     for item in lemmas:
         lib_id = str(item.get("id") or "lib")
         formula = normalize_lemma_formula(str(item.get("formula") or ""))
@@ -393,10 +483,21 @@ def inject_library_axioms(
             continue
         lines.append(f"; {lib_id}")
         lines.append(format_assert_line(formula, add_pattern=add_patterns))
+        emitted_formulas.append(formula)
     if n_skip:
         log_exp("library_skip_missing_prelude", n=n_skip)
     lines.append(LIBRARY_END)
     block = "\n".join(lines) + "\n"
+
+    need_int, need_real = _text_needs_arith_sorts(prelude_block)
+    for formula in emitted_formulas:
+        fi, fr = _text_needs_arith_sorts(formula)
+        need_int = need_int or fi
+        need_real = need_real or fr
+    stripped = ensure_smt_logic_for_arith(
+        stripped, need_int=need_int, need_real=need_real,
+    )
+
     marker = "; proof goal"
     idx = stripped.find(marker)
     if idx >= 0:

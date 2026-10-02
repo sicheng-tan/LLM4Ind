@@ -55,15 +55,19 @@ def _smt_with_measure_prelude(smt_content: str, attempt: SchemeAttempt) -> str:
     prelude = (attempt.measure_prelude or "").strip()
     if not prelude:
         return smt_content
-    if re.search(r";\s*proof goal\b", smt_content, flags=re.IGNORECASE):
+    from obligation_tree import upgrade_smt_logic_for_text
+
+    # UFDT + Int μ helpers must become UFDTLIA before short-prove / gate.
+    base = upgrade_smt_logic_for_text(smt_content, prelude)
+    if re.search(r";\s*proof goal\b", base, flags=re.IGNORECASE):
         return re.sub(
             r";\s*proof goal\b",
             prelude + "\n; proof goal",
-            smt_content,
+            base,
             count=1,
             flags=re.IGNORECASE,
         )
-    return prelude + "\n" + smt_content
+    return prelude + "\n" + base
 
 
 def prove_obligations(

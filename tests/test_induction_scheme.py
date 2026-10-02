@@ -633,6 +633,20 @@ def test_synthesize_adt_size_binary_tree_not_list_len() -> None:
     assert "(+ 1 (__scheme_adt_size __a0)" in prelude
 
 
+def test_scheme_measure_prelude_upgrades_ufdt_logic() -> None:
+    """Short-prove working copy must not leave Int μ under bare UFDT."""
+    from induction_scheme.prove import _smt_with_measure_prelude
+    from induction_scheme.types import SchemeAttempt
+
+    smt = "(set-logic UFDT)\n; proof goal\n(assert (not true))\n; proof goal end\n"
+    prelude = "(declare-fun __scheme_list_len (list) Int)\n"
+    att = SchemeAttempt(goal_name="g", measure_prelude=prelude)
+    out = _smt_with_measure_prelude(smt, att)
+    assert "(set-logic UFDTLIA)" in out
+    assert "(declare-fun __scheme_list_len (list) Int)" in out
+    assert out.index("(set-logic UFDTLIA)") < out.index("__scheme_list_len")
+
+
 def test_synthesize_list_len_snoc_recursive_first() -> None:
     """Snoc with recursive first arg is still a single-spine list."""
     from induction_scheme.bridges import _list_nil_cons, pick_or_synthesize_measure
@@ -1027,6 +1041,7 @@ def main() -> int:
         test_measure_rejects_ssort_minimum_name,
         test_synthesize_list_len_on_real_qsort,
         test_synthesize_adt_size_binary_tree_not_list_len,
+        test_scheme_measure_prelude_upgrades_ufdt_logic,
         test_synthesize_list_len_snoc_recursive_first,
         test_descent_name_covers_remove_prefix,
         test_qsort_emits_descent_not_isort_templates,
