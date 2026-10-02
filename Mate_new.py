@@ -111,6 +111,7 @@ from lemma_harvest import (
     harvest_slot_kind,
     make_harvest_slots,
     run_usefulness_with_delayed_harvest,
+    usefulness_fail_allows_local_harvest,
 )
 from llm_time_budget import (
     arm_task_deadline,
@@ -3125,7 +3126,7 @@ def quick_run(
             depth=depth,
         )
     status = str(getattr(cres, "status", "") or "").lower()
-    if harvest_on and status == "timeout":
+    if harvest_on and usefulness_fail_allows_local_harvest(status):
         _scheme_fin(False)
         result = _finish_usefulness_timeout(
             slots=slots,

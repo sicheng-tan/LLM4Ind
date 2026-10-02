@@ -31,6 +31,7 @@ from exp_flags import (
     repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
+    vampire_collect_feedback_artifacts,
 )
 from lemma_gates import (
     defined_symbols_enabled,
@@ -109,6 +110,7 @@ def test_flags_default_on() -> None:
         assert progress_feedback_enabled() is False
         assert proof_shape_hint_enabled() is False
         assert problem_profiler_enabled() is False
+        assert vampire_collect_feedback_artifacts() is True
         assert prompt_retarget_enabled() is True
         assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
@@ -205,6 +207,24 @@ def test_collect_difficulty_for_feedback_consumers() -> None:
         "FEEDBACK_LLM_HINTS_HD": "on",
     }):
         assert collect_difficulty_for_feedback() is False
+
+
+def test_vampire_collect_feedback_artifacts() -> None:
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "on",
+        "FEEDBACK_PROGRESS": "off",
+    }):
+        assert vampire_collect_feedback_artifacts() is True
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "off",
+        "FEEDBACK_PROGRESS": "on",
+    }):
+        assert vampire_collect_feedback_artifacts() is True
+    with patch.dict(os.environ, {
+        "FEEDBACK_REPAIR_HINTS": "off",
+        "FEEDBACK_PROGRESS": "off",
+    }):
+        assert vampire_collect_feedback_artifacts() is False
 
 
 def test_resolve_prompt_pack() -> None:
@@ -586,6 +606,7 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
 def main() -> int:
     test_flags_default_on()
     test_collect_difficulty_for_feedback_consumers()
+    test_vampire_collect_feedback_artifacts()
     test_resolve_prompt_pack()
     test_paper_schedule_prompt()
     test_prompt_hides_disabled_feedback_sections()

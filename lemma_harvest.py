@@ -26,6 +26,15 @@ from obligation_tree import (
 UsefulnessFn = Callable[[], Tuple[bool, List[str], Any]]
 ProveFn = Callable[[Path], Any]
 
+# Usefulness failed after burning the budget (or soft incomplete) — same harvest
+# finish path as wall-clock timeout. Do *not* include sat/error.
+HARVEST_ON_USEFULNESS_FAIL = frozenset({"timeout", "incomplete", "unknown"})
+
+
+def usefulness_fail_allows_local_harvest(status: Any) -> bool:
+    """Whether failed usefulness should pin local harvest + short retry."""
+    return str(status or "").strip().lower() in HARVEST_ON_USEFULNESS_FAIL
+
 
 @dataclass
 class HarvestSlot:
@@ -154,8 +163,13 @@ def run_usefulness_with_delayed_harvest(
         if not started:
             if useful:
                 log_exp("harvest_skip", goal=goal, reason="usefulness_fast")
-            elif status == "timeout" and elapsed + 1e-9 >= delay:
-                logging.info("有用性 timeout 时投机尚未启动，补跑 A⊢c_i")
+            elif (
+                usefulness_fail_allows_local_harvest(status)
+                and elapsed + 1e-9 >= delay
+            ):
+                logging.info(
+                    "有用性 %s 时投机尚未启动，补跑 A⊢c_i", status or "timeout",
+                )
                 _start_slots(
                     slots, prove_fn, pool, goal=goal, delay_s=delay, profiles=profiles,
                 )

@@ -92,6 +92,7 @@ from exp_flags import (
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
     is_v2_strategy_mode,
+    vampire_collect_feedback_artifacts,
 )
 from ancestor_stack import (
     AncestorStack,
@@ -103,6 +104,7 @@ from lemma_harvest import (
     harvest_slot_kind,
     make_harvest_slots,
     run_usefulness_with_delayed_harvest,
+    usefulness_fail_allows_local_harvest,
 )
 from prompt_modes import apply_advice_system_instruction
 from lemma_gates import (
@@ -1496,13 +1498,14 @@ def verify_combined_lemmas(
         state.decision_source = decision_source or state.decision_source
         if base_path:
             save_routing_state(base_path, gname, state)
+    want_artifacts = vampire_collect_feedback_artifacts()
     useful_result = run_vampire_routed(
         output_path,
         timeout=combined_timeout,
         state=state,
-        collect_stats=True,
+        collect_stats=want_artifacts,
         collect_ucore=False,
-        show_induction=True,
+        show_induction=want_artifacts,
     )
     record_solver_attempt(
         base_path,
@@ -1596,11 +1599,12 @@ def perform_initial_verification(
         n_lib = len(load_lemma_library(base_path))
         log_library_inject(base_path, goal_name, n_lib, log_event)
         smt_path = materialize_smt_with_library(goal_smt_file, base_path)
+    want_artifacts = vampire_collect_feedback_artifacts()
     result = run_vampire_routed(
         smt_path,
         default_timeout,
-        collect_stats=True,
-        show_induction=True,
+        collect_stats=want_artifacts,
+        show_induction=want_artifacts,
         state=routing_state,
     )
     if log_event == "initial_prove" and routing_enabled() and base_path and goal_name:
@@ -2453,13 +2457,14 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
 
 def _harvest_direct_prove(smt_path: Path, base_path: str):
     """Direct-prove A⊢cᵢ with the same paper schedule as usefulness / node prove."""
+    want_artifacts = vampire_collect_feedback_artifacts()
     result = run_vampire_race(
         smt_path,
         config["DEFAULT_CVC_TIMEOUT"],
         list(HARVEST_VAMPIRE_PROFILES),
-        collect_stats=True,
+        collect_stats=want_artifacts,
         collect_ucore=False,
-        show_induction=True,
+        show_induction=want_artifacts,
     )
     add_solver_time(base_path, result.elapsed)
     log_exp(
@@ -2619,7 +2624,11 @@ def quick_run(
         # 在baseline模式下，使用task_timeout作为超时时间
         task_timeout = config['TASK_TIMEOUT']
         logging.info(f"🔍 Baseline模式: 执行初始验证检查，超时时间: {task_timeout}秒")
-        result = run_vampire(goal_smt_file, task_timeout, collect_stats=True)
+        result = run_vampire(
+            goal_smt_file,
+            task_timeout,
+            collect_stats=vampire_collect_feedback_artifacts(),
+        )
         add_solver_time(base_path, result.elapsed)
         if result.proved:
             logging.info("✅ Baseline模式: 初始验证成功!")
@@ -2903,7 +2912,7 @@ def quick_run(
             depth=depth,
         )
     status = str(getattr(vres, "status", "") or "").lower()
-    if harvest_on and status == "timeout":
+    if harvest_on and usefulness_fail_allows_local_harvest(status):
         _scheme_fin(False)
         result = _finish_usefulness_timeout(
             slots=slots,

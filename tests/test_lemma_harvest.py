@@ -127,6 +127,39 @@ def test_timeout_harvest_local_retries_goal_without_prove_run() -> None:
         assert retry.call_args.kwargs.get("timeout") == 2
 
 
+def test_cvc_unknown_usefulness_still_harvests_local() -> None:
+    """CVC portfolio may finish as unknown (not timeout); local harvest must still run."""
+    from lemma_harvest import usefulness_fail_allows_local_harvest
+
+    assert usefulness_fail_allows_local_harvest("unknown")
+    assert not usefulness_fail_allows_local_harvest("sat")
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], CvcResult(proved=False, status="unknown", elapsed=0.08)
+
+    harvest = MagicMock(return_value=_unsat())
+    retry = MagicMock(return_value=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest, retry=retry,
+        )
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert lemma_library_role(stored[0]) == "local"
+        retry.assert_called()
+        assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+
+
+def _v_incomplete(**kwargs) -> VampireResult:
+    payload = {"proved": False, "status": "incomplete", "elapsed": 0.08}
+    payload.update(kwargs)
+    return VampireResult(**payload)
+
+
 def test_slow_unsat_proved_harvest_skips_prove_run_and_initial() -> None:
     import Mate_new as mate
 
@@ -388,9 +421,38 @@ def test_vampire_harvest_retry_refreshes_baseline() -> None:
         assert cached.strategy == "b"
 
 
+def test_vampire_incomplete_usefulness_still_harvests_local() -> None:
+    """Single-schedule Vampire often ends incomplete (not timeout); harvest must pin."""
+    from lemma_harvest import usefulness_fail_allows_local_harvest
+
+    assert usefulness_fail_allows_local_harvest("incomplete")
+    assert usefulness_fail_allows_local_harvest("timeout")
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], _v_incomplete(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_v_unsat())
+    retry = MagicMock(return_value=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick_vampire(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest, retry=retry,
+        )
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert len(stored) == 1
+        assert lemma_library_role(stored[0]) == "local"
+        retry.assert_called()
+        assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+
+
 def main() -> int:
     test_fast_unsat_does_not_start_harvest()
     test_timeout_harvest_local_retries_goal_without_prove_run()
+    test_cvc_unknown_usefulness_still_harvests_local()
     test_slow_unsat_proved_harvest_skips_prove_run_and_initial()
     test_exhausted_harvest_unsat_sets_skip_initial()
     test_skip_initial_prove_run_does_not_call_initial()
@@ -400,6 +462,7 @@ def main() -> int:
     test_vampire_exhausted_harvest_sets_skip_initial_diag()
     test_vampire_skip_initial_seeds_baseline()
     test_vampire_harvest_retry_refreshes_baseline()
+    test_vampire_incomplete_usefulness_still_harvests_local()
     print("lemma harvest tests passed")
     return 0
 

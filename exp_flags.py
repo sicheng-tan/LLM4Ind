@@ -6,6 +6,9 @@ Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
 solver observations before lemma generation). ``FEEDBACK_LLM_HINTS_HD``
 defaults off (diagnoser omits HD hotspots; usefulness skips difficulty dump
 unless another consumer needs it).
+Vampire main prove paths collect ``--statistics full`` / ``--show_induction``
+only when ``vampire_collect_feedback_artifacts()`` is true (repair hints or
+progress sidecar).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
@@ -98,6 +101,20 @@ def collect_difficulty_for_feedback() -> bool:
     if feedback_llm_hints_enabled():
         return feedback_llm_hints_hd_enabled()
     return repair_hints_enabled()
+
+
+def vampire_collect_feedback_artifacts() -> bool:
+    """True when Vampire prove runs should collect stats / induction traces.
+
+    Gates ``--statistics full`` and ``--show_induction`` on main prove paths
+    (usefulness, initial prove, harvest direct prove). Independent of
+    ``SOLVER_ROUTING`` probes, which always collect their own short-run stats.
+
+    Consumers:
+    - ``FEEDBACK_REPAIR_HINTS``: mix / induction_stuck from the failed prove
+    - ``FEEDBACK_PROGRESS``: 3s sidecar scoring (sidecar still forces these on)
+    """
+    return repair_hints_enabled() or progress_feedback_enabled()
 
 
 def progress_feedback_enabled() -> bool:

@@ -1195,6 +1195,39 @@ def test_usefulness_failure_mix_from_full_timeout_ac_implies_p() -> None:
         assert lemma in txt
 
 
+def test_vampire_usefulness_skips_artifacts_when_feedback_off() -> None:
+    import Mate_new_vampire as mate_v
+
+    failed = VampireResult(
+        status="timeout",
+        strategy="struct_induction",
+        stats={},
+        induction_focus=[],
+        elapsed=1.0,
+    )
+    lemma = "(forall ((x Int)) (P x))"
+    with tempfile.TemporaryDirectory() as tmp:
+        original, _ = mate_v.extract_original_goal(_PROOF_GOAL_SMT)
+        out = Path(tmp) / "template_with_lemmas.smt2"
+        with patch.dict(os.environ, {
+            "FEEDBACK_REPAIR_HINTS": "off",
+            "FEEDBACK_PROGRESS": "off",
+            "SOLVER_ROUTING": "off",
+        }), patch(
+            "Mate_new_vampire.run_vampire_routed", return_value=failed
+        ) as routed:
+            useful, kept, _ = mate_v.verify_combined_lemmas(
+                original, [lemma], _PROOF_GOAL_SMT, out,
+                base_path=tmp, goal_name="template",
+            )
+        assert useful is False
+        assert kept == []
+        kwargs = routed.call_args.kwargs
+        assert kwargs.get("collect_stats") is False
+        assert kwargs.get("show_induction") is False
+        assert kwargs.get("collect_ucore") is False
+
+
 def test_usefulness_without_difficulty_omits_lemma_usage() -> None:
     import Mate_new as mate
 
@@ -1323,6 +1356,7 @@ def main() -> int:
     test_timeout_breaks_no_help_streak()
     test_kind_feedback_switches_after_one_no_help()
     test_usefulness_failure_mix_from_full_timeout_ac_implies_p()
+    test_vampire_usefulness_skips_artifacts_when_feedback_off()
     test_usefulness_without_difficulty_omits_lemma_usage()
     test_usefulness_success_keeps_all_lemmas_without_ucore()
     test_sidecar_does_not_write_mix_hints()
