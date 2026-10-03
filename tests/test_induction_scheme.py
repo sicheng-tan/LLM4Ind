@@ -1010,6 +1010,12 @@ def test_scheme_sat_marks_invalid_and_harvests() -> None:
         inv2 = mate.load_failed_lemmas(tmp, "template")["invalid_lemmas"]
         assert len(inv2) == 1
 
+    with patch.dict(os.environ, {"INVALID_LEMMAS": "off"}):
+        with tempfile.TemporaryDirectory() as tmp2:
+            n_off = harvest_scheme_refuted_to_invalid(att, tmp2, goal_name="template")
+            assert n_off == 0
+            assert mate.load_failed_lemmas(tmp2, "template")["invalid_lemmas"] == []
+
 
 def main() -> int:
     tests = [

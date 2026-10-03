@@ -64,6 +64,8 @@ def setup_environment():
     )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
+    # Module-2 hard-invalid store (cross-attempt); independent of LEMMA_LIBRARY.
+    invalid_lemmas = os.getenv('INVALID_LEMMAS', 'on')
     lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
     usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
     harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
@@ -155,6 +157,7 @@ def setup_environment():
         'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
         'LEMMA_LIBRARY': lemma_library,
         'OBLIGATION_TREE': obligation_tree,
+        'INVALID_LEMMAS': invalid_lemmas,
         'LEMMA_LIBRARY_LOCAL': lemma_library_local,
         'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
         'HARVEST_RETRY_TIMEOUT': harvest_retry_timeout,

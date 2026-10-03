@@ -11,8 +11,9 @@ only when ``vampire_collect_feedback_artifacts()`` is true (repair hints or
 progress sidecar).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
-These flags are independent of ``SOLVER_ROUTING``, ``LEMMA_LIBRARY``,
-and ``LEMMA_LIBRARY_LOCAL``.
+These flags are independent of ``SOLVER_ROUTING`` and Module-2 memory
+(``LEMMA_LIBRARY``, ``LEMMA_LIBRARY_LOCAL``, ``INVALID_LEMMAS``,
+``OBLIGATION_TREE``, ``ANCESTOR_*``).
 
 暂时弃用 (default **off**; set ``on`` to re-enable — do not turn this on
 by accident):

@@ -1,9 +1,11 @@
-"""Lemma library + compressed recursive obligation trees for later LLM attempts.
+"""Module-2 cross-attempt memory: lemma library, negative filters, obligation trees.
 
 A new attempt still generates lemmas for the *current* goal. Successfully
-discharged lemmas are stored as theorems and injected as axioms. The prompt
-receives one well-formed obligation tree (the latest attempt that actually
-recursed), not empty / invalid / useless attempts.
+discharged lemmas are stored as theorems and injected as axioms. Negative
+filters (``INVALID_LEMMAS``): hard ``invalid_lemmas`` and soft
+``soft_rejected_lemmas`` for prompt + static screen. The prompt receives one
+well-formed obligation tree (the latest attempt that actually recursed), not
+empty / invalid / useless attempts.
 """
 
 from __future__ import annotations
@@ -62,6 +64,39 @@ def _flag_enabled(name: str, default: str = "on") -> bool:
 def lemma_library_enabled() -> bool:
     """Whether proved lemmas are stored, injected as axioms, and shown in the prompt."""
     return _flag_enabled("LEMMA_LIBRARY")
+
+
+def invalid_lemmas_enabled() -> bool:
+    """Module-2 negative lemma memory on a node (ablation master switch).
+
+    When on (default):
+    - **Hard** ``invalid_lemmas``: solver-refuted / child-invalid → INVALID
+      prompt + ``known_invalid`` screen (cross-attempt).
+    - **Soft** ``soft_rejected_lemmas``: node-local suppressions (same_as_goal,
+      undefined_symbol, …) → soft prompt + ``known_soft_rejected`` screen
+      (same node, later attempts only).
+
+    When off: neither store is written or read for prompt/screen (stale
+    on-disk records ignored). Per-attempt gates such as ``same_as_goal`` /
+    wellformed still run inside ``apply_static_lemma_screen``.
+    """
+    return _flag_enabled("INVALID_LEMMAS")
+
+
+def invalid_lemma_records(failed_data: Optional[dict]) -> List[Any]:
+    """Hard-invalid records for prompt/screen; empty when ``INVALID_LEMMAS`` off."""
+    if not invalid_lemmas_enabled():
+        return []
+    data = failed_data if isinstance(failed_data, dict) else {}
+    return list(data.get("invalid_lemmas") or [])
+
+
+def soft_rejected_lemma_records(failed_data: Optional[dict]) -> List[Any]:
+    """Soft suppressions for prompt/screen; empty when ``INVALID_LEMMAS`` off."""
+    if not invalid_lemmas_enabled():
+        return []
+    data = failed_data if isinstance(failed_data, dict) else {}
+    return list(data.get("soft_rejected_lemmas") or [])
 
 
 def local_lemma_harvest_enabled() -> bool:

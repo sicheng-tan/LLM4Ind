@@ -22,6 +22,8 @@ from obligation_tree import (
     inject_library_axioms,
     first_invalid_reason,
     harvest_retry_timeout_s,
+    invalid_lemma_records,
+    invalid_lemmas_enabled,
     last_normal_tree,
     lemma_library_enabled,
     lemma_library_path,
@@ -651,12 +653,16 @@ def test_flags_default_and_off_synonyms() -> None:
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("LEMMA_LIBRARY", None)
         os.environ.pop("OBLIGATION_TREE", None)
+        os.environ.pop("INVALID_LEMMAS", None)
         assert lemma_library_enabled() is True
         assert obligation_tree_enabled() is True
+        assert invalid_lemmas_enabled() is True
     for val in ("on", "ON", "true", "1", "yes"):
         with _patch_flags(val, val):
             assert lemma_library_enabled() is True
             assert obligation_tree_enabled() is True
+        with patch.dict(os.environ, {"INVALID_LEMMAS": val}):
+            assert invalid_lemmas_enabled() is True
     for val in ("off", "0", "false", "no"):
         with _patch_flags(val, "on"):
             assert lemma_library_enabled() is False
@@ -664,6 +670,91 @@ def test_flags_default_and_off_synonyms() -> None:
         with _patch_flags("on", val):
             assert lemma_library_enabled() is True
             assert obligation_tree_enabled() is False
+        with patch.dict(os.environ, {"INVALID_LEMMAS": val}):
+            assert invalid_lemmas_enabled() is False
+
+
+def test_invalid_lemmas_flag_gates_write_prompt_and_screen() -> None:
+    """Module-2 INVALID_LEMMAS: off ⇒ hard+soft memory ignored for write/prompt/screen."""
+    import Mate_new as mate
+    from lemma_gates import (
+        apply_static_lemma_screen,
+        format_diagnosis_invalid_prompt,
+        format_soft_rejected_prompt,
+        lemma_same_as_goal,
+    )
+    from obligation_tree import soft_rejected_lemma_records
+
+    bad = "(forall ((x Nat)) false)"
+    soft_lem = "(forall ((x Nat)) (= (f x) x))"
+    other = "(forall ((x Nat)) (= x x))"
+    stale = {
+        "invalid_lemmas": [{"lemma": bad, "reason": "stale"}],
+        "soft_rejected_lemmas": [
+            {"lemma": soft_lem, "reason": "Same as original goal", "gate": "same_as_goal"},
+        ],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "repair_hints": [],
+        "routing": {},
+    }
+    screen_env = {"LEMMA_WELLFORMED_CHECK": "off", "LEMMA_DEFINED_SYMBOLS": "off"}
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {"INVALID_LEMMAS": "on", **screen_env}):
+            mate.add_invalid_lemma(tmp, "template", bad, "contradicts")
+            mate.add_soft_rejected_lemma(
+                tmp, "template", soft_lem, "Same as original goal", gate="same_as_goal",
+            )
+            data = mate.load_failed_lemmas(tmp, "template")
+            assert len(data["invalid_lemmas"]) == 1
+            assert len(data["soft_rejected_lemmas"]) == 1
+            assert invalid_lemma_records(stale) and soft_rejected_lemma_records(stale)
+            prompt_on = mate.format_solver_feedback_for_prompt(stale)
+            assert "INVALID:" in prompt_on
+            assert "NODE-LOCAL SUPPRESSIONS" in prompt_on
+            assert "INVALID:" in format_diagnosis_invalid_prompt(stale)
+            assert format_soft_rejected_prompt(stale)
+            kept, dropped = apply_static_lemma_screen(
+                [bad, soft_lem, other],
+                original_forall="(forall ((z Nat)) true)",
+                smt="(set-logic ALL)\n",
+                invalid_records=invalid_lemma_records(stale),
+                soft_rejected_records=soft_rejected_lemma_records(stale),
+                same_as_goal=lemma_same_as_goal,
+            )
+            assert kept == [other]
+            gates = {g for _l, _r, g in dropped}
+            assert "known_invalid" in gates and "known_soft_rejected" in gates
+
+        with patch.dict(os.environ, {"INVALID_LEMMAS": "off", **screen_env}):
+            mate.add_invalid_lemma(tmp, "template2", "(forall ((y Nat)) false)", "x")
+            mate.add_soft_rejected_lemma(
+                tmp, "template2", soft_lem, "Same as original goal", gate="same_as_goal",
+            )
+            data2 = mate.load_failed_lemmas(tmp, "template2")
+            assert data2["invalid_lemmas"] == []
+            assert data2.get("soft_rejected_lemmas", []) == []
+            assert invalid_lemma_records(stale) == []
+            assert soft_rejected_lemma_records(stale) == []
+            prompt = mate.format_solver_feedback_for_prompt(stale)
+            assert "INVALID:" not in prompt
+            assert "NODE-LOCAL SUPPRESSIONS" not in prompt
+            assert format_diagnosis_invalid_prompt(stale) == ""
+            assert format_soft_rejected_prompt(stale) == ""
+            kept2, dropped2 = apply_static_lemma_screen(
+                [bad, soft_lem, other],
+                original_forall="(forall ((z Nat)) true)",
+                smt="(set-logic ALL)\n",
+                invalid_records=[{"lemma": bad, "reason": "stale"}],
+                soft_rejected_records=[
+                    {"lemma": soft_lem, "reason": "Same as original goal", "gate": "same_as_goal"},
+                ],
+                same_as_goal=lemma_same_as_goal,
+            )
+            assert bad in kept2 and soft_lem in kept2 and other in kept2
+            assert not any(
+                g in ("known_invalid", "known_soft_rejected") for _l, _r, g in dropped2
+            )
 
 
 def test_library_flag_controls_persist_and_inject() -> None:
@@ -829,6 +920,7 @@ def main() -> int:
     test_compact_atp_keeps_actionable_hints()
     test_harvest_retry_timeout_s_default_and_override()
     test_flags_default_and_off_synonyms()
+    test_invalid_lemmas_flag_gates_write_prompt_and_screen()
     test_library_flag_controls_persist_and_inject()
     test_prompt_flags_distinguish_library_and_tree()
     test_mate_feedback_and_recording_respect_flags()

@@ -14,10 +14,11 @@ judges whether the CURRENT goal is invalid from the parent's accumulated
 ``invalid_lemmas`` (hard / mathematically refuted child write-back), same
 signal as in-loop diagnosis — not the obligation tree. Skip when that
 INVALID list is empty.
-Hard ``invalid_lemmas`` hold solver-refuted formulas and LLM/solver child
-invalid write-back. Soft ``soft_rejected_lemmas`` hold node-local suppressions
-(same_as_goal, solver errors, undefined_symbol, …) that are not necessarily
-false; they feed screening and a separate prompt block, never INVALID.
+Hard ``invalid_lemmas`` and soft ``soft_rejected_lemmas`` share Module-2
+``INVALID_LEMMAS`` (default on) for ablation: when off, neither store is
+written or used for prompt / ``known_invalid`` / ``known_soft_rejected``.
+Hard = solver-refuted / child-invalid; soft = node-local suppressions
+(same_as_goal, undefined_symbol, …) that are not necessarily false.
 ``FEEDBACK_PROGRESS`` remains default off.
 ``PROOF_SHAPE_HINT`` (default off) appends a short observer/recursion hint after
 LAST ATTEMPT usefulness-fail kept and/or USEFUL BUT UNPROVED (sublemma proof
@@ -442,10 +443,12 @@ def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
     Hard ``invalid_lemmas`` only (child write-back / solver refutation). Soft
     suppressions are omitted — they are not mathematical INVALID evidence.
     Omits unproved, repair, progress, routing, and the obligation tree.
+    Honors Module-2 ``INVALID_LEMMAS`` (empty when off).
     """
-    data = failed_data if isinstance(failed_data, dict) else {}
+    from obligation_tree import invalid_lemma_records
+
     records = [
-        item for item in (data.get("invalid_lemmas") or [])
+        item for item in invalid_lemma_records(failed_data)
         if isinstance(item, dict) and str(item.get("lemma") or "").strip()
     ]
     if not records:
@@ -462,10 +465,14 @@ def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
 
 
 def format_soft_rejected_prompt(failed_data: Optional[dict]) -> str:
-    """Node-local suppressions: do not regenerate; not mathematical INVALID."""
-    data = failed_data if isinstance(failed_data, dict) else {}
+    """Node-local suppressions: do not regenerate; not mathematical INVALID.
+
+    Honors Module-2 ``INVALID_LEMMAS`` (empty when off).
+    """
+    from obligation_tree import soft_rejected_lemma_records
+
     records = [
-        item for item in (data.get("soft_rejected_lemmas") or [])
+        item for item in soft_rejected_lemma_records(failed_data)
         if isinstance(item, dict) and str(item.get("lemma") or "").strip()
     ]
     if not records:
@@ -1288,12 +1295,18 @@ def apply_static_lemma_screen(
     if not current:
         return [], dropped
 
-    if not _stage(
+    # Module-2 INVALID_LEMMAS off → ignore hard + soft negative memory.
+    try:
+        from obligation_tree import invalid_lemmas_enabled as _inv_on
+        use_neg_memory = _inv_on()
+    except Exception:
+        use_neg_memory = True
+    if use_neg_memory and not _stage(
         "known_invalid",
         lambda lemma: "known_invalid" if lemma_known_invalid(lemma, invalid_records) else None,
     ):
         return [], dropped
-    if not _stage(
+    if use_neg_memory and not _stage(
         "known_soft_rejected",
         lambda lemma: (
             "known_soft_rejected"

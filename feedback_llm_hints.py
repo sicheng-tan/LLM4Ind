@@ -371,7 +371,12 @@ def _revival_candidate_items(
     data = dict(failed_data or {})
     seed_revival_from_unproved(data)
     invalid_keys: Set[str] = set()
-    for rec in data.get("invalid_lemmas") or []:
+    try:
+        from obligation_tree import invalid_lemma_records
+        inv_iter = invalid_lemma_records(data)
+    except Exception:
+        inv_iter = data.get("invalid_lemmas") or []
+    for rec in inv_iter:
         if isinstance(rec, dict):
             raw = str(rec.get("lemma") or "")
         else:
@@ -379,7 +384,12 @@ def _revival_candidate_items(
         key = normalize_lemma_formula(raw)
         if key:
             invalid_keys.add(key)
-    for rec in data.get("soft_rejected_lemmas") or []:
+    try:
+        from obligation_tree import soft_rejected_lemma_records
+        soft_iter = soft_rejected_lemma_records(data)
+    except Exception:
+        soft_iter = data.get("soft_rejected_lemmas") or []
+    for rec in soft_iter:
         if isinstance(rec, dict):
             raw = str(rec.get("lemma") or "")
         else:
@@ -465,7 +475,12 @@ def _do_not_repeat_items(
             ancestors.append(rec)
 
     invalids: List[Dict[str, str]] = []
-    for rec in (failed_data or {}).get("invalid_lemmas") or []:
+    try:
+        from obligation_tree import invalid_lemma_records
+        inv_src = invalid_lemma_records(failed_data)
+    except Exception:
+        inv_src = (failed_data or {}).get("invalid_lemmas") or []
+    for rec in inv_src:
         if isinstance(rec, dict):
             lemma = rec.get("lemma") or rec.get("formula")
             reason = str(rec.get("reason") or "").strip()
@@ -479,7 +494,12 @@ def _do_not_repeat_items(
         invalids = invalids[-MAX_LIBRARY_SHOW:]
 
     banned_soft: List[Dict[str, str]] = []
-    for rec in (failed_data or {}).get("soft_rejected_lemmas") or []:
+    try:
+        from obligation_tree import soft_rejected_lemma_records
+        soft_src = soft_rejected_lemma_records(failed_data)
+    except Exception:
+        soft_src = (failed_data or {}).get("soft_rejected_lemmas") or []
+    for rec in soft_src:
         if isinstance(rec, dict):
             lemma = rec.get("lemma") or rec.get("formula")
             reason = str(rec.get("reason") or "").strip()
@@ -591,7 +611,12 @@ def _prove_status_lookup(failed_data):
         status = _normalize_prove_status(rec.get("status") or "unproved")
         if status:
             out[formula] = status
-    for rec in failed_data.get("invalid_lemmas") or []:
+    try:
+        from obligation_tree import invalid_lemma_records
+        inv_src = invalid_lemma_records(failed_data)
+    except Exception:
+        inv_src = failed_data.get("invalid_lemmas") or []
+    for rec in inv_src:
         if isinstance(rec, dict):
             formula = str(rec.get("lemma") or "").strip()
         else:

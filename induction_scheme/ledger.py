@@ -66,9 +66,18 @@ def harvest_scheme_refuted_to_invalid(
     *,
     goal_name: Optional[str] = None,
 ) -> int:
-    """Record solver-refuted (sat) scheme obligations into ``invalid_lemmas``."""
+    """Record solver-refuted (sat) scheme obligations into ``invalid_lemmas``.
+
+    No-op when Module-2 ``INVALID_LEMMAS`` is off (same gate as lemma library).
+    """
     if not base_path or not attempt or attempt.skipped:
         return 0
+    try:
+        from obligation_tree import invalid_lemmas_enabled
+        if not invalid_lemmas_enabled():
+            return 0
+    except Exception:
+        pass
     gname = (goal_name or attempt.goal_name or "").strip()
     if not gname:
         return 0

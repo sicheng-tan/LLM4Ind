@@ -62,7 +62,10 @@ from obligation_tree import (
     append_attempt,
     classify_failed_attempt,
     format_obligation_prompt,
+    invalid_lemma_records,
+    invalid_lemmas_enabled,
     last_normal_tree,
+    soft_rejected_lemma_records,
     lemma_library_enabled,
     load_lemma_library,
     make_child_node,
@@ -296,8 +299,11 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     """Hard invalid: solver-refuted or LLM/solver child write-back.
 
-    Formula already present keeps the original reason (no append).
+    Module-2 cross-attempt memory (``INVALID_LEMMAS``). When the flag is off,
+    this is a no-op. Formula already present keeps the original reason (no append).
     """
+    if not invalid_lemmas_enabled():
+        return
     failed_data = load_failed_lemmas(base_path, goal_name)
     if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
         return
@@ -316,12 +322,17 @@ def add_soft_rejected_lemma(
     *,
     gate: str = "",
 ) -> None:
-    """Node-local suppression: not necessarily false; never hard INVALID."""
+    """Node-local suppression: not necessarily false; never hard INVALID.
+
+    Gated by Module-2 ``INVALID_LEMMAS`` (same ablation switch as hard invalid).
+    """
+    if not invalid_lemmas_enabled():
+        return
     failed_data = load_failed_lemmas(base_path, goal_name)
     soft = failed_data.setdefault("soft_rejected_lemmas", [])
     if lemma_known_soft_rejected(lemma, soft):
         return
-    if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
+    if lemma_known_invalid(lemma, invalid_lemma_records(failed_data)):
         return
     soft_gate = infer_soft_reject_gate(reason, gate=gate)
     soft.append({"lemma": lemma, "reason": reason, "gate": soft_gate})
@@ -1075,12 +1086,13 @@ def format_solver_feedback_for_prompt(
     """
     parts: List[str] = []
 
-    if failed_data.get("invalid_lemmas"):
+    invalid_recs = invalid_lemma_records(failed_data)
+    if invalid_recs:
         parts.append(
             "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
             "Do not generate these lemmas, and do not weaken them; use the reason:"
         )
-        for i, record in enumerate(failed_data["invalid_lemmas"], 1):
+        for i, record in enumerate(invalid_recs, 1):
             parts.append(f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}")
 
     soft_txt = format_soft_rejected_prompt(failed_data)
@@ -2968,8 +2980,8 @@ def quick_run(
             extracted_asserts,
             original_forall=original_forall,
             smt=solver_content,
-            invalid_records=failed_data.get("invalid_lemmas") or [],
-            soft_rejected_records=failed_data.get("soft_rejected_lemmas") or [],
+            invalid_records=invalid_lemma_records(failed_data),
+            soft_rejected_records=soft_rejected_lemma_records(failed_data),
             same_as_goal=are_formulas_equivalent,
             library_items=library_items,
             ancestor_stack=ancestor_stack,
@@ -3326,7 +3338,7 @@ def _run_final_goal_diagnosis(
     if str(existing.get("kind") or "") == "invalid":
         return True
     invalid = [
-        item for item in (failed_data.get("invalid_lemmas") or [])
+        item for item in invalid_lemma_records(failed_data)
         if isinstance(item, dict) and str(item.get("lemma") or "").strip()
     ]
     if not should_run_final_diagnosis(depth, has_invalid=bool(invalid)):
