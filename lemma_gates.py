@@ -14,11 +14,9 @@ judges whether the CURRENT goal is invalid from the parent's accumulated
 ``invalid_lemmas`` (hard / mathematically refuted child write-back), same
 signal as in-loop diagnosis — not the obligation tree. Skip when that
 INVALID list is empty.
-Hard ``invalid_lemmas`` and soft ``soft_rejected_lemmas`` share Module-2
-``INVALID_LEMMAS`` (default on) for ablation: when off, neither store is
-written or used for prompt / ``known_invalid`` / ``known_soft_rejected``.
-Hard = solver-refuted / child-invalid; soft = node-local suppressions
-(same_as_goal, undefined_symbol, …) that are not necessarily false.
+``INVALID_LEMMAS`` modes: ``off`` | ``on`` (default, hard+soft) | ``paper``
+(hard only + all useless groups; Situation A → invalid). Soft
+``soft_rejected_lemmas`` only in ``on``.
 ``FEEDBACK_PROGRESS`` remains default off.
 ``PROOF_SHAPE_HINT`` (default off) appends a short observer/recursion hint after
 LAST ATTEMPT usefulness-fail kept and/or USEFUL BUT UNPROVED (sublemma proof
@@ -1295,18 +1293,23 @@ def apply_static_lemma_screen(
     if not current:
         return [], dropped
 
-    # Module-2 INVALID_LEMMAS off → ignore hard + soft negative memory.
+    # INVALID_LEMMAS: hard when not off; soft only in Module-2 ``on``.
     try:
-        from obligation_tree import invalid_lemmas_enabled as _inv_on
-        use_neg_memory = _inv_on()
+        from obligation_tree import (
+            invalid_lemmas_enabled as _hard_on,
+            soft_rejected_memory_enabled as _soft_on,
+        )
+        use_hard = _hard_on()
+        use_soft = _soft_on()
     except Exception:
-        use_neg_memory = True
-    if use_neg_memory and not _stage(
+        use_hard = True
+        use_soft = True
+    if use_hard and not _stage(
         "known_invalid",
         lambda lemma: "known_invalid" if lemma_known_invalid(lemma, invalid_records) else None,
     ):
         return [], dropped
-    if use_neg_memory and not _stage(
+    if use_soft and not _stage(
         "known_soft_rejected",
         lambda lemma: (
             "known_soft_rejected"
@@ -1696,6 +1699,28 @@ def format_stuck_lines(
     return lines
 
 
+def format_paper_useless_groups_for_prompt(failed_data: Optional[dict]) -> str:
+    """Original LLM4Ind: list **all** accumulated useless groups (comment style)."""
+    data = failed_data if isinstance(failed_data, dict) else {}
+    groups = data.get("useless_lemma_groups") or []
+    if not groups:
+        return ""
+    parts = [
+        "\n; IMPORTANT: The following lemma groups are USELESS for proving the "
+        "original goal. DO NOT generate the exact same group:"
+    ]
+    for i, group in enumerate(groups, 1):
+        lemmas = _group_lemmas(group)
+        if not lemmas:
+            continue
+        parts.append(f"; Useless group {i}:")
+        for j, lemma in enumerate(lemmas, 1):
+            parts.append(f"; {j}. {lemma}")
+    if len(parts) == 1:
+        return ""
+    return "\n".join(parts)
+
+
 def format_attempt_feedback_for_prompt(
     failed_data: Optional[dict],
     *,
@@ -1706,7 +1731,8 @@ def format_attempt_feedback_for_prompt(
 ) -> str:
     """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
 
-    History of older useless groups stays in json; only the last group is shown.
+    History of older useless groups stays in json; only the last group is shown
+    unless ``INVALID_LEMMAS=paper`` (then all useless groups, LLM4Ind style).
     When ``FEEDBACK_LLM_HINTS`` is on, program HD / repair / advice / local-vs-parent
     are omitted; SOLVER HINTS is nested under LAST ATTEMPT only if the diagnoser
     produced an injectable block. ``suppress_advice`` is kept for callers.
@@ -1714,6 +1740,12 @@ def format_attempt_feedback_for_prompt(
     from feedback_llm_hints import format_llm_hints_lines, llm_hints_eligible
 
     data = failed_data if isinstance(failed_data, dict) else {}
+    try:
+        from obligation_tree import invalid_lemmas_paper_mode
+        if invalid_lemmas_paper_mode():
+            return format_paper_useless_groups_for_prompt(data)
+    except Exception:
+        pass
     group = last_useless_group(data)
     kept = _group_lemmas(group)
     dropped = [

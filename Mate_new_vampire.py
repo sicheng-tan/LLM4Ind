@@ -64,8 +64,10 @@ from obligation_tree import (
     format_obligation_prompt,
     invalid_lemma_records,
     invalid_lemmas_enabled,
+    invalid_lemmas_paper_mode,
     last_normal_tree,
     soft_rejected_lemma_records,
+    soft_rejected_memory_enabled,
     lemma_library_enabled,
     load_lemma_library,
     make_child_node,
@@ -288,8 +290,9 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     """Hard invalid: solver-refuted or LLM/solver child write-back.
 
-    Module-2 cross-attempt memory (``INVALID_LEMMAS``). When the flag is off,
-    this is a no-op. Formula already present keeps the original reason (no append).
+    Module-2 / paper negative memory (``INVALID_LEMMAS`` not ``off``).
+    When mode is ``off``, this is a no-op. Formula already present keeps the
+    original reason (no append).
     """
     if not invalid_lemmas_enabled():
         return
@@ -313,9 +316,9 @@ def add_soft_rejected_lemma(
 ) -> None:
     """Node-local suppression: not necessarily false; never hard INVALID.
 
-    Gated by Module-2 ``INVALID_LEMMAS`` (same ablation switch as hard invalid).
+    Only when ``INVALID_LEMMAS=on`` (disabled for ``off`` and ``paper``).
     """
-    if not invalid_lemmas_enabled():
+    if not soft_rejected_memory_enabled():
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
     soft = failed_data.setdefault("soft_rejected_lemmas", [])
@@ -587,10 +590,12 @@ def _record_blocking_lemma(
     With ``UNPROVED_NOT_INVALID`` on (default), record in ``unproved_lemmas``
     (USEFUL BUT UNPROVED) and also ``revival_lemmas`` (diagnoser pool,
     origin=situation_a). Never mark invalid.
-    With the flag off, keep the old invalid_lemmas path.
+    With the flag off — or ``INVALID_LEMMAS=paper`` — keep the old
+    ``invalid_lemmas`` path (original LLM4Ind).
     """
     status = (meta or {}).get("status") or "useful_but_unproved"
-    if unproved_not_invalid_enabled():
+    use_unproved = unproved_not_invalid_enabled() and not invalid_lemmas_paper_mode()
+    if use_unproved:
         add_unproved_lemma(base_path, goal_name, lemma, meta)
         add_revival_lemma(
             base_path, goal_name, lemma,
@@ -1043,12 +1048,24 @@ def format_solver_feedback_for_prompt(
 
     invalid_recs = invalid_lemma_records(failed_data)
     if invalid_recs:
-        parts.append(
-            "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
-            "Do not generate these lemmas, and do not weaken them; use the reason:"
-        )
-        for i, record in enumerate(invalid_recs, 1):
-            parts.append(f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}")
+        if invalid_lemmas_paper_mode():
+            parts.append(
+                "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be "
+                "verified. DO NOT generate these lemmas:"
+            )
+            for i, record in enumerate(invalid_recs, 1):
+                parts.append(
+                    f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}"
+                )
+        else:
+            parts.append(
+                "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
+                "Do not generate these lemmas, and do not weaken them; use the reason:"
+            )
+            for i, record in enumerate(invalid_recs, 1):
+                parts.append(
+                    f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}"
+                )
 
     soft_txt = format_soft_rejected_prompt(failed_data)
     if soft_txt:
@@ -1084,7 +1101,11 @@ def format_solver_feedback_for_prompt(
                 f"{record['lemma']}"
             )
 
-    if unproved_not_invalid_enabled() and failed_data.get("unproved_lemmas"):
+    if (
+        unproved_not_invalid_enabled()
+        and not invalid_lemmas_paper_mode()
+        and failed_data.get("unproved_lemmas")
+    ):
         parts.append(
             "\nUSEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
             "own proofs did not succeed. Do not discard them; generate weaker variants "

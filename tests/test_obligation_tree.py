@@ -24,7 +24,10 @@ from obligation_tree import (
     harvest_retry_timeout_s,
     invalid_lemma_records,
     invalid_lemmas_enabled,
+    invalid_lemmas_mode,
+    invalid_lemmas_paper_mode,
     last_normal_tree,
+    soft_rejected_memory_enabled,
     lemma_library_enabled,
     lemma_library_path,
     lemma_library_role,
@@ -657,12 +660,15 @@ def test_flags_default_and_off_synonyms() -> None:
         assert lemma_library_enabled() is True
         assert obligation_tree_enabled() is True
         assert invalid_lemmas_enabled() is True
+        assert invalid_lemmas_mode() == "on"
+        assert soft_rejected_memory_enabled() is True
     for val in ("on", "ON", "true", "1", "yes"):
         with _patch_flags(val, val):
             assert lemma_library_enabled() is True
             assert obligation_tree_enabled() is True
         with patch.dict(os.environ, {"INVALID_LEMMAS": val}):
             assert invalid_lemmas_enabled() is True
+            assert invalid_lemmas_mode() == "on"
     for val in ("off", "0", "false", "no"):
         with _patch_flags(val, "on"):
             assert lemma_library_enabled() is False
@@ -672,6 +678,69 @@ def test_flags_default_and_off_synonyms() -> None:
             assert obligation_tree_enabled() is False
         with patch.dict(os.environ, {"INVALID_LEMMAS": val}):
             assert invalid_lemmas_enabled() is False
+            assert invalid_lemmas_mode() == "off"
+            assert soft_rejected_memory_enabled() is False
+    with patch.dict(os.environ, {"INVALID_LEMMAS": "paper"}):
+        assert invalid_lemmas_mode() == "paper"
+        assert invalid_lemmas_enabled() is True
+        assert invalid_lemmas_paper_mode() is True
+        assert soft_rejected_memory_enabled() is False
+
+
+def test_invalid_lemmas_paper_mode_hard_only_and_all_useless() -> None:
+    """paper: hard INVALID + all useless groups; no soft; Situation A → invalid."""
+    import Mate_new as mate
+    from lemma_gates import format_attempt_feedback_for_prompt
+
+    g1 = ["(forall ((x Nat)) (= x x))"]
+    g2 = ["(forall ((y Nat)) (= y y))", "(forall ((z Nat)) true)"]
+    data = {
+        "invalid_lemmas": [{"lemma": "(forall ((a Nat)) false)", "reason": "sat"}],
+        "soft_rejected_lemmas": [
+            {"lemma": "(forall ((b Nat)) (= b b))", "reason": "Same as goal", "gate": "same_as_goal"},
+        ],
+        "useless_lemma_groups": [
+            {"lemmas": g1, "status": "timeout"},
+            {"lemmas": g2, "status": "timeout"},
+        ],
+        "unproved_lemmas": [{"lemma": "(forall ((u Nat)) (= u u))", "status": "timeout"}],
+        "progress_lemmas": [],
+        "repair_hints": [],
+        "routing": {},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch.dict(os.environ, {
+            "INVALID_LEMMAS": "paper",
+            "UNPROVED_NOT_INVALID": "on",
+        }):
+            mate.add_soft_rejected_lemma(
+                tmp, "t", "(forall ((b Nat)) (= b b))", "Same as goal", gate="same_as_goal",
+            )
+            assert mate.load_failed_lemmas(tmp, "t").get("soft_rejected_lemmas", []) == []
+            mate._record_blocking_lemma(
+                tmp, "t", "(forall ((p Nat)) (= p p))",
+                {"status": "timeout", "blocking_subgoal": "t_1"},
+            )
+            stored = mate.load_failed_lemmas(tmp, "t")
+            assert stored.get("unproved_lemmas", []) == []
+            assert any("Subgoal proof failed" in (r.get("reason") or "")
+                       for r in stored.get("invalid_lemmas") or [])
+
+            fb = mate.format_solver_feedback_for_prompt(data)
+            # Upstream LLM4Ind create_prompt wording (not Module-2 INVALID: block).
+            assert "; IMPORTANT: The following lemmas are INVALID" in fb
+            assert "DO NOT generate these lemmas:" in fb
+            assert "; Invalid lemma 1 (sat):" in fb
+            assert "INVALID: The following" not in fb
+            assert "do not weaken them" not in fb
+            assert "NODE-LOCAL SUPPRESSIONS" not in fb
+            assert "USEFUL BUT UNPROVED" not in fb
+            attempt = format_attempt_feedback_for_prompt(data, backend="cvc5")
+            assert "; IMPORTANT: The following lemma groups are USELESS" in attempt
+            assert "; Useless group 1:" in attempt
+            assert "; Useless group 2:" in attempt
+            assert "; 1. (= a a)" in attempt or "; 1. (forall" in attempt
+            assert "LAST ATTEMPT" not in attempt
 
 
 def test_invalid_lemmas_flag_gates_write_prompt_and_screen() -> None:
@@ -920,6 +989,7 @@ def main() -> int:
     test_compact_atp_keeps_actionable_hints()
     test_harvest_retry_timeout_s_default_and_override()
     test_flags_default_and_off_synonyms()
+    test_invalid_lemmas_paper_mode_hard_only_and_all_useless()
     test_invalid_lemmas_flag_gates_write_prompt_and_screen()
     test_library_flag_controls_persist_and_inject()
     test_prompt_flags_distinguish_library_and_tree()

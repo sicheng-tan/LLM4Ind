@@ -2,10 +2,10 @@
 
 A new attempt still generates lemmas for the *current* goal. Successfully
 discharged lemmas are stored as theorems and injected as axioms. Negative
-filters (``INVALID_LEMMAS``): hard ``invalid_lemmas`` and soft
-``soft_rejected_lemmas`` for prompt + static screen. The prompt receives one
-well-formed obligation tree (the latest attempt that actually recursed), not
-empty / invalid / useless attempts.
+filters via ``INVALID_LEMMAS`` mode ``off`` | ``on`` | ``paper`` (see
+``invalid_lemmas_mode``). The prompt receives one well-formed obligation tree
+(the latest attempt that actually recursed), not empty / invalid / useless
+attempts.
 """
 
 from __future__ import annotations
@@ -66,25 +66,44 @@ def lemma_library_enabled() -> bool:
     return _flag_enabled("LEMMA_LIBRARY")
 
 
-def invalid_lemmas_enabled() -> bool:
-    """Module-2 negative lemma memory on a node (ablation master switch).
+def invalid_lemmas_mode() -> str:
+    """Negative-feedback mode: ``off`` | ``on`` | ``paper``.
 
-    When on (default):
-    - **Hard** ``invalid_lemmas``: solver-refuted / child-invalid → INVALID
-      prompt + ``known_invalid`` screen (cross-attempt).
-    - **Soft** ``soft_rejected_lemmas``: node-local suppressions (same_as_goal,
-      undefined_symbol, …) → soft prompt + ``known_soft_rejected`` screen
-      (same node, later attempts only).
-
-    When off: neither store is written or read for prompt/screen (stale
-    on-disk records ignored). Per-attempt gates such as ``same_as_goal`` /
-    wellformed still run inside ``apply_static_lemma_screen``.
+    - **``on``** (default / Module-2): hard ``invalid_lemmas`` + soft
+      ``soft_rejected_lemmas``; attempt feedback uses LAST ATTEMPT (latest
+      useless group only).
+    - **``paper``**: LLM4Ind-style hard invalid only (no soft); Situation A
+      writes hard invalid; prompt lists **all** accumulated useless groups
+      (not only the last).
+    - **``off``**: neither hard nor soft memory for write/prompt/screen.
     """
-    return _flag_enabled("INVALID_LEMMAS")
+    raw = (os.getenv("INVALID_LEMMAS") or "on").strip().lower()
+    if raw in _OFF_VALUES:
+        return "off"
+    if raw in ("paper", "legacy", "original", "llm4ind"):
+        return "paper"
+    if raw in ("on", "1", "true", "yes", "module2", "full", "all"):
+        return "on"
+    return "on"
+
+
+def invalid_lemmas_enabled() -> bool:
+    """Hard-invalid store / INVALID prompt / ``known_invalid`` (not ``off``)."""
+    return invalid_lemmas_mode() != "off"
+
+
+def invalid_lemmas_paper_mode() -> bool:
+    """True when ``INVALID_LEMMAS=paper`` (original LLM4Ind negative feedback)."""
+    return invalid_lemmas_mode() == "paper"
+
+
+def soft_rejected_memory_enabled() -> bool:
+    """Soft suppressions only in Module-2 ``on`` mode (not ``paper`` / ``off``)."""
+    return invalid_lemmas_mode() == "on"
 
 
 def invalid_lemma_records(failed_data: Optional[dict]) -> List[Any]:
-    """Hard-invalid records for prompt/screen; empty when ``INVALID_LEMMAS`` off."""
+    """Hard-invalid records for prompt/screen; empty when mode ``off``."""
     if not invalid_lemmas_enabled():
         return []
     data = failed_data if isinstance(failed_data, dict) else {}
@@ -92,8 +111,8 @@ def invalid_lemma_records(failed_data: Optional[dict]) -> List[Any]:
 
 
 def soft_rejected_lemma_records(failed_data: Optional[dict]) -> List[Any]:
-    """Soft suppressions for prompt/screen; empty when ``INVALID_LEMMAS`` off."""
-    if not invalid_lemmas_enabled():
+    """Soft suppressions for prompt/screen; only when mode ``on``."""
+    if not soft_rejected_memory_enabled():
         return []
     data = failed_data if isinstance(failed_data, dict) else {}
     return list(data.get("soft_rejected_lemmas") or [])

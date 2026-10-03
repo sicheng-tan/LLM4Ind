@@ -64,7 +64,7 @@ def setup_environment():
     )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
-    # Module-2 hard-invalid store (cross-attempt); independent of LEMMA_LIBRARY.
+    # off | on (hard+soft) | paper (LLM4Ind hard invalid + all useless groups).
     invalid_lemmas = os.getenv('INVALID_LEMMAS', 'on')
     lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
     usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
