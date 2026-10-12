@@ -288,13 +288,14 @@ def format_scheme_prompt_block(
         lines.append("  Proved other measure facts:")
         for o in other[:4]:
             lines.append(f"  - [{o.ctor}] {o.formula}")
-    # Strategy hint when measure facts exist but observer lemmas are for the LLM.
+    # Strategy hint when measure facts exist but observer/idempotent lemmas are for the LLM.
     if att.measure_fun or att.bridge_primary:
         lines.append(
-            "  Hint: if the goal equates an observer O on a transformer F "
-            "(e.g. sorting), prefer lemmas of the form "
-            "`(= (O (F x)) (O x))` or `(= (O (O x)) (O x))` — "
-            "scheme does not emit those automatically."
+            "  Hint: When a goal compares an observer across a transformation, "
+            "consider a preservation lemma of the form `(= (O (F x)) (O x))`. "
+            "When a same-sort transformation is idempotent, consider a lemma "
+            "of the form `(= (F (F x)) (F x))`. Scheme does not emit these "
+            "semantic properties automatically."
         )
     return "\n".join(lines) + "\n"
 
