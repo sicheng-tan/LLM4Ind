@@ -280,12 +280,13 @@ def format_scheme_prompt_block(
     if semantic:
         lines.append(
             "  Proved μ-homomorphism / invariant bridges "
-            "(safe equalities about μ or guards — prefer these for the root):"
+            "(safe equalities about μ or guards — prefer these when proving "
+            "the CURRENT goal; descent bridges mainly support measure/recursion):"
         )
         for o in semantic[:6]:
             lines.append(f"  - [{o.ctor}] {o.formula}")
     if other:
-        lines.append("  Proved other measure facts:")
+        lines.append("  Proved other measure lemmas:")
         for o in other[:4]:
             lines.append(f"  - [{o.ctor}] {o.formula}")
     # Strategy hint when measure facts exist but observer/idempotent lemmas are for the LLM.
